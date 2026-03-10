@@ -1,0 +1,266 @@
+You are a coding agent operating inside the Ultra AI-Native Operating Shell repository.
+
+Ultra is a deterministic cognitive runtime for code intelligence and autonomous software engineering.
+
+Your role is to implement tasks inside this repository while strictly following the Ultra architecture and tooling rules.
+
+Failure to follow these rules will break the deterministic system.
+
+Therefore you MUST follow the rules below.
+
+RULE 1 — ULTRA COMMANDS HAVE PRIORITY
+
+Ultra provides a runtime daemon with indexed knowledge of the project.
+
+You MUST use Ultra commands first before using any generic shell tools.
+
+Always attempt Ultra commands first
+
+If an Ultra command fails once, you may temporarily fall back to normal commands.
+
+However, on the next iteration you must again try Ultra commands first.
+
+Priority order:
+
+1️⃣ Ultra commands
+2️⃣ Shell commands
+3️⃣ Manual inspection
+
+RULE 2 — ALWAYS START THE AI RUNTIME
+
+Before performing any query or analysis you must ensure the AI runtime daemon is running.
+
+Use:
+
+ultra wake_ai
+
+This loads the persisted graph index and enables:
+
+symbol queries
+
+dependency analysis
+
+context slicing
+
+impact analysis
+
+When the task is finished you may stop the runtime using:
+
+ultra sleep_ai
+RULE 3 — LOAD PROJECT CONTEXT FIRST
+
+Before making ANY architectural or coding decisions you must load the Ultra project context.
+
+Run:
+
+ultra context .
+
+Then read the following files carefully:
+
+E:\Projects\Ultra\.ultra.context.json
+E:\Projects\Ultra\.ultra\ai\.agent_context.json
+
+These files contain:
+
+repository structure
+
+architectural rules
+
+subsystem boundaries
+
+graph metadata
+
+You must use this information to understand the system.
+
+Never guess the architecture.
+
+RULE 4 — USE ULTRA AI RUNTIME COMMANDS FOR CODE ANALYSIS
+
+When inspecting the codebase, you must prefer the following commands.
+
+Symbol search
+ultra ai_query <symbol>
+Source retrieval
+ultra ai_source <file>
+Context slicing
+ultra ai_context <query>
+Impact analysis
+ultra ai_impact <symbol_or_file>
+
+These commands use the Ultra knowledge graph and provide deterministic information.
+
+Avoid manual scanning when these commands can provide the answer.
+
+RULE 5 — VALIDATE INDEX CONSISTENCY
+
+When performing large refactors or graph-sensitive operations you must verify the AI index.
+
+Run:
+
+ultra ai_verify
+
+This ensures the incremental graph index matches a full rebuild.
+
+RULE 6 — BUILD AND TEST RULES
+Build
+
+Do NOT run builds through Ultra.
+
+Instead use the native build system.
+
+Examples:
+
+cmake --build build
+make
+ninja
+
+Ultra should not wrap builds.
+
+Testing
+
+Testing must be executed using Ultra.
+
+Always run:
+
+ultra test
+
+Never bypass Ultra testing.
+
+RULE 7 — MODIFY ONLY RELEVANT SUBSYSTEMS
+
+Ultra is a modular architecture.
+
+You must only modify files directly related to the requested task.
+
+You must NOT modify unrelated subsystems.
+
+Examples of protected subsystems:
+
+graph storage
+
+execution kernel
+
+governance engine
+
+memory system
+
+daemon runtime
+
+Unless explicitly requested.
+
+Before editing code, verify subsystem impact using:
+
+ultra ai_impact <file_or_symbol>
+RULE 8 — NO ARCHITECTURE VIOLATIONS
+
+Ultra follows a layered architecture.
+
+You must not introduce:
+
+circular dependencies
+
+cross-layer shortcuts
+
+direct subsystem bypasses
+
+Respect the architecture boundaries.
+
+RULE 9 — PREFER DETERMINISTIC OPERATIONS
+
+Ultra is a deterministic system.
+
+You must prefer:
+
+reproducible logic
+
+explicit state transitions
+
+deterministic ordering
+
+Avoid nondeterministic behavior.
+
+RULE 10 — COMMAND DISCOVERY
+
+These are the Ultra runtime commands available.
+
+AI Runtime Commands:
+
+ultra wake_ai
+ultra ai_status
+ultra ai_context <query>
+ultra ai_query <target>
+ultra ai_source <file>
+ultra ai_impact <target>
+ultra rebuild_ai
+ultra sleep_ai
+ultra ai_verify
+ultra metrics
+
+General Commands:
+
+ultra version
+ultra help
+
+You must never invent commands outside this list.
+RULE 12 — SAFE ITERATION WORKFLOW
+
+Follow this workflow for every task.
+
+Step 1
+Start runtime
+
+ultra wake_ai
+
+Step 2
+Load project context
+
+ultra context .
+
+Step 3
+Read project context files
+
+.ultra.context.json
+.agent_context.json
+
+Step 4
+Analyze symbols
+
+ultra ai_query
+
+Step 5
+Inspect sources
+
+ultra ai_source
+
+Step 6
+Analyze dependencies
+
+ultra ai_impact
+
+Step 7
+Implement minimal code changes
+
+Step 8
+Build project
+Note before building :make sure ultra sleep_ai always build on Release no debug..
+
+Step 9
+Run tests
+
+ultra test
+
+Step 10
+Verify index
+
+ultra ai_verify
+FINAL PRINCIPLE
+
+Ultra is a deterministic cognitive runtime.
+
+You are not modifying a normal project.
+
+You are operating inside a software intelligence system.
+
+Respect the architecture.
+Follow the tooling rules.
+Never bypass Ultra infrastructure.

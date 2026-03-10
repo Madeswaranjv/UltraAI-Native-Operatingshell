@@ -1,0 +1,280 @@
+﻿MSBuild version 17.14.23+b0019275e for .NET Framework
+
+  OutputFormatter.cpp
+E:\Projects\Ultra\src\types\Serialization.h(28,33): error C2039: 'get': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(28,50): error C2059: syntax error: ')' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+  
+E:\Projects\Ultra\src\types\Serialization.h(38,31): error C2039: 'get': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(38,48): error C2059: syntax error: ')' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+  
+E:\Projects\Ultra\src\types\Serialization.h(44,21): error C2440: '<function-style-cast>': cannot convert from 'initializer list' to 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\src\types\Serialization.h(44,21):
+      'nlohmann::json::json': function does not take 4 arguments
+          E:\Projects\Ultra\src\types\Serialization.h(44,21):
+          while trying to match the argument list '(initializer list, initializer list, initializer list, initializer list)'
+  
+E:\Projects\Ultra\src\types\Serialization.h(52,5): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(53,5): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(54,5): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(60,21): error C2440: '<function-style-cast>': cannot convert from 'initializer list' to 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\src\types\Serialization.h(60,21):
+      'nlohmann::json::json': function does not take 4 arguments
+          E:\Projects\Ultra\src\types\Serialization.h(60,21):
+          while trying to match the argument list '(initializer list, initializer list, initializer list, initializer list)'
+  
+E:\Projects\Ultra\src\types\Serialization.h(75,16): error C2679: binary '=': no operator found which takes a right-hand operand of type 'const std::vector<std::string,std::allocator<std::string>>' (or there is no acceptable conversion) [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(44,9):
+      could be 'nlohmann::json &nlohmann::json::operator =(size_t)'
+          E:\Projects\Ultra\src\types\Serialization.h(75,16):
+          'nlohmann::json &nlohmann::json::operator =(size_t)': cannot convert argument 2 from 'const std::vector<std::string,std::allocator<std::string>>' to 'size_t'
+              E:\Projects\Ultra\src\types\Serialization.h(75,21):
+              No user-defined-conversion operator available that can perform this conversion, or the operator cannot be called
+      E:\Projects\Ultra\include\external\json.hpp(39,9):
+      or       'nlohmann::json &nlohmann::json::operator =(const std::string &)'
+          E:\Projects\Ultra\src\types\Serialization.h(75,16):
+          'nlohmann::json &nlohmann::json::operator =(const std::string &)': cannot convert argument 2 from 'const std::vector<std::string,std::allocator<std::string>>' to 'const std::string &'
+              E:\Projects\Ultra\src\types\Serialization.h(75,21):
+              Reason: cannot convert from 'const std::vector<std::string,std::allocator<std::string>>' to 'const std::string'
+              E:\Projects\Ultra\src\types\Serialization.h(75,21):
+              No user-defined-conversion operator available that can perform this conversion, or the operator cannot be called
+      E:\Projects\Ultra\include\external\json.hpp(21,9):
+      or       'nlohmann::json &nlohmann::json::operator =(const nlohmann::json &)'
+          E:\Projects\Ultra\src\types\Serialization.h(75,16):
+          'nlohmann::json &nlohmann::json::operator =(const nlohmann::json &)': cannot convert argument 2 from 'const std::vector<std::string,std::allocator<std::string>>' to 'const nlohmann::json &'
+              E:\Projects\Ultra\src\types\Serialization.h(75,21):
+              Reason: cannot convert from 'const std::vector<std::string,std::allocator<std::string>>' to 'const nlohmann::json'
+              E:\Projects\Ultra\src\types\Serialization.h(75,21):
+              No user-defined-conversion operator available that can perform this conversion, or the operator cannot be called
+      E:\Projects\Ultra\src\types\Serialization.h(75,16):
+      while trying to match the argument list '(nlohmann::json, const std::vector<std::string,std::allocator<std::string>>)'
+  
+E:\Projects\Ultra\src\types\Serialization.h(77,16): error C2679: binary '=': no operator found which takes a right-hand operand of type 'const ultra::types::Timestamp' (or there is no acceptable conversion) [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(44,9):
+      could be 'nlohmann::json &nlohmann::json::operator =(size_t)'
+          E:\Projects\Ultra\src\types\Serialization.h(77,16):
+          'nlohmann::json &nlohmann::json::operator =(size_t)': cannot convert argument 2 from 'const ultra::types::Timestamp' to 'size_t'
+              E:\Projects\Ultra\src\types\Serialization.h(77,21):
+              No user-defined-conversion operator available that can perform this conversion, or the operator cannot be called
+      E:\Projects\Ultra\include\external\json.hpp(39,9):
+      or       'nlohmann::json &nlohmann::json::operator =(const std::string &)'
+          E:\Projects\Ultra\src\types\Serialization.h(77,16):
+          'nlohmann::json &nlohmann::json::operator =(const std::string &)': cannot convert argument 2 from 'const ultra::types::Timestamp' to 'const std::string &'
+              E:\Projects\Ultra\src\types\Serialization.h(77,21):
+              Reason: cannot convert from 'const ultra::types::Timestamp' to 'const std::string'
+              E:\Projects\Ultra\src\types\Serialization.h(77,21):
+              No user-defined-conversion operator available that can perform this conversion, or the operator cannot be called
+      E:\Projects\Ultra\include\external\json.hpp(21,9):
+      or       'nlohmann::json &nlohmann::json::operator =(const nlohmann::json &)'
+          E:\Projects\Ultra\src\types\Serialization.h(77,16):
+          'nlohmann::json &nlohmann::json::operator =(const nlohmann::json &)': cannot convert argument 2 from 'const ultra::types::Timestamp' to 'const nlohmann::json &'
+              E:\Projects\Ultra\src\types\Serialization.h(77,21):
+              Reason: cannot convert from 'const ultra::types::Timestamp' to 'const nlohmann::json'
+              E:\Projects\Ultra\src\types\Serialization.h(77,21):
+              No user-defined-conversion operator available that can perform this conversion, or the operator cannot be called
+      E:\Projects\Ultra\src\types\Serialization.h(77,16):
+      while trying to match the argument list '(nlohmann::json, const ultra::types::Timestamp)'
+  
+E:\Projects\Ultra\src\types\Serialization.h(81,5): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(82,5): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(83,5): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(84,5): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(85,9): error C2039: 'contains': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(85,31): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(86,9): error C2039: 'contains': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(86,36): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(87,9): error C2039: 'contains': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(87,36): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(88,9): error C2039: 'contains': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(88,32): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(89,9): error C2039: 'contains': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(89,34): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(95,21): error C2440: '<function-style-cast>': cannot convert from 'initializer list' to 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\src\types\Serialization.h(95,21):
+      'nlohmann::json::json': function does not take 6 arguments
+          E:\Projects\Ultra\src\types\Serialization.h(95,21):
+          while trying to match the argument list '(initializer list, initializer list, initializer list, initializer list, initializer list, initializer list)'
+  
+E:\Projects\Ultra\src\types\Serialization.h(111,5): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(121,5): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(122,14): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(123,18): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(124,9): error C2039: 'contains': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(124,34): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(125,9): error C2039: 'contains': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(126,29): error C2039: 'at': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\types\Serialization.h(126,22): error C2530: 'ej': references must be initialized [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+  
+E:\Projects\Ultra\src\types\Serialization.h(126,22): error C3531: 'ej': a symbol whose type contains 'auto' must have an initializer [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+  
+E:\Projects\Ultra\src\types\Serialization.h(126,25): error C2143: syntax error: missing ';' before ':' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+  
+E:\Projects\Ultra\src\types\Serialization.h(126,41): error C2143: syntax error: missing ';' before ')' [E:\Projects\Ultra\build\ultra.vcxproj]
+  (compiling source file '../src/cli/OutputFormatter.cpp')
+  
+E:\Projects\Ultra\src\cli\OutputFormatter.cpp(29,22): error C2039: 'is_null': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\cli\OutputFormatter.cpp(29,48): error C2039: 'empty': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\cli\OutputFormatter.cpp(30,23): error C2039: 'is_string': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\cli\OutputFormatter.cpp(31,34): error C2039: 'get': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\cli\OutputFormatter.cpp(31,51): error C2059: syntax error: ')' [E:\Projects\Ultra\build\ultra.vcxproj]
+E:\Projects\Ultra\src\cli\OutputFormatter.cpp(33,34): error C2665: 'nlohmann::json::dump': no overloaded function could convert all the argument types [E:\Projects\Ultra\build\ultra.vcxproj]
+      E:\Projects\Ultra\include\external\json.hpp(77,8):
+      could be 'void nlohmann::json::dump(std::ostringstream &) const'
+          E:\Projects\Ultra\src\cli\OutputFormatter.cpp(33,34):
+          'void nlohmann::json::dump(std::ostringstream &) const': cannot convert argument 1 from 'int' to 'std::ostringstream &'
+      E:\Projects\Ultra\src\cli\OutputFormatter.cpp(33,34):
+      while trying to match the argument list '(int)'
+  
+E:\Projects\Ultra\src\cli\OutputFormatter.cpp(33,19): error C2088: built-in operator '<<' cannot be applied to an operand of type 'std::ostream' [E:\Projects\Ultra\build\ultra.vcxproj]
+E:\Projects\Ultra\src\cli\OutputFormatter.cpp(45,14): error C2039: 'is_string': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\cli\OutputFormatter.cpp(46,25): error C2039: 'get': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\cli\OutputFormatter.cpp(46,42): error C2059: syntax error: ')' [E:\Projects\Ultra\build\ultra.vcxproj]
+E:\Projects\Ultra\src\cli\OutputFormatter.cpp(47,22): error C2039: 'is_null': is not a member of 'nlohmann::json' [E:\Projects\Ultra\build\ultra.vcxproj]
+      E:\Projects\Ultra\include\external\json.hpp(13,7):
+      see declaration of 'nlohmann::json'
+  
+E:\Projects\Ultra\src\cli\OutputFormatter.cpp(48,25): error C2665: 'nlohmann::json::dump': no overloaded function could convert all the argument types [E:\Projects\Ultra\build\ultra.vcxproj]
+      E:\Projects\Ultra\include\external\json.hpp(77,8):
+      could be 'void nlohmann::json::dump(std::ostringstream &) const'
+          E:\Projects\Ultra\src\cli\OutputFormatter.cpp(48,25):
+          'void nlohmann::json::dump(std::ostringstream &) const': cannot convert argument 1 from 'int' to 'std::ostringstream &'
+      E:\Projects\Ultra\src\cli\OutputFormatter.cpp(48,25):
+      while trying to match the argument list '(int)'
+  
+E:\Projects\Ultra\src\cli\OutputFormatter.cpp(48,17): error C2088: built-in operator '<<' cannot be applied to an operand of type 'std::ostream' [E:\Projects\Ultra\build\ultra.vcxproj]
+  ultra_init_tests.vcxproj -> E:\Projects\Ultra\build\Release\ultra_init_tests.exe

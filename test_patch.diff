@@ -1,0 +1,4 @@
+--- a/src/core/Logger.cpp
++++ b/src/core/Logger.cpp
+@@
++// ultra patch

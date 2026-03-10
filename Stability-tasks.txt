@@ -1,0 +1,56 @@
+🧩 The Next 10 Components (Codex roadmap)
+
+Codex suggested exactly the right order.
+
+1️⃣ Model adapters
+src/ai/model/
+
+Adapters for:
+
+Ollama
+OpenAI
+DeepSeek
+2️⃣ Multi-model orchestrator
+src/ai/orchestration/
+MultiModelOrchestrator.*
+3️⃣ Tool cognition
+src/runtime/tools/
+ToolCapabilityRegistry.*
+ToolRouter.*
+4️⃣ Cognitive execution loop
+src/runtime/autonomy/
+CognitiveLoop.*
+5️⃣ Autonomous refactoring engine
+src/engine/refactor/
+RefactorPlanner.*
+TransformEngine.*
+6️⃣ Real semantic parsing
+
+Upgrade:
+
+TreeSitterParser
+AstExtractor
+7️⃣ Graph overlay engine
+src/core/graph_overlay/
+OverlayGraph.*
+OverlayMerger.*
+8️⃣ Semantic branch merge
+
+Extend:
+
+CommitCoordinator
+BranchLifecycle
+9️⃣ Real API services
+
+Replace mocks:
+
+HttpServer
+JsonRpcServer
+GitHubConnector
+🔟 Execution feedback loop
+
+Connect:
+
+BuildEngine
+PatchManager
+ExecutionKernel

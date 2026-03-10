@@ -1,0 +1,12 @@
+{
+  "centrality_weight": 0.25,
+  "dependency_depth_weight": 4.999996662139893,
+  "determinism_weight": 5.0,
+  "impact_weight": 0.10000000149011612,
+  "merge_weight": 5.0,
+  "module_proximity_weight": 0.10000000149011612,
+  "recency_weight": 0.3499999940395355,
+  "risk_weight": 0.10000000149011612,
+  "token_weight": 0.10000000149011612,
+  "usage_weight": 0.10000000149011612
+}

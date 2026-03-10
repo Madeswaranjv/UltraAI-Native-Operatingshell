@@ -1,0 +1,634 @@
+ULTRA — EXTENDED AI-NATIVE OPERATING SHELL ARCHITECTURE (v2)
+
+Ultra is a deterministic cognitive runtime for AI-assisted software engineering.
+
+Core principles:
+
+structural understanding of codebases
+
+deterministic execution environment
+
+multi-model AI orchestration
+
+safe tool execution
+
+autonomous engineering loops
+
+long-term reasoning memory
+
+LLMs are plug-in reasoning modules, not the system itself.
+
+GLOBAL EXECUTION MODES
+Bootstrap Mode
+
+Used when project graph does not exist.
+
+Capabilities:
+
+architecture planning
+
+scaffold generation
+
+repository initialization
+
+module decomposition
+
+Graph state: empty
+
+Ultra relies on:
+
+user intent
+
+architecture planner model
+
+templates
+
+Incremental Mode
+
+Normal development workflow.
+
+Features:
+
+incremental hashing
+
+selective parsing
+
+graph overlays
+
+hot slice updates
+
+fast context regeneration
+
+Full Reconstruction Mode
+
+Triggered when:
+
+repository corruption
+
+graph rebuild
+
+massive refactor
+
+Ultra rebuilds entire graph.
+
+DOMAIN 1 — INFRASTRUCTURE FOUNDATION
+LAYER 0 — Event & Version Controller
+
+Deterministic event coordinator.
+
+Responsibilities:
+
+filesystem watcher
+
+git tracking
+
+commit detection
+
+mutation ordering
+
+change queue
+
+All structural updates originate here.
+
+LAYER 1 — Parallel Hash Engine
+
+Detects changed files.
+
+Features:
+
+bounded thread pool
+
+incremental hashing
+
+hash reuse
+
+disk I/O throttling
+
+Avoids unnecessary parsing.
+
+LAYER 2 — Language Adapter System
+
+Supports multiple project types.
+
+Adapters:
+
+C++
+
+Python
+
+Django
+
+React
+
+Rust
+
+Responsibilities:
+
+build commands
+
+dependency installation
+
+test execution
+
+file discovery
+
+package managers
+
+DOMAIN 2 — GRAPH INTELLIGENCE CORE
+LAYER 3 — Semantic Extraction Engine
+
+Extracts structural metadata.
+
+Sources:
+
+Tree-sitter
+
+libclang
+
+regex fallback
+
+Extracts:
+
+symbols
+
+functions
+
+classes
+
+dependencies
+
+includes
+
+LAYER 4 — Immutable Knowledge Graph
+
+Ultra’s central intelligence graph.
+
+Nodes:
+
+FileNode
+
+SymbolNode
+
+ModuleNode
+
+Edges:
+
+calls
+
+defines
+
+imports
+
+inherits
+
+depends
+
+Graph stored via:
+
+GraphStore
+
+GraphChunk
+
+GraphSnapshot
+
+Guarantees:
+
+lock-free reads
+
+deterministic state
+
+LAYER 5 — Copy-On-Write Branch Overlays
+
+Stores graph deltas.
+
+Each overlay contains:
+
+modified nodes
+
+dependency changes
+
+removed symbols
+
+Enables speculative reasoning.
+
+LAYER 6 — Epoch Memory Reclamation
+
+Memory safety layer.
+
+Components:
+
+epoch counters
+
+read guards
+
+retire lists
+
+Ensures safe deletion of graph overlays.
+
+DOMAIN 3 — CONTEXT ENGINE
+
+Transforms graph → LLM context.
+
+LAYER 7 — Context Planning Engine
+
+Determines relevant nodes.
+
+Inputs:
+
+user query
+
+recent edits
+
+dependency graph
+
+hot slice
+
+Produces:
+
+ContextPlan
+
+LAYER 8 — Context Extraction Engine
+
+Extracts graph nodes.
+
+Produces:
+
+ContextSlice
+
+Contains:
+
+symbol metadata
+
+file locations
+
+dependency edges
+
+LAYER 9 — Context Compression Engine
+
+Minimizes token usage.
+
+Methods:
+
+hierarchical summaries
+
+symbol clustering
+
+dependency pruning
+
+Guarantees deterministic context.
+
+LAYER 10 — Hot Slice Working Memory
+
+Ultra’s working memory.
+
+Stores:
+
+high-relevance nodes
+
+frequently accessed files
+
+impact traversal results
+
+Automatically recalibrated.
+
+DOMAIN 4 — COGNITIVE REASONING STACK
+LAYER 11 — Intent Runtime
+
+Transforms user request → structured goal.
+
+Example:
+
+Goal: optimize audio engine
+Constraints: maintain API compatibility
+Risk tolerance: medium
+
+Components:
+
+Intent
+
+IntentDecomposer
+
+IntentEvaluator
+
+LAYER 12 — Strategy Planner
+
+LLM generates strategies.
+
+Produces:
+
+ExecutionPlan
+
+TaskGraph
+
+NEW CRITICAL LAYER
+LAYER 13 — Micro-Planning Engine
+
+Solves LLM planning unreliability.
+
+Instead of large tasks:
+
+Implement caching system
+
+Ultra decomposes into micro-tasks:
+
+create CacheManager class
+compile
+resolve compile errors
+add caching method
+integrate with ApiModule
+run tests
+
+Benefits:
+
+reduces catastrophic planning errors
+
+enables adaptive replanning
+
+improves autonomous execution reliability
+
+LAYER 14 — Task Graph Engine
+
+Represents plan as dependency graph.
+
+Example:
+
+decoder → playback
+buffer → playback
+
+Advantages:
+
+parallel execution
+
+dependency awareness
+
+partial plan repair
+
+LAYER 15 — Execution Kernel
+
+Deterministic runtime executor.
+
+Responsibilities:
+
+validate actions
+
+execute tools
+
+capture outputs
+
+maintain snapshot state
+
+All operations pass through kernel.
+
+LAYER 16 — Tool Cognition Layer
+
+LLMs understand tools.
+
+Example description:
+
+Tool: query_symbol
+Purpose: locate symbol in graph
+Inputs: symbol name
+Returns: file path and references
+
+Allows intelligent tool planning.
+
+LAYER 17 — Tool Router
+
+Maps tool requests → CLI commands.
+
+Examples:
+
+query_symbol → ultra ai_query
+read_source → ultra ai_source
+impact_analysis → ultra ai_impact
+apply_patch → ultra apply-patch
+
+Prevents hallucinated commands.
+
+LAYER 18 — Governance Engine
+
+Safety enforcement layer.
+
+Checks:
+
+policy rules
+
+risk thresholds
+
+confidence scoring
+
+AI actions become proposals.
+
+NEW CRITICAL LAYER
+LAYER 19 — Autonomous Failure Recovery Engine
+
+Handles runtime failures.
+
+Detects:
+
+compile errors
+
+test failures
+
+dependency issues
+
+patch conflicts
+
+tool crashes
+
+Recovery pipeline:
+
+Failure detected
+↓
+Error classification
+↓
+Root cause analysis
+↓
+Generate repair strategy
+↓
+Apply fix
+↓
+Re-execute
+
+Ultra can retry multiple strategies automatically.
+
+LAYER 20 — Autonomous Refactoring Engine
+
+Analyzes code health.
+
+Detects:
+
+large files
+
+duplicate code
+
+tight coupling
+
+dependency risks
+
+Generates structural refactoring plans.
+
+DOMAIN 5 — AI CAPABILITY FABRIC
+LAYER 21 — Model Adapter Layer
+
+Unified interface for AI models.
+
+Adapters:
+
+OllamaAdapter
+
+OpenAIAdapter
+
+ClaudeAdapter
+
+GeminiAdapter
+
+DeepSeekAdapter
+
+Supports:
+
+local models
+
+API models
+
+hybrid orchestration
+
+LAYER 22 — Multi-Model Orchestrator
+
+Routes tasks to optimal models.
+
+Example routing:
+
+planner → DeepSeek R1
+code synthesis → Qwen Coder
+utility tasks → Llama
+
+Ultra dynamically selects models.
+
+DOMAIN 6 — AUTONOMOUS COGNITION
+LAYER 23 — Cognitive Execution Loop
+
+Ultra’s main reasoning cycle:
+
+PLAN
+↓
+MICRO-PLAN
+↓
+EXECUTE
+↓
+VERIFY
+↓
+REFLECT
+↓
+REPLAN
+
+Ultra continues until:
+
+DONE
+or
+IMPOSSIBLE
+
+This enables autonomous engineering loops.
+
+DOMAIN 7 — MEMORY SYSTEM
+LAYER 24 — Cognitive Memory
+
+Four memory types:
+
+Working memory → hot slice
+Episodic memory → task history
+Semantic memory → code graph
+Strategic memory → policy tuning
+
+DOMAIN 8 — RUNTIME SERVICES
+LAYER 25 — AI Runtime Daemon (UAIR)
+
+Persistent runtime process.
+
+Handles:
+
+ultra wake_ai
+ultra ai_query
+ultra ai_context
+ultra ai_impact
+
+Maintains:
+
+loaded graph
+
+runtime state
+
+cached context
+
+LAYER 26 — Authority API
+
+External interface for agents.
+
+Functions:
+
+createBranch()
+simulateIntent()
+getContextSlice()
+commitBranch()
+estimateTokenSavings()
+
+CLI equivalents:
+
+ultra branch create
+ultra intent simulate
+ultra context
+ultra commit
+ultra savings
+LAYER 27 — Analytics & Self-Observation
+
+Tracks system performance.
+
+Metrics:
+
+token savings
+
+context reuse
+
+branch success rate
+
+LLM efficiency
+
+repair success rate
+
+FINAL ULTRA STACK (UPDATED)
+27 Analytics
+26 Authority API
+25 AI Runtime Daemon
+24 Cognitive Memory
+23 Cognitive Execution Loop
+22 Multi-Model Orchestrator
+21 Model Adapter Layer
+--------------------------------
+20 Autonomous Refactoring Engine
+19 Failure Recovery Engine
+18 Governance Engine
+17 Tool Router
+16 Tool Cognition Layer
+15 Execution Kernel
+14 Task Graph Engine
+13 Micro-Planning Engine
+12 Strategy Planner
+11 Intent Runtime
+--------------------------------
+10 Hot Slice Memory
+9 Context Compression
+8 Context Extraction
+7 Context Planning
+--------------------------------
+6 Epoch Memory
+5 Branch Overlays
+4 Immutable Graph
+3 Semantic Extraction
+--------------------------------
+2 Language Adapters
+1 Parallel Hash Engine
+0 Event Controller
+
+Total:
+
+28 layers

@@ -1,0 +1,21 @@
+{
+  "providers": {
+    "deepseek": {
+      "api_key": "${DEEPSEEK_API_KEY}",
+      "context_window": 64000,
+      "endpoint": "https://api.deepseek.com/chat/completions",
+      "model": "deepseek-reasoner"
+    },
+    "ollama": {
+      "context_window": 8192,
+      "endpoint": "http://localhost:11434",
+      "model": "llama3.2"
+    },
+    "openai": {
+      "api_key": "${OPENAI_API_KEY}",
+      "context_window": 128000,
+      "endpoint": "https://api.openai.com/v1/chat/completions",
+      "model": "gpt-4o-mini"
+    }
+  }
+}

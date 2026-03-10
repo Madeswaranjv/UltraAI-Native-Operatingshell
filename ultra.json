@@ -1,0 +1,6 @@
+{
+  "ignore_dirs": ["build", ".git", ".vs"],
+  "supported_extensions": [".cpp", ".hpp", ".h"],
+  "vendor_patterns": ["stb_", "glad", "nuklear", "minimp3"],
+  "max_file_size_kb": 200
+}

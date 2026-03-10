@@ -1,0 +1,18 @@
+{
+  "branchId": "f751a741aa2b0c235c3bed4f82331cd74073a835cf2cf29c260ca05e2eb5cf91",
+  "confidence": {
+    "decisionReliabilityIndex": 0.0,
+    "riskAdjustedConfidence": 0.0,
+    "stabilityScore": 1.0
+  },
+  "creationSequence": 4,
+  "currentExecutionNodeId": "",
+  "dependencyReferences": [],
+  "goal": "test branch",
+  "isOverlayResident": false,
+  "lastMutationSequence": 11,
+  "memorySnapshotId": "",
+  "parentId": "",
+  "status": "Active",
+  "subBranches": []
+}

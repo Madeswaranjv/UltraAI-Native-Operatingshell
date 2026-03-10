@@ -1,0 +1,15 @@
+{
+  "activeBranchCount": 0,
+  "dependenciesIndexed": 13686,
+  "graphEdges": 12691,
+  "graphNodes": 4231,
+  "hotSliceSize": 1024,
+  "indexedFiles": 645,
+  "lastHeartbeat": 1773151830812,
+  "memoryUsageBytes": 216248320,
+  "pendingChanges": 0,
+  "pid": 27832,
+  "runtimeActive": true,
+  "snapshotCount": 3,
+  "symbolsIndexed": 25756
+}
