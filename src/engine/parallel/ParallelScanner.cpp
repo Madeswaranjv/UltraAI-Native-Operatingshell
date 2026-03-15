@@ -152,8 +152,13 @@ bool ParallelScanner::runFullScan(const DependencyResolver& dependencyResolver,
           return;
         }
 
-        ai::SemanticParseResult semantic =
-            ai::SemanticExtractor::extract(task.absolutePath, task.record.language);
+        ai::SemanticParseResult semantic;
+        if (!ai::SemanticExtractor::extract(task.absolutePath,
+                                            task.record.language, semantic,
+                                            localError)) {
+          reportError(localError);
+          return;
+        }
 
         std::vector<ai::SymbolRecord> fileSymbols;
         if (!ai::SymbolTable::buildFromExtracted(task.record.fileId,

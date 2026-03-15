@@ -47,12 +47,16 @@ class CognitiveMemoryManager {
 
   void bindToSnapshot(const runtime::GraphSnapshot* snapshot);
 
+  /// Call once after each index rebuild with the live graph dimensions.
+  /// Immediately resizes working HotSlice to the graph-proportional capacity.
+  void setGraphScale(std::size_t graphNodeCount,
+                     std::size_t avgSnapshotNodes = 0U) noexcept;
+
   void recordIntentExecution(const std::string& actionId,
                              const runtime::GraphSnapshot& snapshot,
                              bool success,
                              bool rolledBack,
                              const std::string& message);
-
   void recordIntentStart(const std::string& intentId,
                          const runtime::GraphSnapshot& snapshot,
                          double riskScore,
@@ -142,6 +146,8 @@ class CognitiveMemoryManager {
   IdentityState identity_;
   MemoryGovernanceState governanceState_;
   runtime::RelevanceProfile optimizedProfile_{};
+  std::size_t graphNodeCount_{0U};
+  std::size_t avgSnapshotNodes_{0U};
 };
 
 }  // namespace ultra::memory

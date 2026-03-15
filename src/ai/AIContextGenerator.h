@@ -1,9 +1,9 @@
 #pragma once
 
 #include "external/json.hpp"
+
 #include <cstddef>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace ultra::core {
@@ -29,7 +29,6 @@ struct ContextStats {
 struct GenerateResult {
   nlohmann::json context;
   ContextStats stats;
-  /** Path keys of files included in context (for snapshot). */
   std::vector<std::string> includedPathKeys;
 };
 
@@ -40,14 +39,11 @@ class AIContextGenerator {
       const ultra::graph::DependencyGraph& graph,
       const ultra::core::ConfigManager& config);
 
-  /** Like generate() but uses AST extraction (libclang or regex fallback)
-   *  and includes line numbers in the output. */
   static GenerateResult generateWithAst(
       const std::vector<ultra::scanner::FileInfo>& files,
       const ultra::graph::DependencyGraph& graph,
       const ultra::core::ConfigManager& config);
 
-  /** Path keys of files that would be included in context (same filter as generate). */
   static std::vector<std::string> getContextPathSet(
       const std::vector<ultra::scanner::FileInfo>& files,
       const ultra::graph::DependencyGraph& graph,

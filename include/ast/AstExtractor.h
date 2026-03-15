@@ -7,11 +7,11 @@ namespace ultra::ast {
 
 class AstExtractor {
  public:
-  /** Extract structure from a single file. Uses libclang when available,
-   *  otherwise falls back to regex. */
+  /** Deprecated compatibility shim. Semantic extraction is handled by
+   *  ultra::ai::SemanticExtractor + Tree-sitter pipeline. */
   static FileStructure extract(const std::filesystem::path& file);
 
-  /** Returns true if libclang-backed extraction is available. */
+  /** Always false in the unified Tree-sitter architecture. */
   static bool isLibClangAvailable();
 };
 

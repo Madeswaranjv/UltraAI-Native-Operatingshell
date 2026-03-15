@@ -2,20 +2,24 @@
 
 #include <cmath>
 #include <stdexcept>
+#include <utility>
 
 namespace ultra::runtime {
 
 CognitiveState::CognitiveState(const GraphSnapshot& snap,
-                               const memory::HotSlice& slice,
+                               std::shared_ptr<memory::HotSlice> slice,
                                const TokenBudget tokenBudget,
                                const RelevanceProfile& profile)
     : snapshot(snap),
-      workingSet(slice),
+      workingSet(std::move(slice)),
       weights(profile),
       budget(tokenBudget),
       branch(snap.branch),
       pinnedVersion(snap.version),
       pinnedHash(snap.deterministicHash()) {
+  if (!workingSet) {
+    throw std::runtime_error("CognitiveState requires a working hot slice.");
+  }
   if (!snapshot.graph) {
     throw std::runtime_error("CognitiveState requires a non-empty graph snapshot.");
   }
@@ -40,7 +44,7 @@ CognitiveState::CognitiveState(const GraphSnapshot& snap,
        weights.impactWeight) <= 0.0) {
     throw std::runtime_error("CognitiveState relevance profile must have positive total weight.");
   }
-  workingSet.syncVersions(pinnedVersion);
+  workingSet->syncVersions(pinnedVersion);
 }
 
 }  // namespace ultra::runtime

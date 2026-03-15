@@ -1,3 +1,4 @@
+
 #include "TreeSitterParser.h"
 
 #include <algorithm>
@@ -8,7 +9,8 @@
 #include <string>
 #include <utility>
 #include <vector>
-
+#include <unordered_map>
+//E:\Projects\Ultra\src\ai\parsing\TreeSitterParser.cpp
 #if __has_include(<tree_sitter/api.h>)
 #include <tree_sitter/api.h>
 #define ULTRA_HAS_TREE_SITTER 1
@@ -20,8 +22,9 @@ struct TSNode;
 #endif
 
 #if ULTRA_HAS_TREE_SITTER
-#include "ASTNormalizer.h"
 #include "TreeSitterLanguages.h"
+#include "TreeSitterNormalization.h"
+#include "TreeSitterQueryEngine.h"
 #endif
 
 namespace ultra::ai::parsing {
@@ -368,7 +371,14 @@ void parseCpp(const std::vector<std::string>& lines, AstNode& root) {
     if (line.empty()) {
       continue;
     }
-
+    if (startsWithWord(line, "use")) {
+    AstNode node;
+    node.kind = AstNodeKind::ImportStatement;
+    node.value = trimCopy(line.substr(3));
+    node.startLine = lineNo;
+    node.endLine = lineNo;
+    addNode(root, std::move(node));
+}
     if (startsWithWord(line, "#include")) {
       AstNode node;
       node.kind = AstNodeKind::IncludeDirective;
@@ -797,6 +807,7 @@ int pythonIndentWidth(const std::string& line) {
   return count;
 }
 
+
 void parsePython(const std::vector<std::string>& lines, AstNode& root) {
   std::vector<ScopeFrame> scopes;
 
@@ -804,109 +815,168 @@ void parsePython(const std::vector<std::string>& lines, AstNode& root) {
     const std::uint32_t lineNo = static_cast<std::uint32_t>(i + 1U);
     const std::string raw = stripPythonComment(lines[i]);
     const std::string line = trimCopy(raw);
+
     if (line.empty()) {
       continue;
     }
+
     const int indent = pythonIndentWidth(raw);
 
     while (!scopes.empty() && indent <= scopes.back().depth) {
       scopes.pop_back();
     }
 
-    if (startsWithWord(line, "import")) {
-      std::string target = trimCopy(line.substr(std::string("import").size()));
-      const std::size_t comma = target.find(',');
-      if (comma != kNpos) {
-        target = trimCopy(target.substr(0U, comma));
-      }
-      AstNode importNode;
-      importNode.kind = AstNodeKind::ImportStatement;
-      importNode.value = target;
-      importNode.startLine = lineNo;
-      importNode.endLine = lineNo;
-      if (!importNode.value.empty()) {
-        addNode(root, std::move(importNode));
-      }
-    } else if (startsWithWord(line, "from")) {
-      std::string target =
-          trimCopy(line.substr(std::string("from").size()));
-      const std::size_t importPos = target.find(" import ");
-      if (importPos != kNpos) {
-        target = trimCopy(target.substr(0U, importPos));
-      }
-      AstNode importNode;
-      importNode.kind = AstNodeKind::ImportStatement;
-      importNode.value = target;
-      importNode.startLine = lineNo;
-      importNode.endLine = lineNo;
-      if (!importNode.value.empty()) {
-        addNode(root, std::move(importNode));
+    /* -------------------------
+       IMPORT STATEMENTS
+    ------------------------- */
+
+    if (startsWithWord(line, "import") || startsWithWord(line, "from")) {
+
+      std::string trimmed = trimCopy(line);
+
+      if (trimmed.rfind("import ", 0) == 0) {
+
+        std::string imports = trimCopy(trimmed.substr(6));
+        std::vector<std::string> modules = splitCsv(imports);
+
+        for (std::string module : modules) {
+
+          const std::size_t asPos = module.find(" as ");
+          if (asPos != kNpos)
+            module = trimCopy(module.substr(0, asPos));
+
+          AstNode importNode;
+          importNode.kind = AstNodeKind::ImportStatement;
+          importNode.value = stripQualifiers(trimCopy(module));
+          importNode.startLine = lineNo;
+          importNode.endLine = lineNo;
+
+          if (!importNode.value.empty())
+            addNode(root, std::move(importNode));
+        }
+
+      } else if (trimmed.rfind("from ", 0) == 0) {
+
+        std::string target = trimCopy(trimmed.substr(4));
+
+        const std::size_t importPos = target.find(" import ");
+        if (importPos != kNpos)
+          target = trimCopy(target.substr(0, importPos));
+
+        AstNode importNode;
+        importNode.kind = AstNodeKind::ImportStatement;
+        importNode.value = stripQualifiers(target);
+        importNode.startLine = lineNo;
+        importNode.endLine = lineNo;
+
+        if (!importNode.value.empty())
+          addNode(root, std::move(importNode));
       }
     }
 
+    /* -------------------------
+       CLASS DECLARATION
+    ------------------------- */
+
     if (startsWithWord(line, "class")) {
+
       AstNode classNode;
       classNode.kind = AstNodeKind::ClassDecl;
       classNode.name = stripQualifiers(extractIdentifierAfterKeyword(line, "class"));
       classNode.signature = line;
       classNode.startLine = lineNo;
       classNode.endLine = lineNo;
+
       if (!classNode.name.empty()) {
+
         const std::size_t openParen = line.find('(');
         const std::size_t closeParen = line.find(')', openParen + 1U);
+
         if (openParen != kNpos && closeParen != kNpos && closeParen > openParen + 1U) {
+
           const std::string basesSegment =
               line.substr(openParen + 1U, closeParen - openParen - 1U);
+
           const std::vector<std::string> bases = splitCsv(basesSegment);
+
           for (std::string base : bases) {
+
             base = stripQualifiers(trimCopy(base));
-            if (base.empty()) {
+
+            if (base.empty())
               continue;
-            }
+
             AstNode inheritNode;
             inheritNode.kind = AstNodeKind::InheritanceRef;
             inheritNode.name = base;
             inheritNode.owner = classNode.name;
             inheritNode.startLine = lineNo;
             inheritNode.endLine = lineNo;
+
             addNode(root, std::move(inheritNode));
           }
         }
+
         ScopeFrame scope;
         scope.kind = AstNodeKind::ClassDecl;
         scope.name = classNode.name;
         scope.depth = indent;
+
         scopes.push_back(std::move(scope));
+
         addNode(root, std::move(classNode));
       }
     }
 
+    /* -------------------------
+       FUNCTION / METHOD
+    ------------------------- */
+
     if (startsWithWord(line, "def")) {
+
       AstNode fnNode;
       fnNode.name = stripQualifiers(extractIdentifierAfterKeyword(line, "def"));
       fnNode.signature = line;
       fnNode.startLine = lineNo;
       fnNode.endLine = lineNo;
+
       const std::string classOwner = currentClassLikeOwner(scopes);
-      fnNode.kind = classOwner.empty() ? AstNodeKind::FunctionDecl : AstNodeKind::MethodDecl;
+
+      fnNode.kind =
+          classOwner.empty() ? AstNodeKind::FunctionDecl : AstNodeKind::MethodDecl;
+
       fnNode.owner = classOwner;
+
       if (!fnNode.name.empty()) {
+
         ScopeFrame scope;
         scope.kind = fnNode.kind;
         scope.name = fnNode.name;
         scope.depth = indent;
+
         scopes.push_back(std::move(scope));
+
         addNode(root, std::move(fnNode));
       }
     }
 
+    /* -------------------------
+       VARIABLE DECLARATIONS
+    ------------------------- */
+
     const std::size_t assignPos = line.find('=');
-    if (assignPos != kNpos && line.find("==") == kNpos &&
-        !startsWithWord(line, "if") && !startsWithWord(line, "while") &&
+
+    if (assignPos != kNpos &&
+        line.find("==") == kNpos &&
+        !startsWithWord(line, "if") &&
+        !startsWithWord(line, "while") &&
         !startsWithWord(line, "return")) {
+
       const std::string variableName =
           stripQualifiers(lastIdentifierBefore(line, assignPos));
+
       if (!variableName.empty()) {
+
         AstNode varNode;
         varNode.kind = AstNodeKind::VariableDecl;
         varNode.name = variableName;
@@ -914,21 +984,31 @@ void parsePython(const std::vector<std::string>& lines, AstNode& root) {
         varNode.signature = line;
         varNode.startLine = lineNo;
         varNode.endLine = lineNo;
+
         addNode(root, std::move(varNode));
       }
     }
 
+    /* -------------------------
+       FUNCTION CALLS
+    ------------------------- */
+
     const std::vector<std::string> calls = collectCallTargets(line);
+
     for (const std::string& call : calls) {
-      if (startsWithWord(line, "def") && call == extractIdentifierAfterKeyword(line, "def")) {
+
+      if (startsWithWord(line, "def") &&
+          call == extractIdentifierAfterKeyword(line, "def")) {
         continue;
       }
+
       AstNode callNode;
       callNode.kind = AstNodeKind::CallExpr;
       callNode.name = call;
       callNode.owner = currentBestOwner(scopes);
       callNode.startLine = lineNo;
       callNode.endLine = lineNo;
+
       addNode(root, std::move(callNode));
     }
   }
@@ -951,44 +1031,252 @@ void sortAstDeterministic(AstNode& root) {
             });
 }
 
+#if ULTRA_HAS_TREE_SITTER
+
+struct SourceView {
+  const char* data{nullptr};
+  std::uint32_t size{0};
+};
+
+const char* readSource(void* payload,
+                       std::uint32_t byte_index,
+                       TSPoint /*position*/,
+                       std::uint32_t* bytes_read) {
+  const SourceView* view = static_cast<const SourceView*>(payload);
+  if (view == nullptr || byte_index >= view->size) {
+    if (bytes_read != nullptr) {
+      *bytes_read = 0;
+    }
+    return nullptr;
+  }
+  if (bytes_read != nullptr) {
+    *bytes_read = view->size - byte_index;
+  }
+  return view->data + byte_index;
+}
+
+TSPoint pointForByte(const std::string& source, std::uint32_t byte) {
+  TSPoint point{0, 0};
+  const std::uint32_t limit =
+      std::min<std::uint32_t>(byte, static_cast<std::uint32_t>(source.size()));
+  for (std::uint32_t i = 0; i < limit; ++i) {
+    if (source[i] == '\n') {
+      ++point.row;
+      point.column = 0;
+    } else {
+      ++point.column;
+    }
+  }
+  return point;
+}
+
+struct EditResult {
+  TSInputEdit edit{};
+  bool changed{false};
+};
+
+EditResult computeEdit(const std::string& oldSource,
+                       const std::string& newSource) {
+  EditResult result;
+  if (oldSource == newSource) {
+    result.changed = false;
+    return result;
+  }
+
+  std::size_t prefix = 0U;
+  const std::size_t oldSize = oldSource.size();
+  const std::size_t newSize = newSource.size();
+  while (prefix < oldSize && prefix < newSize &&
+         oldSource[prefix] == newSource[prefix]) {
+    ++prefix;
+  }
+
+  std::size_t oldSuffix = oldSize;
+  std::size_t newSuffix = newSize;
+  while (oldSuffix > prefix && newSuffix > prefix &&
+         oldSource[oldSuffix - 1U] == newSource[newSuffix - 1U]) {
+    --oldSuffix;
+    --newSuffix;
+  }
+
+  result.edit.start_byte = static_cast<uint32_t>(prefix);
+  result.edit.old_end_byte = static_cast<uint32_t>(oldSuffix);
+  result.edit.new_end_byte = static_cast<uint32_t>(newSuffix);
+  result.edit.start_point = pointForByte(oldSource, result.edit.start_byte);
+  result.edit.old_end_point = pointForByte(oldSource, result.edit.old_end_byte);
+  result.edit.new_end_point = pointForByte(newSource, result.edit.new_end_byte);
+  result.changed = true;
+  return result;
+}
+
+struct TreeCacheEntry {
+  Language language{Language::Unknown};
+  std::string source;
+  TSTree* tree{nullptr};
+
+  TreeCacheEntry() = default;
+  ~TreeCacheEntry() {
+    if (tree != nullptr) {
+      ts_tree_delete(tree);
+      tree = nullptr;
+    }
+  }
+
+  TreeCacheEntry(const TreeCacheEntry&) = delete;
+  TreeCacheEntry& operator=(const TreeCacheEntry&) = delete;
+
+  TreeCacheEntry(TreeCacheEntry&& other) noexcept
+      : language(other.language), source(std::move(other.source)), tree(other.tree) {
+    other.tree = nullptr;
+  }
+
+  TreeCacheEntry& operator=(TreeCacheEntry&& other) noexcept {
+    if (this != &other) {
+      if (tree != nullptr) {
+        ts_tree_delete(tree);
+      }
+      language = other.language;
+      source = std::move(other.source);
+      tree = other.tree;
+      other.tree = nullptr;
+    }
+    return *this;
+  }
+};
+
+struct ParserState {
+  TSParser* parser{nullptr};
+  const TSLanguage* language{nullptr};
+  std::unordered_map<std::string, TreeCacheEntry> trees;
+
+  ~ParserState() {
+    for (auto& entry : trees) {
+      if (entry.second.tree != nullptr) {
+        ts_tree_delete(entry.second.tree);
+        entry.second.tree = nullptr;
+      }
+    }
+    if (parser != nullptr) {
+      ts_parser_delete(parser);
+      parser = nullptr;
+    }
+  }
+};
+
+ParserState& parserState() {
+  static thread_local ParserState state;
+  return state;
+}
+
+std::string buildCacheKey(const std::filesystem::path& path) {
+  try {
+    return std::filesystem::absolute(path).lexically_normal().string();
+  } catch (...) {
+    return path.string();
+  }
+}
+
+bool ensureParserLanguage(ParserState& state, const TSLanguage* tsLanguage) {
+  if (tsLanguage == nullptr) {
+    return false;
+  }
+  if (state.parser == nullptr) {
+    state.parser = ts_parser_new();
+    if (state.parser == nullptr) {
+      return false;
+    }
+  }
+  if (state.language != tsLanguage) {
+    if (!ts_parser_set_language(state.parser, tsLanguage)) {
+      return false;
+    }
+    state.language = tsLanguage;
+  }
+  return true;
+}
+
+#endif  // ULTRA_HAS_TREE_SITTER
+
 bool parseWithTreeSitter(const std::filesystem::path& path,
                          const Language language,
                          ParsedAST& ast) {
 #if ULTRA_HAS_TREE_SITTER
-  TSParser* parser = ts_parser_new();
-  if (parser == nullptr) {
-    return false;
-  }
-
   const TSLanguage* tsLang = TreeSitterLanguages::getTreeSitterLanguage(language);
   if (tsLang == nullptr) {
-    ts_parser_delete(parser);
     return false;
   }
 
-  if (!ts_parser_set_language(parser, tsLang)) {
-    ts_parser_delete(parser);
+  ParserState& state = parserState();
+  if (!ensureParserLanguage(state, tsLang)) {
     return false;
   }
 
   std::string source;
   if (!readFileToString(path, source)) {
-    ts_parser_delete(parser);
     return false;
   }
 
-  TSTree* tree = ts_parser_parse_string(parser, nullptr, source.c_str(),
-                                        static_cast<uint32_t>(source.size()));
-  if (tree == nullptr) {
-    ts_parser_delete(parser);
-    return false;
+  const std::string key = buildCacheKey(path);
+  TreeCacheEntry* entry = nullptr;
+  auto it = state.trees.find(key);
+  if (it == state.trees.end()) {
+    auto inserted = state.trees.emplace(key, TreeCacheEntry{});
+    entry = &inserted.first->second;
+  } else {
+    entry = &it->second;
   }
 
+  if (entry->language != language) {
+    if (entry->tree != nullptr) {
+      ts_tree_delete(entry->tree);
+      entry->tree = nullptr;
+    }
+    entry->source.clear();
+    entry->language = language;
+  }
+
+  TSTree* tree = nullptr;
+  if (entry->tree != nullptr && !entry->source.empty()) {
+    if (entry->source == source) {
+      tree = entry->tree;
+    } else {
+      const EditResult edit = computeEdit(entry->source, source);
+      if (edit.changed) {
+        ts_tree_edit(entry->tree, &edit.edit);
+      }
+      SourceView view{source.data(), static_cast<uint32_t>(source.size())};
+      TSInput input;
+      input.payload = &view;
+      input.read = readSource;
+      input.encoding = TSInputEncodingUTF8;
+      tree = ts_parser_parse(state.parser, entry->tree, input);
+      if (tree == nullptr) {
+        return false;
+      }
+      ts_tree_delete(entry->tree);
+      entry->tree = tree;
+      entry->source = source;
+    }
+  } else {
+    SourceView view{source.data(), static_cast<uint32_t>(source.size())};
+    TSInput input;
+    input.payload = &view;
+    input.read = readSource;
+    input.encoding = TSInputEncodingUTF8;
+    tree = ts_parser_parse(state.parser, nullptr, input);
+    if (tree == nullptr) {
+      return false;
+    }
+    entry->tree = tree;
+    entry->source = source;
+  }
+
+  ast.root.children.clear();
   TSNode rootNode = ts_tree_root_node(tree);
-  ASTNormalizer::walkTree(rootNode, source, ast.root);
+  const std::vector<SemanticSymbol> symbols =
+      TreeSitterQueryEngine::execute(rootNode, source, language);
+  TreeSitterNormalization::normalize(symbols, ast.root);
 
-  ts_tree_delete(tree);
-  ts_parser_delete(parser);
   return true;
 #else
   (void)path;
@@ -1003,44 +1291,30 @@ bool parseWithTreeSitter(const std::filesystem::path& path,
 bool TreeSitterParser::parseFile(const std::filesystem::path& path,
                                  const Language language,
                                  ParsedAST& ast) const {
+
   ast = ParsedAST{};
   ast.language = language;
   ast.sourcePath = path;
   ast.root.kind = AstNodeKind::Root;
   ast.usedTreeSitterBackend = false;
 
-#if ULTRA_HAS_TREE_SITTER
-  if (parseWithTreeSitter(path, language, ast)) {
-    ast.usedTreeSitterBackend = true;
-    sortAstDeterministic(ast.root);
-    ast.valid = true;
-    return true;
-  }
-#endif
+#if !ULTRA_HAS_TREE_SITTER
+  return false;
+#else
 
-  std::vector<std::string> lines;
-  if (!readLines(path, lines)) {
-    return false;
-  }
-
-  switch (language) {
-    case Language::Cpp:
-      parseCpp(lines, ast.root);
-      break;
-    case Language::JavaScript:
-    case Language::TypeScript:
-      parseJavaScriptLike(lines, ast.root);
-      break;
-    case Language::Python:
-      parsePython(lines, ast.root);
-      break;
-    default:
+  if (!parseWithTreeSitter(path, language, ast)) {
       return false;
   }
 
+  ast.usedTreeSitterBackend = true;
+
   sortAstDeterministic(ast.root);
+
   ast.valid = true;
+
   return true;
+
+#endif
 }
 
 }  // namespace ultra::ai::parsing

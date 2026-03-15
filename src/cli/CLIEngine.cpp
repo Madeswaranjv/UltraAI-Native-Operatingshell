@@ -3,13 +3,33 @@
 #include "CommandRouter.h"
 #include "../authority/UltraAuthorityAPI.h"
 #include "../api/CognitiveKernelAPI.h"
-#include "../ai/AIContextGenerator.h"
 #include "../ai/AiRuntimeManager.h"
+#include "../ai/AgentExportBuilder.h"
+#include "../ai/BinaryIndexReader.h"
+#include "../ai/BinaryIndexWriter.h"
+#include "../ai/DependencyTable.h"
+#include "../ai/FileRegistry.h"
+#include "../ai/Hashing.h"
+#include "../ai/IntegrityManager.h"
+#include "../ai/SemanticExtractor.h"
+#include "../ai/SymbolTable.h"
+#include "../core/state_manager.h"
+#include "../engine/query/SymbolQueryEngine.h"
+#include "../engine/scanner.h"
+#include "../indexing/IndexingService.h"
+#include "../memory/HotSlice.h"
+#include "../memory/StateSnapshot.h"
+#include "../metrics/PerformanceMetrics.h"
+#include "../metacognition/MetaCognitiveOrchestrator.h"
+#include "../runtime/ContextExtractor.h"
+#include "../runtime/precision_invalidation.h"
+#include "ultra/runtime/ultra_daemon.h"
 #include "../core/ConfigManager.h"
 #include "../core/Logger.h"
 #include "context/ContextSnapshot.h"
 #include "../graph/DependencyGraph.h"
 #include "../hashing/HashManager.h"
+#include "../intelligence/BranchPersistence.h"
 #include "../incremental/IncrementalAnalyzer.h"
 #include "../language/AdapterFactory.h"
 #include "../language/ILanguageAdapter.h"
@@ -25,6 +45,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -37,6 +58,1350 @@ namespace {
 
 const char* kVersion = "0.1.0";
 
+std::string normalizePathString(const std::filesystem::path& path) {
+  const auto u8 = path.generic_u8string();
+  std::string out;
+  out.reserve(u8.size());
+  for (const auto ch : u8) {
+    out.push_back(static_cast<char>(ch));
+  }
+  return out;
+}
+
+bool endsWith(const std::string& value, const std::string& suffix) {
+  return value.size() >= suffix.size() &&
+         value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+nlohmann::json buildMetaCognitivePayload(
+    const ultra::metacognition::QueryMetrics& metrics) {
+  nlohmann::json payload;
+  payload["stability_score"] = metrics.stabilityScore;
+  payload["drift_score"] = metrics.driftScore;
+  payload["learning_velocity"] = metrics.learningVelocity;
+  payload["predicted_next_command"] = metrics.predictedNextCommand;
+  payload["query_token_budget"] = metrics.queryTokenBudget;
+  payload["query_cache_capacity"] = metrics.queryCacheCapacity;
+  payload["hot_slice_capacity"] = metrics.hotSliceCapacity;
+  payload["branch_retention_hint"] = metrics.branchRetentionHint;
+
+  const bool conservative = metrics.stabilityScore < 0.4;
+  const bool exploratory = !conservative &&
+                           metrics.learningVelocity < 0.2 &&
+                           metrics.driftScore < 0.1;
+  payload["conservative_mode"] = conservative;
+  payload["exploratory_mode"] = exploratory;
+  return payload;
+}
+
+nlohmann::json buildBranchPayload(const ultra::intelligence::Branch& branch) {
+  nlohmann::json payload;
+  payload["branchId"] = branch.branchId;
+  payload["parentId"] = branch.parentId;
+  payload["parentBranchId"] = branch.parentBranchId;
+  payload["goal"] = branch.goal;
+  payload["currentExecutionNodeId"] = branch.currentExecutionNodeId;
+  payload["subBranches"] = branch.subBranches;
+  payload["memorySnapshotId"] = branch.memorySnapshotId;
+  payload["dependencyReferences"] = branch.dependencyReferences;
+  payload["confidence"] = {
+      {"stabilityScore", branch.confidence.stabilityScore},
+      {"riskAdjustedConfidence", branch.confidence.riskAdjustedConfidence},
+      {"decisionReliabilityIndex", branch.confidence.decisionReliabilityIndex},
+  };
+  payload["status"] = ultra::intelligence::toString(branch.status);
+  payload["isOverlayResident"] = branch.isOverlayResident;
+  payload["creationSequence"] = branch.creationSequence;
+  payload["lastMutationSequence"] = branch.lastMutationSequence;
+  return payload;
+}
+
+nlohmann::json buildBranchListPayload(
+    const std::filesystem::path& projectRoot) {
+  nlohmann::json payload = nlohmann::json::object();
+  nlohmann::json branches = nlohmann::json::array();
+
+  ultra::intelligence::BranchStore store;
+  ultra::intelligence::BranchPersistence persistence(projectRoot / ".ultra");
+  const bool loaded = persistence.load(store);
+  if (loaded) {
+    std::vector<ultra::intelligence::Branch> items = store.getAll();
+    std::sort(items.begin(), items.end(),
+              [](const auto& left, const auto& right) {
+                return left.branchId < right.branchId;
+              });
+    for (const auto& branch : items) {
+      branches.push_back(buildBranchPayload(branch));
+    }
+  }
+
+  payload["branches"] = std::move(branches);
+  payload["loaded"] = loaded;
+  return payload;
+}
+
+nlohmann::json buildBranchDiffPayload(
+    const ultra::diff::semantic::BranchDiffReport& report) {
+  nlohmann::json payload;
+  payload["symbols"] = nlohmann::json::array();
+  for (const auto& symbol : report.symbols) {
+    payload["symbols"].push_back(
+        {{"id", symbol.id},
+         {"type", ultra::diff::semantic::toString(symbol.type)}});
+  }
+  payload["signatures"] = nlohmann::json::array();
+  for (const auto& signature : report.signatures) {
+    payload["signatures"].push_back(
+        {{"id", signature.id},
+         {"change", ultra::diff::semantic::toString(signature.change)}});
+  }
+  payload["dependencies"] = nlohmann::json::array();
+  for (const auto& dependency : report.dependencies) {
+    payload["dependencies"].push_back(
+        {{"from", dependency.from},
+         {"to", dependency.to},
+         {"type", ultra::diff::semantic::toString(dependency.type)}});
+  }
+  payload["risk"] = ultra::diff::semantic::toString(report.overallRisk);
+  payload["impactScore"] = report.impactScore;
+  return payload;
+}
+
+nlohmann::json buildRiskReportPayload(
+    const ultra::authority::AuthorityRiskReport& report) {
+  nlohmann::json payload;
+  payload["score"] = report.score;
+  payload["removed_symbols"] = report.removedSymbols;
+  payload["signature_changes"] = report.signatureChanges;
+  payload["dependency_breaks"] = report.dependencyBreaks;
+  payload["public_api_changes"] = report.publicApiChanges;
+  payload["impact_depth"] = report.impactDepth;
+  payload["within_threshold"] = report.withinThreshold;
+  payload["diff_report"] = buildBranchDiffPayload(report.diffReport);
+  return payload;
+}
+
+std::vector<std::string> dependencyCandidatesForReference(
+    const std::string& reference,
+    const std::string& currentFilePath) {
+  static const std::vector<std::string> kCodeExtensions{
+      "",            ".h",        ".hpp",      ".hh",   ".hxx",
+      ".c",          ".cc",       ".cpp",      ".cxx",  ".js",
+      ".jsx",        ".mjs",      ".cjs",      ".ts",   ".tsx",
+      ".py",         "/index.js", "/index.ts", "/index.tsx",
+      "/__init__.py"};
+
+  std::vector<std::string> out;
+  out.reserve(kCodeExtensions.size() * 2U);
+
+  const std::filesystem::path currentParent =
+      std::filesystem::path(currentFilePath).parent_path();
+
+  const auto addVariants = [&](const std::filesystem::path& basePath) {
+    for (const std::string& ext : kCodeExtensions) {
+      if (ext.empty()) {
+        out.push_back(normalizePathString(basePath.lexically_normal()));
+      } else if (ext[0] == '/') {
+        out.push_back(
+            normalizePathString((basePath / ext.substr(1)).lexically_normal()));
+      } else {
+        std::filesystem::path variant = basePath;
+        variant += ext;
+        out.push_back(normalizePathString(variant.lexically_normal()));
+      }
+    }
+  };
+
+  if (!reference.empty() && reference[0] == '.') {
+    addVariants((currentParent / reference).lexically_normal());
+  } else {
+    addVariants(std::filesystem::path(reference));
+    addVariants((currentParent / reference).lexically_normal());
+    if (reference.find('.') != std::string::npos &&
+        reference.find('/') == std::string::npos) {
+      std::string pythonModule = reference;
+      std::replace(pythonModule.begin(), pythonModule.end(), '.', '/');
+      addVariants(std::filesystem::path(pythonModule));
+    }
+  }
+
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
+}
+
+bool resolveDependencyReference(
+    const std::string& currentFilePath,
+    const std::string& reference,
+    const std::map<std::string, ultra::ai::FileRecord>& currentFilesByPath,
+    std::string& resolvedPath) {
+  if (reference.empty()) {
+    return false;
+  }
+
+  if (currentFilesByPath.find(reference) != currentFilesByPath.end()) {
+    resolvedPath = reference;
+    return true;
+  }
+
+  const std::vector<std::string> candidates =
+      dependencyCandidatesForReference(reference, currentFilePath);
+  for (const std::string& candidate : candidates) {
+    const auto exactIt = currentFilesByPath.find(candidate);
+    if (exactIt != currentFilesByPath.end()) {
+      resolvedPath = exactIt->first;
+      return true;
+    }
+  }
+
+  std::vector<std::string> suffixMatches;
+  suffixMatches.reserve(currentFilesByPath.size());
+  for (const auto& [path, file] : currentFilesByPath) {
+    (void)file;
+    if (path == reference || endsWith(path, "/" + reference) ||
+        endsWith(path, reference)) {
+      suffixMatches.push_back(path);
+    }
+  }
+  if (suffixMatches.empty()) {
+    return false;
+  }
+
+  std::sort(suffixMatches.begin(), suffixMatches.end());
+  resolvedPath = suffixMatches.front();
+  return true;
+}
+
+bool isDefinitionSymbol(const ultra::ai::SymbolRecord& symbol) {
+  switch (symbol.symbolType) {
+    case ultra::ai::SymbolType::Class:
+    case ultra::ai::SymbolType::Function:
+    case ultra::ai::SymbolType::EntryPoint:
+    case ultra::ai::SymbolType::ReactComponent:
+      return true;
+    case ultra::ai::SymbolType::Unknown:
+    case ultra::ai::SymbolType::Import:
+    case ultra::ai::SymbolType::Export:
+    default:
+      return false;
+  }
+}
+
+std::unordered_map<std::string, ultra::ai::SymbolNode> buildSymbolIndex(
+    const std::vector<ultra::ai::FileRecord>& files,
+    const std::vector<ultra::ai::SymbolRecord>& symbols,
+    const ultra::ai::DependencyTableData& deps) {
+  std::unordered_map<std::string, ultra::ai::SymbolNode> index;
+  index.reserve(symbols.size());
+  if (symbols.empty()) {
+    return index;
+  }
+
+  std::unordered_map<std::uint32_t, std::string> pathByFileId;
+  pathByFileId.reserve(files.size());
+  for (const ultra::ai::FileRecord& file : files) {
+    pathByFileId[file.fileId] = file.path;
+  }
+
+  std::unordered_map<std::uint64_t, const ultra::ai::SymbolRecord*> symbolById;
+  symbolById.reserve(symbols.size());
+  for (const ultra::ai::SymbolRecord& symbol : symbols) {
+    symbolById[symbol.symbolId] = &symbol;
+  }
+
+  std::unordered_map<std::string, std::vector<const ultra::ai::SymbolRecord*>>
+      definitionsByName;
+  definitionsByName.reserve(symbols.size());
+
+  std::unordered_map<std::string, std::set<std::string>> usageFilesByName;
+  usageFilesByName.reserve(symbols.size());
+
+  for (const ultra::ai::SymbolRecord& symbol : symbols) {
+    if (symbol.name.empty()) {
+      continue;
+    }
+
+    const auto pathIt = pathByFileId.find(symbol.fileId);
+    if (pathIt == pathByFileId.end()) {
+      continue;
+    }
+
+    if (isDefinitionSymbol(symbol)) {
+      definitionsByName[symbol.name].push_back(&symbol);
+    } else {
+      usageFilesByName[symbol.name].insert(pathIt->second);
+    }
+  }
+
+  for (const ultra::ai::SymbolDependencyEdge& edge : deps.symbolEdges) {
+    const auto fromIt = symbolById.find(edge.fromSymbolId);
+    const auto toIt = symbolById.find(edge.toSymbolId);
+    if (fromIt == symbolById.end() || toIt == symbolById.end()) {
+      continue;
+    }
+    if (toIt->second == nullptr || toIt->second->name.empty()) {
+      continue;
+    }
+
+    const auto userFileIt = pathByFileId.find(fromIt->second->fileId);
+    if (userFileIt == pathByFileId.end()) {
+      continue;
+    }
+
+    usageFilesByName[toIt->second->name].insert(userFileIt->second);
+  }
+
+  for (const auto& [name, definitions] : definitionsByName) {
+    if (name.empty() || definitions.empty()) {
+      continue;
+    }
+
+    std::string definedIn;
+    for (const ultra::ai::SymbolRecord* definition : definitions) {
+      if (definition == nullptr) {
+        continue;
+      }
+      const auto pathIt = pathByFileId.find(definition->fileId);
+      if (pathIt == pathByFileId.end()) {
+        continue;
+      }
+      if (definedIn.empty() || pathIt->second < definedIn) {
+        definedIn = pathIt->second;
+      }
+    }
+    if (definedIn.empty()) {
+      continue;
+    }
+
+    ultra::ai::SymbolNode node;
+    node.name = name;
+    node.definedIn = std::move(definedIn);
+    const auto usageIt = usageFilesByName.find(name);
+    if (usageIt != usageFilesByName.end()) {
+      const auto& usage = usageIt->second;
+      node.usedInFiles.insert(usage.begin(), usage.end());
+    }
+    index.emplace(name, std::move(node));
+  }
+
+  const double centralityDenom =
+      files.size() > 1U ? static_cast<double>(files.size() - 1U) : 1.0;
+  for (auto& [name, node] : index) {
+    (void)name;
+    node.centrality = files.size() > 1U
+                          ? static_cast<double>(node.usedInFiles.size()) /
+                                centralityDenom
+                          : 0.0;
+    node.weight = 1.0 + (0.25 * node.centrality);
+  }
+
+  return index;
+}
+
+void rebuildSymbolEdges(ultra::ai::RuntimeState& state) {
+  ultra::ai::SymbolTable::sortDeterministic(state.symbols);
+  ultra::ai::DependencyTable::sortAndDedupe(state.deps);
+  const std::map<std::uint32_t, std::vector<ultra::ai::SymbolRecord>> symbolsByFileId =
+      ultra::ai::SymbolTable::groupByFileId(state.symbols);
+  state.deps.symbolEdges.clear();
+  const std::vector<ultra::ai::SymbolDependencyEdge> fromFileEdges =
+      ultra::ai::DependencyTable::buildSymbolEdgesFromFileEdges(
+          state.deps.fileEdges, symbolsByFileId);
+  const std::vector<ultra::ai::SymbolDependencyEdge> fromSemanticEdges =
+      ultra::ai::DependencyTable::buildSymbolEdgesFromSemanticDependencies(
+          state.semanticSymbolDepsByFileId, symbolsByFileId);
+  state.deps.symbolEdges.insert(state.deps.symbolEdges.end(),
+                                fromFileEdges.begin(), fromFileEdges.end());
+  state.deps.symbolEdges.insert(state.deps.symbolEdges.end(),
+                                fromSemanticEdges.begin(),
+                                fromSemanticEdges.end());
+  ultra::ai::DependencyTable::sortAndDedupe(state.deps);
+  state.symbolIndex = buildSymbolIndex(state.files, state.symbols, state.deps);
+}
+
+std::vector<std::string> toSortedVector(
+    const std::unordered_set<std::string>& values) {
+  std::vector<std::string> out(values.begin(), values.end());
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
+}
+
+std::size_t estimateRuntimeBytes(const ultra::ai::RuntimeState& runtime) {
+  std::size_t total = sizeof(runtime);
+  for (const auto& file : runtime.files) {
+    total += sizeof(file) + file.path.size();
+  }
+  for (const auto& symbol : runtime.symbols) {
+    total += sizeof(symbol) + symbol.name.size() + symbol.signature.size();
+  }
+  total += runtime.deps.fileEdges.size() * sizeof(ultra::ai::FileDependencyEdge);
+  total += runtime.deps.symbolEdges.size() *
+           sizeof(ultra::ai::SymbolDependencyEdge);
+  for (const auto& [fileId, deps] : runtime.semanticSymbolDepsByFileId) {
+    total += sizeof(fileId);
+    for (const auto& dep : deps) {
+      total += sizeof(dep) + dep.fromSymbol.size() + dep.toSymbol.size();
+    }
+  }
+  for (const auto& [name, node] : runtime.symbolIndex) {
+    total += name.size() + node.definedIn.size();
+    for (const auto& usedIn : node.usedInFiles) {
+      total += usedIn.size();
+    }
+  }
+  return total;
+}
+
+struct DaemonRuntimeDispatcher {
+  std::filesystem::path projectRoot;
+  std::filesystem::path aiDirectory;
+  std::filesystem::path agentContextPath;
+  std::filesystem::path contextDiffPath;
+  ultra::core::StateManager stateManager;
+  std::optional<ultra::ai::RuntimeState> previousState;
+
+  explicit DaemonRuntimeDispatcher(std::filesystem::path root)
+      : projectRoot(std::filesystem::absolute(std::move(root)).lexically_normal()),
+        aiDirectory(projectRoot / ".ultra" / "ai"),
+        agentContextPath(projectRoot / ".ultra.context.json"),
+        contextDiffPath(projectRoot / ".ultra.context-diff.json"),
+        stateManager(projectRoot) {}
+
+  nlohmann::json handle(const std::string& type, const nlohmann::json& payload) {
+    if (type == "ai_status") {
+      std::string error;
+      (void)ensureIndexAvailable(error);  // lazy build on first status check
+      const bool verbose = payload.value("verbose", false);
+      (void)verbose;
+      return makeOk(buildStatusPayload(), 0);
+    }
+
+    if (type == "rebuild_ai") {
+      nlohmann::json payloadOut;
+      std::string error;
+      if (!rebuildIndex(payloadOut, error)) {
+        return makeError(error);
+      }
+      return makeOk(payloadOut, 0, "semantic_index_built");
+    }
+
+    if (type == "ai_query") {
+      const std::string target = payload.value("target", std::string{});
+      if (target.empty()) {
+        return makeError("missing_query_target");
+      }
+      std::string error;
+      if (!ensureIndexAvailable(error)) {
+        return makeError(error);
+      }
+      const ultra::ai::RuntimeState& runtime = runtimeState();
+      if (runtime.symbolIndex.empty()) {
+        return makeError("semantic_index_unavailable");
+      }
+      const auto it = runtime.symbolIndex.find(target);
+      if (it == runtime.symbolIndex.end()) {
+        nlohmann::json notFound{{"kind", "not_found"}, {"target", target}};
+        return makeOk(notFound, 1);
+      }
+
+      nlohmann::json result;
+      result["kind"] = "symbol";
+      result["name"] = target;
+      result["defined_in"] = it->second.definedIn;
+      result["usage_count"] = it->second.usedInFiles.size();
+      result["weight"] = it->second.weight;
+      result["centrality"] = it->second.centrality;
+      result["references"] = toSortedVector(it->second.usedInFiles);
+
+      auto& queryEngine = symbolQueryEngine();
+      if (queryEngine.empty()) {
+        queryEngine.rebuild(runtime, runtimeVersion());
+      }
+
+      nlohmann::json definitions = nlohmann::json::array();
+      for (const auto& definition : queryEngine.findDefinition(target)) {
+        nlohmann::json item;
+        item["file_path"] = definition.filePath;
+        item["line_number"] = definition.lineNumber;
+        item["signature"] = definition.signature;
+        item["symbol_id"] = definition.symbolId;
+        definitions.push_back(std::move(item));
+      }
+      result["definitions"] = std::move(definitions);
+      result["symbol_dependencies"] = queryEngine.findSymbolDependencies(target);
+      const std::size_t depth = std::max<std::size_t>(
+          1U, payload.value("depth", payload.value("max_depth", 2U)));
+      result["impact_region"] = queryEngine.findImpactRegion(target, depth);
+      nlohmann::json contextPayload = nlohmann::json::object();
+      try {
+        const std::size_t contextBudget =
+            std::max<std::size_t>(1U, payload.value("token_budget", 4096U));
+        ultra::runtime::CognitiveState cognitiveState =
+            stateManager.createCognitiveState(contextBudget);
+        ultra::runtime::Query contextQuery;
+        contextQuery.kind = ultra::runtime::QueryKind::Auto;
+        contextQuery.target = target;
+        contextQuery.impactDepth = depth;
+        ultra::runtime::ContextExtractor extractor;
+        const ultra::runtime::ContextSlice slice =
+            extractor.getMinimalContext(cognitiveState, contextQuery);
+        nlohmann::json parsed =
+            nlohmann::json::parse(slice.json, nullptr, false);
+        if (!parsed.is_discarded()) {
+          contextPayload = std::move(parsed);
+        }
+      } catch (...) {
+      }
+      result["ai_context"] = std::move(contextPayload);
+      const std::size_t tokenBudget = payload.value("token_budget", 4096U);
+      const auto metrics =
+          ultra::metacognition::MetaCognitiveOrchestrator::instance()
+              .recordQuery(target,
+                           runtimeVersion(),
+                           tokenBudget,
+                           128U,
+                           ultra::memory::HotSlice::kMaxHotSliceEntries);
+      result["meta_cognitive"] = buildMetaCognitivePayload(metrics);
+      return makeOk(result, 0);
+    }
+
+    if (type == "ai_source") {
+      std::string error;
+      if (!ensureIndexAvailable(error)) {
+        return makeError(error);
+      }
+      const std::string target = payload.value("file", std::string{});
+      if (target.empty()) {
+        return makeError("missing_source_target");
+      }
+      nlohmann::json result;
+      if (!readSource(target, result, error)) {
+        return makeError(error);
+      }
+      return makeOk(result, 0);
+    }
+
+    if (type == "ai_impact") {
+      std::string error;
+      if (!ensureIndexAvailable(error)) {
+        return makeError(error);
+      }
+      const std::string target = payload.value("target", std::string{});
+      if (target.empty()) {
+        return makeError("missing_impact_target");
+      }
+
+      const ultra::ai::RuntimeState& runtime = runtimeState();
+      auto& queryEngine = symbolQueryEngine();
+      if (queryEngine.empty()) {
+        queryEngine.rebuild(runtime, runtimeVersion());
+      }
+      const std::size_t depth = std::max<std::size_t>(
+          1U, payload.value("depth", payload.value("max_depth", 2U)));
+
+      // --- Symbol-based impact (primary path) ---
+      const auto symIt = runtime.symbolIndex.find(target);
+      if (symIt != runtime.symbolIndex.end()) {
+        const std::vector<std::string> direct =
+            queryEngine.findReferences(target);
+        const std::vector<std::string> impact =
+            queryEngine.findImpactRegion(target, depth);
+
+        std::set<std::string> directSet(direct.begin(), direct.end());
+        std::vector<std::string> transitive;
+        for (const std::string& path : impact) {
+          if (directSet.find(path) == directSet.end()) {
+            transitive.push_back(path);
+          }
+        }
+
+        nlohmann::json result;
+        result["kind"] = "symbol_impact";
+        result["symbol"] = target;
+        result["defined_in"] = symIt->second.definedIn;
+        result["direct_usage_files"] = direct;
+        result["transitive_impacted_files"] = transitive;
+        const std::size_t totalFiles = runtime.files.size();
+        const double score =
+            totalFiles > 0U
+                ? static_cast<double>(direct.size() + transitive.size()) /
+                      static_cast<double>(totalFiles)
+                : 0.0;
+        result["impact_score"] = score;
+        const std::size_t tokenBudget = payload.value("token_budget", 4096U);
+        const auto metrics =
+            ultra::metacognition::MetaCognitiveOrchestrator::instance()
+                .recordQuery(target,
+                             runtimeVersion(),
+                             tokenBudget,
+                             128U,
+                             ultra::memory::HotSlice::kMaxHotSliceEntries);
+        result["meta_cognitive"] = buildMetaCognitivePayload(metrics);
+        return makeOk(result, 0);
+      }
+
+      // --- File-based impact (fallback when target is a file path) ---
+      // Normalise: strip leading slashes/backslashes and convert to forward slashes.
+      std::string normalizedTarget =
+          std::filesystem::path(target).generic_string();
+      // Try suffix matching against the indexed file list.
+      std::string matchedPath;
+      for (const ultra::ai::FileRecord& file : runtime.files) {
+        const std::string& filePath = file.path;
+        if (filePath == normalizedTarget ||
+            (filePath.size() > normalizedTarget.size() &&
+             filePath[filePath.size() - normalizedTarget.size() - 1U] == '/' &&
+             filePath.compare(filePath.size() - normalizedTarget.size(),
+                              normalizedTarget.size(),
+                              normalizedTarget) == 0)) {
+          if (matchedPath.empty() || filePath.size() < matchedPath.size()) {
+            matchedPath = filePath;
+          }
+        }
+      }
+
+      if (matchedPath.empty()) {
+        nlohmann::json notFound{{"kind", "not_found"}, {"target", target}};
+        return makeOk(notFound, 1);
+      }
+
+      // Find all files that directly depend on the matched file.
+      std::unordered_map<std::uint32_t, std::string> pathById;
+      pathById.reserve(runtime.files.size());
+      std::uint32_t targetFileId = 0U;
+      for (const ultra::ai::FileRecord& file : runtime.files) {
+        pathById[file.fileId] = file.path;
+        if (file.path == matchedPath) {
+          targetFileId = file.fileId;
+        }
+      }
+
+      std::set<std::string> directSet;
+      for (const ultra::ai::FileDependencyEdge& edge : runtime.deps.fileEdges) {
+        if (edge.toFileId == targetFileId) {
+          const auto it = pathById.find(edge.fromFileId);
+          if (it != pathById.end()) {
+            directSet.insert(it->second);
+          }
+        }
+      }
+
+      // BFS for transitive dependents up to `depth` hops.
+      std::set<std::string> visited(directSet);
+      visited.insert(matchedPath);
+      std::vector<std::string> frontier(directSet.begin(), directSet.end());
+      std::set<std::string> transitiveSet;
+
+      std::unordered_map<std::string, std::uint32_t> idByPath;
+      idByPath.reserve(runtime.files.size());
+      for (const ultra::ai::FileRecord& file : runtime.files) {
+        idByPath[file.path] = file.fileId;
+      }
+
+      for (std::size_t hop = 1U; hop < depth && !frontier.empty(); ++hop) {
+        std::vector<std::string> nextFrontier;
+        for (const std::string& frontierPath : frontier) {
+          const auto idIt = idByPath.find(frontierPath);
+          if (idIt == idByPath.end()) continue;
+          const std::uint32_t fid = idIt->second;
+          for (const ultra::ai::FileDependencyEdge& edge : runtime.deps.fileEdges) {
+            if (edge.toFileId == fid) {
+              const auto pIt = pathById.find(edge.fromFileId);
+              if (pIt != pathById.end() && visited.find(pIt->second) == visited.end()) {
+                visited.insert(pIt->second);
+                transitiveSet.insert(pIt->second);
+                nextFrontier.push_back(pIt->second);
+              }
+            }
+          }
+        }
+        frontier = std::move(nextFrontier);
+      }
+
+      const std::vector<std::string> directVec(directSet.begin(), directSet.end());
+      const std::vector<std::string> transitiveVec(transitiveSet.begin(), transitiveSet.end());
+      const std::size_t totalFiles = runtime.files.size();
+      const double score =
+          totalFiles > 0U
+              ? static_cast<double>(directVec.size() + transitiveVec.size()) /
+                    static_cast<double>(totalFiles)
+              : 0.0;
+
+      nlohmann::json result;
+      result["kind"] = "file_impact";
+      result["target"] = matchedPath;
+      result["direct_dependents"] = directVec;
+      result["transitive_dependents"] = transitiveVec;
+      result["impact_score"] = score;
+      const std::size_t tokenBudget = payload.value("token_budget", 4096U);
+      const auto metrics =
+          ultra::metacognition::MetaCognitiveOrchestrator::instance()
+              .recordQuery(target,
+                           runtimeVersion(),
+                           tokenBudget,
+                           128U,
+                           ultra::memory::HotSlice::kMaxHotSliceEntries);
+      result["meta_cognitive"] = buildMetaCognitivePayload(metrics);
+      return makeOk(result, 0);
+    }
+
+    if (type == "ai_context") {
+      std::string error;
+      if (!ensureIndexAvailable(error)) {
+        return makeError(error);
+      }
+      nlohmann::json payloadOut;
+      if (!writeAgentContext(payloadOut, error)) {
+        return makeError(error);
+      }
+      if (payload.contains("query")) {
+        payloadOut["query"] = payload.value("query", std::string{});
+      }
+      return makeOk(payloadOut, 0);
+    }
+
+    if (type == "context_diff") {
+      nlohmann::json payloadOut;
+      std::string error;
+      if (!computeContextDiff(payloadOut, error)) {
+        return makeError(error);
+      }
+      return makeOk(payloadOut, 0);
+    }
+
+    if (type == "ai_metrics" || type == "metrics") {
+      const std::string action = payload.value("action", std::string{});
+      if (action == "enable") {
+        ultra::metrics::PerformanceMetrics::setEnabled(true);
+      } else if (action == "disable") {
+        ultra::metrics::PerformanceMetrics::setEnabled(false);
+      } else if (action == "reset") {
+        ultra::metrics::PerformanceMetrics::reset();
+      }
+      nlohmann::json payloadOut;
+      payloadOut["report"] = ultra::metrics::PerformanceMetrics::report();
+      payloadOut["meta_cognitive"] = nlohmann::json::object();
+      return makeOk(payloadOut, 0);
+    }
+
+    if (type == "ai_verify") {
+      nlohmann::json payloadOut;
+      std::string error;
+      if (!verifyIntegrity(payloadOut, error)) {
+        return makeError(error);
+      }
+      return makeOk(payloadOut, 0);
+    }
+
+    if (type == "authority_branch_list") {
+      return makeOk(buildBranchListPayload(projectRoot), 0);
+    }
+
+    if (type == "authority_branch_create") {
+      ultra::authority::AuthorityBranchRequest request;
+      request.reason = payload.value("reason", std::string{});
+      request.parentBranchId = payload.value("parent_branch_id", std::string{});
+      if (request.reason.empty()) {
+        return makeError("missing_branch_reason");
+      }
+      try {
+        ultra::authority::UltraAuthorityAPI api(projectRoot);
+        const std::string branchId = api.createBranch(request);
+        nlohmann::json payloadOut = nlohmann::json::object();
+        payloadOut["branch_id"] = branchId;
+        payloadOut["parent_branch_id"] = request.parentBranchId;
+        payloadOut["reason"] = request.reason;
+        return makeOk(payloadOut, 0);
+      } catch (const std::exception& ex) {
+        return makeError(ex.what());
+      } catch (...) {
+        return makeError("branch_create_failed");
+      }
+    }
+
+    if (type == "authority_intent_simulate") {
+      ultra::authority::AuthorityIntentRequest request;
+      request.goal = payload.value("goal", std::string{});
+      request.target = payload.value("target", std::string{});
+      request.branchId = payload.value("branch_id", std::string{});
+      request.tokenBudget = payload.value("token_budget", request.tokenBudget);
+      request.impactDepth = payload.value("impact_depth", request.impactDepth);
+      request.maxFilesChanged =
+          payload.value("max_files_changed", request.maxFilesChanged);
+      request.allowPublicApiChange =
+          payload.value("allow_public_api_change", request.allowPublicApiChange);
+      request.threshold = payload.value("threshold", request.threshold);
+      if (request.goal.empty() && request.target.empty()) {
+        return makeError("missing_intent_goal");
+      }
+      if (request.target.empty()) {
+        request.target = request.goal;
+      }
+      try {
+        ultra::authority::UltraAuthorityAPI api(projectRoot);
+        const ultra::authority::AuthorityRiskReport report =
+            api.evaluateRisk(request);
+        return makeOk(buildRiskReportPayload(report), 0);
+      } catch (const std::exception& ex) {
+        return makeError(ex.what());
+      } catch (...) {
+        return makeError("intent_simulation_failed");
+      }
+    }
+
+    if (type == "authority_context_query") {
+      ultra::authority::AuthorityContextRequest request;
+      request.query = payload.value("query", std::string{});
+      request.branchId = payload.value("branch_id", std::string{});
+      request.tokenBudget = payload.value("token_budget", request.tokenBudget);
+      request.impactDepth = payload.value("impact_depth", request.impactDepth);
+      if (request.query.empty()) {
+        return makeError("missing_context_query");
+      }
+      ultra::authority::UltraAuthorityAPI api(projectRoot);
+      const ultra::authority::AuthorityContextResult result =
+          api.getContextSlice(request);
+      if (!result.success) {
+        return makeError(result.message.empty() ? "context_query_failed"
+                                                : result.message);
+      }
+      nlohmann::json payloadOut = nlohmann::json::object();
+      payloadOut["context_json"] = result.contextJson;
+      payloadOut["estimated_tokens"] = result.estimatedTokens;
+      payloadOut["snapshot_version"] = result.snapshotVersion;
+      payloadOut["snapshot_hash"] = result.snapshotHash;
+      payloadOut["message"] = result.message;
+      return makeOk(payloadOut, 0);
+    }
+
+    if (type == "authority_commit" || type == "authority_branch_commit") {
+      ultra::authority::AuthorityCommitRequest request;
+      request.sourceBranchId = payload.value("source_branch_id", std::string{});
+      request.targetBranchId =
+          payload.value("target_branch_id", std::string{"main"});
+      request.maxAllowedRisk =
+          payload.value("max_allowed_risk", request.maxAllowedRisk);
+      const nlohmann::json policyPayload =
+          payload.value("policy", nlohmann::json::object());
+      if (policyPayload.is_object()) {
+        request.policy.maxImpactDepth =
+            policyPayload.value("max_impact_depth", request.policy.maxImpactDepth);
+        request.policy.maxFilesChanged =
+            policyPayload.value("max_files_changed", request.policy.maxFilesChanged);
+        request.policy.maxTokenBudget =
+            policyPayload.value("max_token_budget", request.policy.maxTokenBudget);
+        request.policy.allowPublicAPIChange =
+            policyPayload.value("allow_public_api_change",
+                                request.policy.allowPublicAPIChange);
+        request.policy.allowCrossModuleMove =
+            policyPayload.value("allow_cross_module_move",
+                                request.policy.allowCrossModuleMove);
+        request.policy.requireDeterminism =
+            policyPayload.value("require_determinism",
+                                request.policy.requireDeterminism);
+      }
+      if (request.sourceBranchId.empty()) {
+        return makeError("missing_source_branch");
+      }
+      std::string error;
+      ultra::authority::UltraAuthorityAPI api(projectRoot);
+      if (!api.commitWithPolicy(request, error)) {
+        return makeError(error.empty() ? "commit_failed" : error);
+      }
+      nlohmann::json payloadOut = nlohmann::json::object();
+      payloadOut["committed"] = true;
+      payloadOut["source_branch_id"] = request.sourceBranchId;
+      payloadOut["target_branch_id"] = request.targetBranchId;
+      return makeOk(payloadOut, 0);
+    }
+
+    if (type == "authority_savings") {
+      ultra::authority::UltraAuthorityAPI api(projectRoot);
+      nlohmann::json payloadOut = api.getSavingsReport();
+      return makeOk(payloadOut, 0);
+    }
+
+    return makeError("unsupported_request_type");
+  }
+
+ private:
+  static nlohmann::json makeOk(nlohmann::json payload,
+                               const int exitCode,
+                               const std::string& message = {}) {
+    nlohmann::json response;
+    response["status"] = "ok";
+    response["payload"] = std::move(payload);
+    response["exit_code"] = exitCode;
+    response["ok"] = exitCode == 0;
+    if (!message.empty()) {
+      response["message"] = message;
+    }
+    return response;
+  }
+
+  static nlohmann::json makeError(const std::string& error) {
+    return nlohmann::json{{"status", "error"}, {"error", error}};
+  }
+
+  static ultra::ai::RuntimeState& runtimeState() {
+    static ultra::ai::RuntimeState runtime;
+    return runtime;
+  }
+
+  static std::uint64_t& runtimeVersion() {
+    static std::uint64_t version = 0U;
+    return version;
+  }
+
+  static ultra::engine::query::SymbolQueryEngine& symbolQueryEngine() {
+    static ultra::engine::query::SymbolQueryEngine engine;
+    return engine;
+  }
+
+  bool ensureIndexAvailable(std::string& error) {
+    if (!runtimeState().files.empty()) {
+      return true;
+    }
+    // Lazy first-use build: the index has not been populated yet (startup
+    // rebuild was deliberately deferred so the IPC server could start and
+    // respond to the parent's "wake" ping before the scan runs).
+    nlohmann::json payloadOut;
+    return rebuildIndex(payloadOut, error);
+  }
+
+  nlohmann::json buildStatusPayload() const {
+    const ultra::ai::RuntimeState& runtime = runtimeState();
+    nlohmann::json payload = nlohmann::json::object();
+    const bool runtimeActive =
+        runtime.core.runtimeActive == 1U || !runtime.files.empty();
+    payload["runtime_active"] = runtimeActive;
+    payload["files_indexed"] = runtime.files.size();
+    payload["symbols_indexed"] = runtime.symbols.size();
+    payload["dependencies_indexed"] =
+        runtime.deps.fileEdges.size() + runtime.deps.symbolEdges.size();
+    payload["graph_nodes"] = runtime.files.size() + runtime.symbols.size();
+    payload["graph_edges"] =
+        runtime.deps.fileEdges.size() + runtime.deps.symbolEdges.size();
+    payload["memory_usage_bytes"] = estimateRuntimeBytes(runtime);
+    payload["pending_changes"] = 0U;
+    payload["schema_version"] = runtime.core.schemaVersion == 0U
+                                    ? ultra::ai::IntegrityManager::kSchemaVersion
+                                    : runtime.core.schemaVersion;
+    payload["index_version"] = runtime.core.indexVersion == 0U
+                                   ? ultra::ai::IntegrityManager::kIndexVersion
+                                   : runtime.core.indexVersion;
+    const std::filesystem::path pidPath =
+        projectRoot / ".ultra_daemon" / "daemon.pid";
+    std::ifstream pidStream(pidPath);
+    long long pid = 0;
+    pidStream >> pid;
+    payload["daemon_pid"] =
+        static_cast<std::uint64_t>(std::max<long long>(0, pid));
+    return payload;
+  }
+
+ public:
+  bool rebuildIndex(nlohmann::json& payloadOut, std::string& error) {
+    payloadOut = nlohmann::json::object();
+    error.clear();
+
+    ultra::ai::RuntimeState next;
+    std::vector<ultra::ai::DiscoveredFile> discovered =
+        ultra::ai::FileRegistry::discoverProjectFiles(projectRoot);
+
+    // Filter out directories that are not part of the project's own source:
+    // build artefacts, vendored grammars/deps, and VCS metadata.
+    // Without this, symbols like `main` resolve to googletest and tree-sitter
+    // test files instead of the project's own src/main.cpp.
+    static const std::vector<std::string> kExcludedPrefixes{
+        "build/", "build\\",
+        "third_party/", "third_party\\",
+        "_deps/", "_deps\\",
+        ".git/", ".git\\",
+        ".ultra_daemon/",
+    };
+    discovered.erase(
+        std::remove_if(
+            discovered.begin(), discovered.end(),
+            [](const ultra::ai::DiscoveredFile& file) {
+              for (const std::string& prefix : kExcludedPrefixes) {
+                if (file.relativePath.size() >= prefix.size() &&
+                    file.relativePath.compare(0, prefix.size(), prefix) == 0) {
+                  return true;
+                }
+              }
+              return false;
+            }),
+        discovered.end());
+
+    std::vector<ultra::ai::FileRecord> records =
+        ultra::ai::FileRegistry::deriveRecords(discovered);
+
+    for (std::size_t i = 0; i < records.size(); ++i) {
+      if (!ultra::ai::sha256OfFile(discovered[i].absolutePath,
+                                   records[i].hash, error)) {
+        return false;
+      }
+    }
+
+    const std::map<std::string, ultra::ai::FileRecord> filesByPath =
+        ultra::ai::FileRegistry::mapByPath(records);
+
+    std::vector<ultra::ai::SymbolRecord> symbols;
+    ultra::ai::DependencyTableData deps;
+    std::map<std::uint32_t, std::vector<ultra::ai::SemanticSymbolDependency>>
+        semanticDepsByFileId;
+
+    for (const auto& file : discovered) {
+      ultra::ai::SemanticParseResult semantic;
+      if (!ultra::ai::SemanticExtractor::extract(file.absolutePath, file.language,
+                                                 semantic, error)) {
+        return false;
+      }
+
+      std::vector<ultra::ai::SymbolRecord> fileSymbols;
+      if (!ultra::ai::SymbolTable::buildFromExtracted(
+              file.fileId, semantic.symbols, fileSymbols, error)) {
+        return false;
+      }
+      symbols.insert(symbols.end(), fileSymbols.begin(), fileSymbols.end());
+      semanticDepsByFileId[file.fileId] = semantic.symbolDependencies;
+
+      const std::string currentPath = file.relativePath;
+      for (const std::string& reference : semantic.dependencyReferences) {
+        std::string resolvedPath;
+        if (!resolveDependencyReference(currentPath, reference, filesByPath,
+                                        resolvedPath)) {
+          continue;
+        }
+        const auto targetIt = filesByPath.find(resolvedPath);
+        if (targetIt == filesByPath.end()) {
+          continue;
+        }
+        ultra::ai::FileDependencyEdge edge;
+        edge.fromFileId = file.fileId;
+        edge.toFileId = targetIt->second.fileId;
+        deps.fileEdges.push_back(edge);
+      }
+    }
+
+    next.files = std::move(records);
+    next.symbols = std::move(symbols);
+    next.deps = std::move(deps);
+    next.semanticSymbolDepsByFileId = std::move(semanticDepsByFileId);
+    rebuildSymbolEdges(next);
+
+    std::error_code ec;
+    std::filesystem::create_directories(aiDirectory, ec);
+    if (ec) {
+      error = "Failed to create AI runtime directory: " + aiDirectory.string();
+      return false;
+    }
+
+    const std::filesystem::path filesTablePath = aiDirectory / "files.tbl";
+    const std::filesystem::path symbolsTablePath = aiDirectory / "symbols.tbl";
+    const std::filesystem::path depsTablePath = aiDirectory / "deps.tbl";
+    const std::filesystem::path corePath = aiDirectory / "core.idx";
+
+    if (!ultra::ai::BinaryIndexWriter::writeFilesTable(
+            filesTablePath, ultra::ai::IntegrityManager::kSchemaVersion,
+            next.files, error)) {
+      return false;
+    }
+    if (!ultra::ai::BinaryIndexWriter::writeSymbolsTable(
+            symbolsTablePath, ultra::ai::IntegrityManager::kSchemaVersion,
+            next.symbols, error)) {
+      return false;
+    }
+    if (!ultra::ai::BinaryIndexWriter::writeDependenciesTable(
+            depsTablePath, ultra::ai::IntegrityManager::kSchemaVersion,
+            next.deps, error)) {
+      return false;
+    }
+
+    ultra::ai::Sha256Hash filesHash{};
+    ultra::ai::Sha256Hash symbolsHash{};
+    ultra::ai::Sha256Hash depsHash{};
+    ultra::ai::Sha256Hash indexHash{};
+
+    if (!ultra::ai::IntegrityManager::computeTableHash(
+            filesTablePath, filesHash, error)) {
+      return false;
+    }
+    if (!ultra::ai::IntegrityManager::computeTableHash(
+            symbolsTablePath, symbolsHash, error)) {
+      return false;
+    }
+    if (!ultra::ai::IntegrityManager::computeTableHash(
+            depsTablePath, depsHash, error)) {
+      return false;
+    }
+    if (!ultra::ai::IntegrityManager::computeIndexHash(
+            filesTablePath, symbolsTablePath, depsTablePath, indexHash, error)) {
+      return false;
+    }
+
+    const ultra::ai::Sha256Hash projectRootHash =
+        ultra::ai::IntegrityManager::computeProjectRootHash(next.files);
+    const ultra::ai::CoreIndex core = ultra::ai::IntegrityManager::buildCoreIndex(
+        !next.files.empty(), filesHash, symbolsHash, depsHash, projectRootHash,
+        indexHash);
+
+    if (!ultra::ai::BinaryIndexWriter::writeCoreIndex(corePath, core, error)) {
+      return false;
+    }
+
+    next.core = core;
+    previousState = runtimeState();
+    runtimeState() = std::move(next);
+    stateManager.replaceState(runtimeState());
+    symbolQueryEngine().rebuild(runtimeState(), ++runtimeVersion());
+
+    payloadOut["message"] = "semantic_index_built";
+    payloadOut["runtime_active"] = runtimeState().core.runtimeActive == 1U;
+    payloadOut["files_indexed"] = runtimeState().files.size();
+    payloadOut["symbols_indexed"] = runtimeState().symbols.size();
+    payloadOut["dependencies_indexed"] =
+        runtimeState().deps.fileEdges.size() +
+        runtimeState().deps.symbolEdges.size();
+    payloadOut["schema_version"] = runtimeState().core.schemaVersion;
+    payloadOut["index_version"] = runtimeState().core.indexVersion;
+    return true;
+  }
+
+  bool writeAgentContext(nlohmann::json& payloadOut, std::string& error) {
+    payloadOut = nlohmann::json::object();
+    error.clear();
+
+    const ultra::ai::RuntimeState& state = runtimeState();
+    if (!ultra::ai::AgentExportBuilder::writeAgentContext(
+            agentContextPath, state.files, state.symbols, state.deps, error)) {
+      return false;
+    }
+
+    // Do NOT read the file back into the response payload.
+    // The agent context JSON for a real project can be several MB.
+    // The IPC pipe has a 1 MB cap (kMaxMessageBytes in ultra_ipc_client.cpp).
+    // Embedding the raw content causes the response to overflow the cap,
+    // the reader returns empty, and the client gets "invalid_json_response".
+    // Instead we return the path so the CLI can read it directly from disk.
+    payloadOut["context_path"] = agentContextPath.string();
+    payloadOut["files_indexed"] = state.files.size();
+    payloadOut["symbols_indexed"] = state.symbols.size();
+    payloadOut["dependencies_indexed"] =
+        state.deps.fileEdges.size() + state.deps.symbolEdges.size();
+    return true;
+  }
+
+  bool computeContextDiff(nlohmann::json& payloadOut, std::string& error) {
+    payloadOut = nlohmann::json::object();
+    error.clear();
+
+    if (!previousState.has_value()) {
+      error = "no_previous_snapshot";
+      return false;
+    }
+
+    const ultra::ai::RuntimeState current = runtimeState();
+    const ultra::runtime::DiffResult diff =
+        ultra::runtime::buildDiffResult(*previousState, current, nullptr, 0U);
+
+    nlohmann::json added = nlohmann::json::array();
+    nlohmann::json removed = nlohmann::json::array();
+    nlohmann::json modified = nlohmann::json::array();
+
+    for (const ultra::diff::SymbolDelta& delta : diff.delta.changeObject) {
+      switch (delta.changeType) {
+        case ultra::types::ChangeType::Added:
+          added.push_back(delta.symbolName);
+          break;
+        case ultra::types::ChangeType::Removed:
+          removed.push_back(delta.symbolName);
+          break;
+        case ultra::types::ChangeType::Modified:
+        case ultra::types::ChangeType::Renamed:
+          modified.push_back(delta.symbolName);
+          break;
+        default:
+          break;
+      }
+    }
+
+    payloadOut["added"] = std::move(added);
+    payloadOut["removed"] = std::move(removed);
+    payloadOut["modified"] = std::move(modified);
+    payloadOut["changed"] = diff.changedFiles;
+
+    std::unordered_map<std::uint64_t, std::string> nameById;
+    nameById.reserve(current.symbols.size());
+    for (const ultra::ai::SymbolRecord& symbol : current.symbols) {
+      if (!symbol.name.empty()) {
+        nameById[symbol.symbolId] = symbol.name;
+      }
+    }
+
+    nlohmann::json affected = nlohmann::json::array();
+    for (const ultra::runtime::SymbolID symbolId : diff.affectedSymbols) {
+      const auto it = nameById.find(symbolId);
+      if (it != nameById.end() && !it->second.empty()) {
+        affected.push_back(it->second);
+      } else {
+        affected.push_back(std::to_string(symbolId));
+      }
+    }
+    payloadOut["affected"] = std::move(affected);
+
+    std::ofstream output(contextDiffPath, std::ios::binary | std::ios::trunc);
+    if (!output) {
+      error = "Failed to write context diff: " + contextDiffPath.string();
+      return false;
+    }
+    output << payloadOut.dump(2);
+    if (!output) {
+      error = "Failed writing context diff: " + contextDiffPath.string();
+      return false;
+    }
+
+    return true;
+  }
+
+  bool readSource(const std::string& target,
+                  nlohmann::json& payloadOut,
+                  std::string& error) const {
+    payloadOut = nlohmann::json::object();
+
+    // First try the target as-is: absolute, or relative to projectRoot.
+    std::filesystem::path path(target);
+    if (path.is_relative()) {
+      path = projectRoot / path;
+    }
+    path = path.lexically_normal();
+
+    if (!std::filesystem::exists(path)) {
+      // Exact path failed. Try suffix matching against the indexed file list.
+      // This lets the user type "SymbolDiff.h" and resolve to
+      // "src/diff/SymbolDiff.h" automatically.
+      const ultra::ai::RuntimeState& runtime = runtimeState();
+      std::string bestMatch;
+      const std::string normalizedTarget =
+          std::filesystem::path(target).generic_string();
+      for (const ultra::ai::FileRecord& file : runtime.files) {
+        const std::string& filePath = file.path;
+        if (filePath == normalizedTarget ||
+            (filePath.size() > normalizedTarget.size() &&
+             filePath[filePath.size() - normalizedTarget.size() - 1U] == '/' &&
+             filePath.compare(filePath.size() - normalizedTarget.size(),
+                              normalizedTarget.size(),
+                              normalizedTarget) == 0)) {
+          if (bestMatch.empty() || filePath.size() < bestMatch.size()) {
+            bestMatch = filePath;
+          }
+        }
+      }
+      if (!bestMatch.empty()) {
+        path = (projectRoot / bestMatch).lexically_normal();
+      }
+    }
+
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+      error = "Failed to open source file: " + target +
+              "\n  Tried: " + path.string() +
+              "\n  Hint: use a relative path like src/diff/SymbolDiff.h";
+      return false;
+    }
+
+    const std::string content((std::istreambuf_iterator<char>(input)),
+                              std::istreambuf_iterator<char>());
+    if (!input.good() && !input.eof()) {
+      error = "Failed reading source file: " + target;
+      return false;
+    }
+
+    payloadOut["kind"] = "source";
+    payloadOut["path"] = path.string();
+    payloadOut["content"] = content;
+    return true;
+  }
+
+  bool verifyIntegrity(nlohmann::json& payloadOut, std::string& error) {
+    payloadOut = nlohmann::json::object();
+    error.clear();
+
+    const std::filesystem::path corePath = aiDirectory / "core.idx";
+    const std::filesystem::path filesTablePath = aiDirectory / "files.tbl";
+    const std::filesystem::path symbolsTablePath = aiDirectory / "symbols.tbl";
+    const std::filesystem::path depsTablePath = aiDirectory / "deps.tbl";
+
+    ultra::ai::CoreIndex core;
+    if (!ultra::ai::BinaryIndexReader::readCoreIndex(corePath, core, error)) {
+      return false;
+    }
+
+    std::vector<ultra::ai::FileRecord> files;
+    if (!ultra::ai::BinaryIndexReader::readFilesTable(
+            filesTablePath, core.schemaVersion, files, error)) {
+      return false;
+    }
+
+    ultra::ai::Sha256Hash filesHash{};
+    ultra::ai::Sha256Hash symbolsHash{};
+    ultra::ai::Sha256Hash depsHash{};
+    ultra::ai::Sha256Hash indexHash{};
+
+    if (!ultra::ai::IntegrityManager::computeTableHash(
+            filesTablePath, filesHash, error)) {
+      return false;
+    }
+    if (!ultra::ai::IntegrityManager::computeTableHash(
+            symbolsTablePath, symbolsHash, error)) {
+      return false;
+    }
+    if (!ultra::ai::IntegrityManager::computeTableHash(
+            depsTablePath, depsHash, error)) {
+      return false;
+    }
+    if (!ultra::ai::IntegrityManager::computeIndexHash(
+            filesTablePath, symbolsTablePath, depsTablePath, indexHash, error)) {
+      return false;
+    }
+
+    const ultra::ai::Sha256Hash projectRootHash =
+        ultra::ai::IntegrityManager::computeProjectRootHash(files);
+
+    if (!ultra::ai::IntegrityManager::verify(core,
+                                              filesHash,
+                                              symbolsHash,
+                                              depsHash,
+                                              projectRootHash,
+                                              indexHash,
+                                              error)) {
+      return false;
+    }
+
+    payloadOut["integrity_ok"] = true;
+    payloadOut["runtime_active"] = core.runtimeActive == 1U;
+    payloadOut["schema_version"] = core.schemaVersion;
+    payloadOut["index_version"] = core.indexVersion;
+    return true;
+  }
+};
+
+inline ultra::runtime::UltraDaemon::RuntimeRequestHandler buildDaemonRuntimeHandler(
+    const std::filesystem::path& projectRoot) {
+  auto dispatcher = std::make_shared<DaemonRuntimeDispatcher>(projectRoot);
+  // Do NOT call rebuildIndex here. Doing so blocks the return of this function,
+  // which means UltraDaemon::run() / ipcServer_.start() never gets called until
+  // the full scan completes. The parent process polls for a "wake" IPC response
+  // with a 5-second deadline — on any real project the scan exceeds that window
+  // and wake() returns false ("failed to spawn daemon").
+  // Index is built lazily inside ensureIndexAvailable() on the first query that
+  // needs it, by which point the IPC server is already listening.
+  return [dispatcher](const std::string& type, const nlohmann::json& payload) {
+    return dispatcher->handle(type, payload);
+  };
+}
 bool pathExists(const std::filesystem::path& path) {
   std::error_code ec;
   const bool exists = std::filesystem::exists(path, ec);
@@ -267,16 +1632,6 @@ void printAiContextPayload(const nlohmann::json& value) {
                              "path");
   printStringList("Context impact region",
                   value.value("impact_region", nlohmann::json::array()));
-}
-
-bool contextPayloadHasContent(const nlohmann::json& value) {
-  if (!value.is_object()) {
-    return false;
-  }
-  const nlohmann::json nodes = value.value("nodes", nlohmann::json::array());
-  const nlohmann::json files = value.value("files", nlohmann::json::array());
-  return (nodes.is_array() && !nodes.empty()) ||
-         (files.is_array() && !files.empty());
 }
 
 void printMetaCognitivePayload(const nlohmann::json& payload) {
@@ -838,7 +2193,7 @@ bool CLIEngine::validate(const ParsedCommand& cmd) const {
   if (cmd.name == "branch") {
     if (cmd.args.empty()) {
         ultra::core::Logger::error(
-            "Command 'branch' requires a subcommand (create).");
+            "Command 'branch' requires a subcommand (create, list, simulate).");
         return false;
     }
 }
@@ -1201,57 +2556,14 @@ void CLIEngine::registerHandlers() {
                                                                              : 1);
                                     };
 
-                                auto requestAiContextFallback =
-                                    [this, &request](nlohmann::json& responseOut,
-                                                     std::string& errorOut) {
-                                      nlohmann::json payload =
-                                          nlohmann::json::object();
-                                      payload["query"] = request.query;
-                                      payload["token_budget"] = request.tokenBudget;
-                                      payload["impact_depth"] = request.impactDepth;
-                                      return ultra::ai::AiRuntimeManager::requestDaemon(
-                                          m_projectRoot, "ai_context", payload,
-                                          responseOut, errorOut);
-                                    };
-
                                 nlohmann::json response;
                                 std::string error;
                                 if (!ultra::ai::AiRuntimeManager::requestDaemon(
                                         m_projectRoot, "authority_context_query",
                                         requestPayload, response, error)) {
-                                  nlohmann::json fallbackResponse;
-                                  std::string fallbackError;
-                                  if (requestAiContextFallback(fallbackResponse,
-                                                               fallbackError)) {
-                                    emitContextResponse(fallbackResponse);
-                                    return;
-                                  }
                                   ultra::core::Logger::error(error);
                                   m_lastExitCode = 1;
                                   return;
-                                }
-
-                                const nlohmann::json payload = response.value(
-                                    "payload", nlohmann::json::object());
-                                const nlohmann::json authorityContext =
-                                    payload.value("context",
-                                                  nlohmann::json::object());
-                                if (!contextPayloadHasContent(authorityContext)) {
-                                  nlohmann::json fallbackResponse;
-                                  std::string fallbackError;
-                                  if (requestAiContextFallback(fallbackResponse,
-                                                               fallbackError)) {
-                                    const nlohmann::json fallbackPayload =
-                                        fallbackResponse.value(
-                                            "payload", nlohmann::json::object());
-                                    if (contextPayloadHasContent(
-                                            fallbackPayload.value(
-                                                "context",
-                                                nlohmann::json::object()))) {
-                                      emitContextResponse(fallbackResponse);
-                                      return;
-                                    }
-                                  }
                                 }
 
                                 emitContextResponse(response);
@@ -1518,10 +2830,45 @@ void CLIEngine::registerHandlers() {
   });
   m_router.registerCommand("branch", [this](const std::vector<std::string>& args) {
     const std::string& subcmd = args.at(0);
+
+    if (subcmd == "list") {
+      nlohmann::json response;
+      std::string error;
+
+      if (!ultra::ai::AiRuntimeManager::requestDaemon(
+              m_projectRoot, "authority_branch_list",
+              nlohmann::json::object(), response, error)) {
+        ultra::core::Logger::error(error);
+        m_lastExitCode = 1;
+        return;
+      }
+
+      std::cout << response.value("payload", nlohmann::json::object()).dump(2) << '\n';
+      m_lastExitCode = response.value("exit_code", response.value("ok", false) ? 0 : 1);
+      return;
+    }
+
+    if (subcmd == "simulate") {
+      nlohmann::json requestPayload = nlohmann::json::object();
+      nlohmann::json response;
+      std::string error;
+
+      if (!ultra::ai::AiRuntimeManager::requestDaemon(
+              m_projectRoot, "authority_intent_simulate",
+              requestPayload, response, error)) {
+        ultra::core::Logger::error(error);
+        m_lastExitCode = 1;
+        return;
+      }
+
+      std::cout << response.value("payload", nlohmann::json::object()).dump(2) << '\n';
+      m_lastExitCode = response.value("exit_code", response.value("ok", false) ? 0 : 1);
+      return;
+    }
+
     if (subcmd != "create") {
-      std::cout << "[Core Intelligence] Branch -> " << subcmd << " requested.\n";
-      std::cout << "  Command under construction or missing required arguments.\n";
-      m_lastExitCode = 0;
+      ultra::core::Logger::error("Unsupported branch subcommand: " + subcmd);
+      m_lastExitCode = 1;
       return;
     }
 
@@ -1929,7 +3276,17 @@ void CLIEngine::registerHandlers() {
     if (!workspaceOverride.empty()) {
       projectRoot = workspaceOverride;
     }
-    (void)uairChildMode;
+    // If this process was spawned AS the daemon child (legacy --uair-child path),
+    // enter the daemon loop directly. The early intercept in run() handles
+    // the newer --ultra-daemon path; this covers any caller that still uses
+    // --uair-child as a sub-argument to wake_ai rather than as argv[1].
+    if (uairChildMode) {
+      ultra::runtime::UltraDaemon::RuntimeRequestHandler handler =
+          buildDaemonRuntimeHandler(projectRoot);
+      ultra::runtime::UltraDaemon daemon(projectRoot);
+      m_lastExitCode = daemon.run(handler) ? 0 : 1;
+      return;  // void lambda — set m_lastExitCode above, early-exit handler
+    }
 
     ultra::ai::AiRuntimeManager runtime(projectRoot);
     m_lastExitCode = runtime.wakeAi(true);
@@ -2029,7 +3386,7 @@ void CLIEngine::registerHandlers() {
     requestDaemonCommand("rebuild_ai", false, nlohmann::json::object(), false);
   });
   m_router.registerCommand("sleep_ai", [requestDaemonCommand](const std::vector<std::string>&) {
-    requestDaemonCommand("sleep_ai", false, nlohmann::json::object(), false);
+    requestDaemonCommand("shutdown", false, nlohmann::json::object(), false);
   });
   m_router.registerCommand("ai_context",
                            [this](const std::vector<std::string>& args) {
@@ -2054,15 +3411,36 @@ void CLIEngine::registerHandlers() {
 
     const nlohmann::json payload =
         response.value("payload", nlohmann::json::object());
-    const std::string contextJson =
-        payload.value("context_json", std::string{});
-    if (!contextJson.empty()) {
-      std::cout << contextJson;
+
+    // The daemon no longer embeds the raw context JSON in the IPC response
+    // (it would overflow the 1 MB pipe cap). It returns a context_path instead.
+    // Read the file from disk here on the client side.
+    const std::string contextPath = payload.value("context_path", std::string{});
+    if (!contextPath.empty()) {
+      std::ifstream contextFile(contextPath, std::ios::binary);
+      if (contextFile) {
+        const std::string content((std::istreambuf_iterator<char>(contextFile)),
+                                  std::istreambuf_iterator<char>());
+        std::cout << content;
+        if (content.empty() || content.back() != '\n') {
+          std::cout << '\n';
+        }
+      } else {
+        ultra::core::Logger::error("Failed to read context file: " + contextPath);
+        m_lastExitCode = 1;
+        return;
+      }
     } else {
-      std::cout << payload.value("context", nlohmann::json::object()).dump(2);
-    }
-    if (contextJson.empty() || contextJson.back() != '\n') {
-      std::cout << '\n';
+      // Fallback: daemon sent context_json directly (old behaviour / small payload).
+      const std::string contextJson = payload.value("context_json", std::string{});
+      if (!contextJson.empty()) {
+        std::cout << contextJson;
+      } else {
+        std::cout << payload.value("context", nlohmann::json::object()).dump(2);
+      }
+      if (contextJson.empty() || contextJson.back() != '\n') {
+        std::cout << '\n';
+      }
     }
     m_lastExitCode =
         response.value("exit_code", response.value("ok", false) ? 0 : 1);
@@ -2168,8 +3546,34 @@ void CLIEngine::printMetricsIfRequested(
 }
 
 int CLIEngine::run(int argc, char* argv[]) {
-  m_projectRoot = resolveCliProjectRoot((argc > 0 && argv != nullptr) ? argv[0]
-                                                                       : nullptr);
+  // Daemon child intercept — MUST be the first thing in run().
+  // When wakeAi() spawns a background child it calls:
+  //   ultra.exe --ultra-daemon --project-root <path>
+  // argv[1] == "--ultra-daemon" is NOT a CLI command, so parse() would
+  // produce "Unknown command" and exit before the daemon loop ever starts.
+  // We catch it here and enter the blocking daemon event loop directly.
+  if (argc >= 2) {
+    const std::string firstArg(argv[1]);
+    if (firstArg == "--ultra-daemon" || firstArg == "--uair-child") {
+      // Parse --project-root <path> which spawnDetached() always appends.
+      std::filesystem::path projectRoot = std::filesystem::current_path();
+      for (int i = 2; i < argc - 1; ++i) {
+        if (std::string(argv[i]) == "--project-root" && argv[i + 1] != nullptr) {
+          projectRoot = argv[i + 1];
+          break;
+        }
+      }
+      // buildDaemonRuntimeHandler creates the dispatcher and returns the handler.
+      // The IPC server starts inside daemon.run() so the parent's wake ping is
+      // answered immediately; the index builds lazily on the first query.
+      ultra::runtime::UltraDaemon::RuntimeRequestHandler handler =
+          buildDaemonRuntimeHandler(projectRoot);
+      ultra::runtime::UltraDaemon daemon(projectRoot);
+      return daemon.run(handler) ? 0 : 1;
+    }
+  }
+
+   m_projectRoot = std::filesystem::current_path();
   ParsedCommand cmd = parse(argc, argv);
   if (!cmd.valid) return 1;
   m_metricsRequested = false;

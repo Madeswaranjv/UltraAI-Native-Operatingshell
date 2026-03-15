@@ -8,14 +8,26 @@
 
 namespace ultra::ai {
 
-SemanticParseResult SemanticExtractor::extract(const std::filesystem::path& path,
-                                               const Language language) {
-  SemanticParseResult result;
+bool SemanticExtractor::extract(const std::filesystem::path& path,
+                                const Language language,
+                                SemanticParseResult& result,
+                                std::string& error) {
+  result = SemanticParseResult{};
+  error.clear();
 
   parsing::ParsedAST ast;
   parsing::TreeSitterParser parser;
   if (!parser.parseFile(path, language, ast)) {
-    return result;
+    result.parseError =
+        "Tree-sitter parse failed for: " + path.lexically_normal().string();
+    error = result.parseError;
+    return false;
+  }
+  if (!ast.valid || !ast.usedTreeSitterBackend) {
+    result.parseError =
+        "Tree-sitter AST is unavailable for: " + path.lexically_normal().string();
+    error = result.parseError;
+    return false;
   }
 
   result.symbols = parsing::SymbolExtractor::extract(ast);
@@ -30,8 +42,9 @@ SemanticParseResult SemanticExtractor::extract(const std::filesystem::path& path
                     return symbol.symbolType == SymbolType::EntryPoint ||
                            symbol.name == "main";
                   });
+  result.parsed = true;
 
-  return result;
+  return true;
 }
 
 }  // namespace ultra::ai

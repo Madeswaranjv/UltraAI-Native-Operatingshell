@@ -16,7 +16,11 @@ enum class Language : std::uint8_t {
   Cpp = 1,
   JavaScript = 2,
   TypeScript = 3,
-  Python = 4
+  Python = 4,
+  Java = 5,
+  Go = 6,
+  Rust = 7,
+  CSharp = 8
 };
 
 struct DiscoveredFile {
@@ -43,18 +47,23 @@ class FileRegistry {
  public:
   static std::vector<DiscoveredFile> discoverProjectFiles(
       const std::filesystem::path& projectRoot);
+
   static std::vector<FileRecord> deriveRecords(
       const std::vector<DiscoveredFile>& discoveredFiles);
 
   static std::map<std::string, FileRecord> mapByPath(
       const std::vector<FileRecord>& records);
+
   static std::map<std::uint32_t, std::string> mapPathById(
       const std::vector<FileRecord>& records);
 
   static Language detectLanguage(const std::filesystem::path& path);
+
   static std::string languageToString(Language language);
+
   static std::string toRelativeUtf8Path(const std::filesystem::path& root,
                                         const std::filesystem::path& absolute);
+
   static std::uint64_t fileTimeToUint64(std::filesystem::file_time_type value);
 };
 

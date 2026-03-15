@@ -7,10 +7,10 @@
   "rollback_count": 0,
   "cumulative_compression_efficiency": 0.0,
   "compression_samples": 126,
-  "cumulative_risk_error": 861.0488749407745,
-  "risk_samples": 4282,
-  "cumulative_confidence_error": 91.18693056962039,
-  "confidence_samples": 4282,
+  "cumulative_risk_error": 1027.51335136829,
+  "risk_samples": 4648,
+  "cumulative_confidence_error": 190.88326389797487,
+  "confidence_samples": 4648,
   "outcomes": [
     {
       "version": 152,

@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <list>
 #include <map>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <utility>
 
@@ -16,6 +18,7 @@ class QueryCache {
 
   void clear();
   void invalidate(std::uint64_t version);
+  [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
 
   template <typename ValueT>
   bool get(const std::string& key, std::uint64_t version, ValueT& out) const {
@@ -23,17 +26,32 @@ class QueryCache {
       return false;
     }
     ensureVersion(version);
-    const auto it = indexByKey_.find(key);
-    if (it == indexByKey_.end()) {
-      return false;
+
+    ValueT cachedValue{};
+    {
+      std::shared_lock<std::shared_mutex> lock(mutex_);
+      const auto it = indexByKey_.find(key);
+      if (it == indexByKey_.end()) {
+        return false;
+      }
+
+      const ValueT* cached = std::any_cast<ValueT>(&it->second->value);
+      if (cached == nullptr) {
+        return false;
+      }
+      cachedValue = *cached;
     }
 
-    const ValueT* cached = std::any_cast<ValueT>(&it->second->value);
-    if (cached == nullptr) {
-      return false;
+    {
+      std::unique_lock<std::shared_mutex> lock(mutex_);
+      const auto it = indexByKey_.find(key);
+      if (it != indexByKey_.end()) {
+        entries_.splice(entries_.end(), entries_, it->second);
+        it->second = std::prev(entries_.end());
+      }
     }
 
-    out = *cached;
+    out = std::move(cachedValue);
     return true;
   }
 
@@ -44,6 +62,7 @@ class QueryCache {
     }
     ensureVersion(version);
 
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     const auto existingIt = indexByKey_.find(key);
     if (existingIt != indexByKey_.end()) {
       entries_.erase(existingIt->second);
@@ -74,7 +93,7 @@ class QueryCache {
   mutable std::uint64_t version_{0U};
   mutable std::list<Entry> entries_;
   mutable std::map<std::string, std::list<Entry>::iterator> indexByKey_;
+  mutable std::shared_mutex mutex_;
 };
 
 }  // namespace ultra::engine::query
-

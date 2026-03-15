@@ -1,8 +1,11 @@
 #pragma once
 //E:\Projects\Ultra\src\memory\HotSlice.h
 #include "StateGraph.h"
+#include <atomic>
 #include <cstdint>
 #include <map>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -14,7 +17,23 @@ namespace ultra::memory {
 /// Tracks access frequency and automatically evicts cold nodes.
 class HotSlice {
  public:
-  static constexpr std::size_t kMaxHotSliceEntries = 256U;
+  // Minimum floor — never shrink below this regardless of graph size.
+  static constexpr std::size_t kMinHotSliceEntries = 256U;
+
+  // Backward-compatible alias so all existing callers of kMaxHotSliceEntries
+  // continue to compile without changes.
+  static constexpr std::size_t kMaxHotSliceEntries = kMinHotSliceEntries;
+
+  // Legacy default kept for zero-arg construction (small repos / tests).
+  static constexpr std::size_t kDefaultHotSliceEntries = kMinHotSliceEntries;
+
+  /// Compute the correct hot-slice capacity for a graph of this size.
+  /// Formula: max(avgSnapshotNodes * 2, graphNodeCount / 20, kMinHotSliceEntries)
+  /// Call once after each index rebuild and pass the result to setMaxSize().
+  /// avgSnapshotNodes = 0 means "use graph size only".
+  [[nodiscard]] static std::size_t computeCapacity(
+      std::size_t graphNodeCount,
+      std::size_t avgSnapshotNodes = 0U) noexcept;
 
   struct GovernanceStats {
     std::size_t currentSize{0U};
@@ -26,7 +45,7 @@ class HotSlice {
     double hitRate{0.0};
   };
 
-  explicit HotSlice(std::size_t maxSize = kMaxHotSliceEntries);
+  explicit HotSlice(std::size_t maxSize = kDefaultHotSliceEntries);
 
   /// Increment access count for a node, potentially promoting it.
   void recordAccess(const std::string& nodeId);
@@ -68,7 +87,8 @@ class HotSlice {
   /// Bind this working memory to a specific graph snapshot version.
   void bindToSnapshotVersion(std::uint64_t snapshotVersion);
 
-  [[nodiscard]] std::uint64_t boundSnapshotVersion() const noexcept {
+  [[nodiscard]] std::uint64_t boundSnapshotVersion() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     return boundSnapshotVersion_;
   }
 
@@ -83,11 +103,29 @@ class HotSlice {
   void evictLowestRelevance();
   void setMaxSize(std::size_t maxSize);
 
-  std::size_t currentSize() const { return nodes_.size(); }
-  [[nodiscard]] std::size_t maxSize() const noexcept { return maxSize_; }
+  std::size_t currentSize() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return nodes_.size();
+  }
+  [[nodiscard]] std::size_t maxSize() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return maxSize_;
+  }
   [[nodiscard]] GovernanceStats stats() const noexcept;
 
  private:
+  void recordAccessLocked(const std::string& nodeId,
+                          std::uint64_t currentVersion);
+  void promoteLocked(const std::string& nodeId,
+                     double boost,
+                     std::uint64_t currentVersion);
+  void demoteLocked(const std::string& nodeId,
+                    double penalty,
+                    std::uint64_t currentVersion);
+  void storeNodeLocked(const StateNode& node, std::uint64_t versionStamp);
+  void evictLowestRelevanceLocked();
+  void trimLocked();
+
   struct TrackedNode {
     StateNode data;
     std::size_t accessCount{1};
@@ -102,10 +140,11 @@ class HotSlice {
   std::size_t maxSize_;
   std::uint64_t boundSnapshotVersion_{0U};
   std::map<std::string, TrackedNode> nodes_;
-  mutable std::size_t lookupCount_{0U};
-  mutable std::size_t hitCount_{0U};
+  mutable std::atomic<std::size_t> lookupCount_{0U};
+  mutable std::atomic<std::size_t> hitCount_{0U};
   std::size_t evictionCount_{0U};
   std::size_t recalibrationCount_{0U};
+  mutable std::shared_mutex mutex_;
 };
 
 }  // namespace ultra::memory

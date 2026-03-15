@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <set>
 #include <tuple>
-
+//E:\Projects\Ultra\src\ai\parsing\DependencyExtractor.cpp
 namespace ultra::ai::parsing {
 
 namespace {
@@ -31,7 +31,7 @@ void gatherSymbolDependencies(
   const bool isDependencyNode =
       node.kind == AstNodeKind::CallExpr || node.kind == AstNodeKind::TypeRef ||
       node.kind == AstNodeKind::InheritanceRef;
-  if (isDependencyNode && !node.owner.empty() && !node.name.empty()) {
+  if (isDependencyNode && !node.name.empty()) {
     const auto key = std::make_tuple(node.owner, node.name, node.startLine);
     if (dedupe.insert(key).second) {
       SemanticSymbolDependency edge;

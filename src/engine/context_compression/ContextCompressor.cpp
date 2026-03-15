@@ -1,6 +1,7 @@
 #include "ContextCompressor.h"
 
 #include "../context/TokenBudgetManager.h"
+#include "../../metrics/PerformanceMetrics.h"
 #include "../../runtime/CPUGovernor.h"
 
 #include <algorithm>
@@ -557,6 +558,13 @@ context::ContextSlice ContextCompressor::compressContext(
   ScopedGovernorWorkload workload("context_compression");
   (void)workload.recommendedThreads;
 
+  // Capture raw token count before compression so we can report savings.
+  const std::size_t rawTokens =
+      slice.rawEstimatedTokens > 0U ? slice.rawEstimatedTokens
+                                    : slice.estimatedTokens;
+  const std::size_t candidateSymbols = slice.candidateSymbolCount;
+  const std::size_t selectedSymbols = slice.includedNodes.size();
+
   const context::TokenBudgetManager budgetManager(tokenBudget);
 
   const std::vector<CompressedNode> nodes = collectNodes(snapshot, slice);
@@ -611,6 +619,47 @@ context::ContextSlice ContextCompressor::compressContext(
     throw std::runtime_error(
         "Token budget too small for deterministic compressed context.");
   }
+
+  // Record compression outcome to PerformanceMetrics so that
+  // ultra savings / ultra metrics populate context and token sections.
+  if (metrics::PerformanceMetrics::isEnabled()) {
+    const std::size_t compressedTokens = slice.estimatedTokens;
+    const std::size_t jsonBytes = slice.json.size();
+    const bool truncated =
+        slice.payload.contains("metadata") &&
+        slice.payload["metadata"].is_object() &&
+        slice.payload["metadata"].value("truncated", false);
+
+    // Token savings: raw vs. compressed token count.
+    if (rawTokens > 0U) {
+      metrics::PerformanceMetrics::recordTokenSavings(rawTokens,
+                                                      compressedTokens);
+    }
+
+    // Context metrics: duration comes from the ScopedGovernorWorkload timer.
+    const std::uint64_t durationUs =
+        static_cast<std::uint64_t>(
+            std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - workload.start)
+                .count());
+
+    metrics::ContextMetrics cm;
+    cm.durationMicros = durationUs;
+    cm.candidateSymbolCount = candidateSymbols;
+    cm.selectedSymbolCount = selectedSymbols;
+    cm.jsonSizeBytes = jsonBytes;
+    cm.estimatedTokens = compressedTokens;
+    cm.rawEstimatedTokens = rawTokens;
+    cm.truncationRatio =
+        (rawTokens > 0U && rawTokens >= compressedTokens)
+            ? static_cast<double>(rawTokens - compressedTokens) /
+                  static_cast<double>(rawTokens)
+            : 0.0;
+    cm.hotSliceHits = 0U;
+    cm.hotSliceLookups = truncated ? 0U : 1U;
+    metrics::PerformanceMetrics::recordContextMetric(cm);
+  }
+
   return slice;
 }
 

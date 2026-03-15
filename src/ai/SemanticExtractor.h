@@ -45,13 +45,17 @@ struct SemanticParseResult {
   std::vector<ExtractedSymbol> symbols;
   std::vector<std::string> dependencyReferences;
   std::vector<SemanticSymbolDependency> symbolDependencies;
+  bool parsed{false};
   bool hasEntryPoint{false};
+  std::string parseError;
 };
 
 class SemanticExtractor {
  public:
-  static SemanticParseResult extract(const std::filesystem::path& path,
-                                     Language language);
+  static bool extract(const std::filesystem::path& path,
+                      Language language,
+                      SemanticParseResult& result,
+                      std::string& error);
 };
 
 }  // namespace ultra::ai

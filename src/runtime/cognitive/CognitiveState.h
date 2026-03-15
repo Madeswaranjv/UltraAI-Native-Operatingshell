@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 
 namespace ultra::runtime {
@@ -22,7 +23,7 @@ struct RelevanceProfile {
 
 struct CognitiveState {
   GraphSnapshot snapshot;
-  memory::HotSlice workingSet;
+  std::shared_ptr<memory::HotSlice> workingSet;
   RelevanceProfile weights;
   TokenBudget budget{0U};
   BranchID branch{BranchID::nil()};
@@ -30,7 +31,7 @@ struct CognitiveState {
   std::string pinnedHash;
 
   CognitiveState(const GraphSnapshot& snap,
-                 const memory::HotSlice& slice,
+                 std::shared_ptr<memory::HotSlice> slice,
                  TokenBudget tokenBudget,
                  const RelevanceProfile& profile = {});
 };

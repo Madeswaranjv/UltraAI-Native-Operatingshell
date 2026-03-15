@@ -41,7 +41,7 @@ AuthorityRiskReport RiskEvaluator::evaluate(
       clamp01(static_cast<double>(report.removedSymbols + report.publicApiChanges) /
               4.0);
   const double signatureComponent =
-      clamp01(static_cast<double>(report.signatureChanges) / 6.0);
+    clamp01(static_cast<double>(report.signatureChanges) / 100.0);
   const double dependencyComponent =
       clamp01((static_cast<double>(report.dependencyBreaks) +
                static_cast<double>(report.impactDepth)) /

@@ -369,8 +369,12 @@ bool Scanner::incrementalAdd(ai::RuntimeState& state,
     return false;
   }
 
-  const ai::SemanticParseResult semantic = ai::SemanticExtractor::extract(
-      discoveredIt->second.absolutePath, discoveredIt->second.language);
+  ai::SemanticParseResult semantic;
+  if (!ai::SemanticExtractor::extract(discoveredIt->second.absolutePath,
+                                      discoveredIt->second.language, semantic,
+                                      error)) {
+    return false;
+  }
 
   state.files.push_back(record);
   std::sort(state.files.begin(), state.files.end(),
@@ -498,8 +502,12 @@ bool Scanner::incrementalModify(ai::RuntimeState& state,
   fileIt->lastModified = discoveredIt->second.lastModified;
   fileIt->language = discoveredIt->second.language;
 
-  const ai::SemanticParseResult semantic = ai::SemanticExtractor::extract(
-      discoveredIt->second.absolutePath, discoveredIt->second.language);
+  ai::SemanticParseResult semantic;
+  if (!ai::SemanticExtractor::extract(discoveredIt->second.absolutePath,
+                                      discoveredIt->second.language, semantic,
+                                      error)) {
+    return false;
+  }
 
   state.symbols.erase(
       std::remove_if(state.symbols.begin(), state.symbols.end(),

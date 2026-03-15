@@ -87,12 +87,21 @@ void validateCognitiveState(const runtime::CognitiveState& state) {
   if (state.pinnedVersion != state.snapshot.version) {
     throwContractViolation("Invalid cognitive state: pinned version mismatch.");
   }
+  if (!state.workingSet) {
+    throwContractViolation("Invalid cognitive state: working set is null.");
+  }
 
-  memory::HotSlice alignedWorkingSet = state.workingSet;
+  const memory::HotSlice& alignedWorkingSet = *state.workingSet;
   const std::size_t entryCount = alignedWorkingSet.currentSize();
   const std::vector<memory::StateNode> alignedEntries =
-      alignedWorkingSet.getTopK(entryCount, state.snapshot.version);
-  if (alignedEntries.size() != entryCount) {
+      alignedWorkingSet.getTopK(entryCount);
+  std::size_t validEntries = 0U;
+  for (const memory::StateNode& entry : alignedEntries) {
+    if (alignedWorkingSet.containsNode(entry.nodeId, state.snapshot.version)) {
+      ++validEntries;
+    }
+  }
+  if (validEntries != entryCount) {
     throwContractViolation(
         "Invalid cognitive state: working set version mismatch.");
   }

@@ -1,10 +1,12 @@
 #include "ProjectScanner.h"
 #include "../core/ConfigManager.h"
 #include "utils/FileClassifier.h"
+
 #include <algorithm>
 #include <iterator>
-#include<iostream>
-//E:\Projects\Ultra\src\scanner\ProjectScanner.cpp
+#include <iostream>
+#include <chrono>
+
 namespace ultra::scanner {
 
 ProjectScanner::ProjectScanner(const ultra::core::ConfigManager& config)
@@ -67,46 +69,93 @@ bool ProjectScanner::shouldIgnore(const std::filesystem::path& path) const {
 }
 
 std::vector<FileInfo> ProjectScanner::scan(const std::filesystem::path& root) {
+
+  using clock = std::chrono::high_resolution_clock;
+  auto start = clock::now();
+
   std::vector<FileInfo> results;
 
   try {
+
     for (auto it = std::filesystem::recursive_directory_iterator(
              root,
              std::filesystem::directory_options::skip_permission_denied);
          it != std::filesystem::recursive_directory_iterator(); ++it) {
 
+      const std::filesystem::path& path = it->path();
+
+      // ---- Skip heavy directories ----
       if (it->is_directory()) {
-        if (shouldIgnore(it->path().filename())) {
+
+        const std::string name = path.filename().string();
+
+        if (name == ".git" ||
+      name == "node_modules" ||
+      name == "build" ||
+      name == "dist" ||
+      name == ".next" ||
+      name == "out" ||
+      name == "coverage" ||
+      name == "target" ||
+      name == ".cache" ||
+      name == "venv" ||
+      name == ".venv" ||
+      name == "__pycache__" ||
+      name == ".eggs" ||
+      name == ".mypy_cache" ||
+      name == ".pytest_cache" ||
+      name == ".tox" ||
+      name == ".idea" ||
+      name == ".vscode") {
+
+          it.disable_recursion_pending();
+          continue;
+        }
+
+        if (shouldIgnore(path.filename())) {
           it.disable_recursion_pending();
         }
+
         continue;
       }
 
       if (!it->is_regular_file())
         continue;
 
-      const std::filesystem::path& p = it->path();
-
       // Skip Ultra internal artifacts
-      if (ultra::utils::isToolArtifact(p))
+      if (ultra::utils::isToolArtifact(path))
         continue;
 
       FileInfo info;
-      info.path = p;
-      info.type = detectType(p);
+
+      info.path = path;
+      info.type = detectType(path);
 
       try {
-        info.size = std::filesystem::file_size(p);
+        info.size = std::filesystem::file_size(path);
       } catch (...) {
         info.size = 0;
       }
-        std::cout << p << " type=" << static_cast<int>(info.type) << "\n";
+
       results.push_back(std::move(info));
     }
 
   } catch (const std::filesystem::filesystem_error&) {
     throw;
   }
+
+  auto end = clock::now();
+
+  double seconds =
+      std::chrono::duration<double>(end - start).count();
+
+  std::cout << "[scanner] scanned "
+            << results.size()
+            << " files in "
+            << std::fixed
+            << std::setprecision(2)
+            << seconds
+            << " seconds\n";
 
   return results;
 }

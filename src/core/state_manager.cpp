@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <map>
+#include <new>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -22,7 +23,7 @@ namespace ultra::core {
 namespace {
 
 constexpr std::size_t kHotWindow = 8U;
-constexpr std::size_t kHotSliceFloor = 256U;
+constexpr std::size_t kHotSliceFloor = 10000U;
 constexpr std::size_t kMaxHotSymbols = 64U;
 constexpr std::size_t kTokenBudgetCeiling = 1U << 20;
 
@@ -94,6 +95,43 @@ void replaceSharedPtr(std::shared_ptr<T>& slot, std::shared_ptr<T> replacement) 
   std::shared_ptr<T> previous = std::move(slot);
   slot = std::move(replacement);
   retireSharedPtr(std::move(previous));
+}
+
+struct HotSliceSnapshot {
+  std::size_t maxSize{memory::HotSlice::kMaxHotSliceEntries};
+  std::uint64_t boundVersion{0U};
+  std::vector<memory::StateNode> nodes;
+};
+
+HotSliceSnapshot snapshotHotSlice(const memory::HotSlice& hotSlice) {
+  HotSliceSnapshot snapshot;
+  snapshot.maxSize = hotSlice.maxSize();
+  snapshot.boundVersion = hotSlice.boundSnapshotVersion();
+  const std::size_t count = hotSlice.currentSize();
+  if (count != 0U) {
+    snapshot.nodes = hotSlice.getTopK(count);
+  }
+  return snapshot;
+}
+
+void restoreHotSlice(memory::HotSlice& hotSlice, const HotSliceSnapshot& snapshot) {
+  hotSlice.~HotSlice();
+  new (&hotSlice) memory::HotSlice(snapshot.maxSize);
+  if (snapshot.boundVersion != 0U) {
+    hotSlice.bindToSnapshotVersion(snapshot.boundVersion);
+  }
+  for (const memory::StateNode& node : snapshot.nodes) {
+    hotSlice.storeNode(node, snapshot.boundVersion);
+  }
+}
+
+void resetHotSlice(memory::HotSlice& hotSlice, const std::size_t maxSize) {
+  hotSlice.~HotSlice();
+  new (&hotSlice) memory::HotSlice(maxSize);
+}
+
+std::shared_ptr<memory::HotSlice> aliasHotSlice(memory::HotSlice& hotSlice) {
+  return std::shared_ptr<memory::HotSlice>(&hotSlice, [](memory::HotSlice*) {});
 }
 
 }  // namespace
@@ -212,7 +250,7 @@ runtime::CognitiveState StateManager::createCognitiveState(
   const std::size_t boundedTokenBudget =
       cognitiveMemoryManager_.governedTokenBudget(clampTokenBudget(tokenBudget));
   runtime::GraphSnapshot snapshot = getSnapshot();
-  memory::HotSlice workingSet;
+  std::shared_ptr<memory::HotSlice> workingSet;
 
   {
     std::shared_lock lock(graphMutex_);
@@ -221,15 +259,15 @@ runtime::CognitiveState StateManager::createCognitiveState(
       snapshot.version = globalVersion_;
       snapshot.branch = activeBranch_;
     }
-    workingSet = cognitiveMemoryManager_.working;
+    workingSet = aliasHotSlice(cognitiveMemoryManager_.working);
   }
 
   cognitiveMemoryManager_.bindToSnapshot(&snapshot);
-  workingSet.bindToSnapshotVersion(snapshot.version);
-  workingSet.syncVersions(snapshot.version);
+  workingSet->bindToSnapshotVersion(snapshot.version);
+  workingSet->syncVersions(snapshot.version);
   const runtime::RelevanceProfile effectiveWeights =
       cognitiveMemoryManager_.resolvedRelevanceProfile(weights);
-  return runtime::CognitiveState(snapshot, workingSet, boundedTokenBudget,
+  return runtime::CognitiveState(snapshot, std::move(workingSet), boundedTokenBudget,
                                  effectiveWeights);
 }
 
@@ -438,7 +476,8 @@ KernelMutationOutcome StateManager::applyOverlayMutation(
   const engine::WeightEngine previousWeightEngine = weightEngine_;
   const memory::LruManager previousLru = lruManager_;
   const memory::LruManager previousBranchOverlayLru = branchOverlayLruManager_;
-  const memory::HotSlice previousHotSlice = cognitiveMemoryManager_.working;
+  const HotSliceSnapshot previousHotSlice =
+      snapshotHotSlice(cognitiveMemoryManager_.working);
   const memory::SnapshotChain previousSnapshotChain = snapshotChain_;
   const std::shared_ptr<memory::StateGraph> previousGraph =
       graph_ ? std::make_shared<memory::StateGraph>(*graph_) : nullptr;
@@ -451,7 +490,7 @@ KernelMutationOutcome StateManager::applyOverlayMutation(
     weightEngine_ = previousWeightEngine;
     lruManager_ = previousLru;
     branchOverlayLruManager_ = previousBranchOverlayLru;
-    cognitiveMemoryManager_.working = previousHotSlice;
+    restoreHotSlice(cognitiveMemoryManager_.working, previousHotSlice);
     snapshotChain_ = previousSnapshotChain;
     replaceSharedPtr(graph_, previousGraph);
     pendingDiffResult_ = previousDiffResult;
@@ -996,9 +1035,16 @@ void StateManager::rebuildGraphLocked() {
               return left.first < right.first;
             });
 
+  // Pass real graph dimensions into the cognitive memory layer BEFORE
+  // computing the hot slice size. Without this, graphNodeCount_ stays 0
+  // and computeCapacity() always returns the 256-node floor regardless of
+  // how large the repo is.
+  // files.size() + symbolsByName.size() ≈ total graph nodes.
+  cognitiveMemoryManager_.setGraphScale(
+      state_.files.size() + state_.symbols.size(), 0U);
   const std::size_t hotSliceSize = cognitiveMemoryManager_.governedHotSliceCapacity(
       std::max<std::size_t>(kHotSliceFloor, symbolsByName.size()));
-  cognitiveMemoryManager_.working = memory::HotSlice(hotSliceSize);
+  resetHotSlice(cognitiveMemoryManager_.working, hotSliceSize);
 
   std::set<std::string> recentFiles;
   for (std::size_t index = 0U;

@@ -20,7 +20,6 @@ constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
 constexpr std::size_t kMinGovernedTokenBudget = 64U;
 constexpr std::size_t kMinGovernedHotSliceCapacity = 64U;
-constexpr std::size_t kMaxGovernedHotSliceCapacity = 1024U;
 
 double clampDouble(const double value,
                    const double minValue,
@@ -101,6 +100,14 @@ void CognitiveMemoryManager::bindToSnapshot(const runtime::GraphSnapshot* snapsh
   persistEpisodic();
 }
 
+void CognitiveMemoryManager::setGraphScale(
+    const std::size_t graphNodeCount,
+    const std::size_t avgSnapshotNodes) noexcept {
+  graphNodeCount_ = graphNodeCount;
+  avgSnapshotNodes_ = avgSnapshotNodes;
+  working.setMaxSize(HotSlice::computeCapacity(graphNodeCount_, avgSnapshotNodes_));
+}
+
 void CognitiveMemoryManager::recordIntentExecution(
     const std::string& actionId,
     const runtime::GraphSnapshot& snapshot,
@@ -151,7 +158,6 @@ void CognitiveMemoryManager::recordIntentExecution(
   applyStrategicAdjustments();
   persistEpisodic();
   persistStrategic();
-  
 }
 
 void CognitiveMemoryManager::recordIntentStart(
@@ -405,7 +411,7 @@ void CognitiveMemoryManager::applyMemoryGovernance(
   governanceState_.branchId = boundBranch_.toString();
   governanceState_.activeOverlayCount = activeOverlayCount;
   const std::size_t requestedCapacity =
-      std::max<std::size_t>(working.currentSize(), HotSlice::kMaxHotSliceEntries);
+      HotSlice::computeCapacity(graphNodeCount_, avgSnapshotNodes_);
   governanceState_.targetHotSliceCapacity =
       governedHotSliceCapacity(requestedCapacity);
   working.setMaxSize(governanceState_.targetHotSliceCapacity);
@@ -464,13 +470,15 @@ std::size_t CognitiveMemoryManager::governedTokenBudget(
 
 std::size_t CognitiveMemoryManager::governedHotSliceCapacity(
     const std::size_t requestedCapacity) const {
+  const std::size_t computedMax =
+      HotSlice::computeCapacity(graphNodeCount_, avgSnapshotNodes_);
   const std::size_t baseCapacity = clampSize(
-      requestedCapacity == 0U ? HotSlice::kMaxHotSliceEntries : requestedCapacity,
-      kMinGovernedHotSliceCapacity, kMaxGovernedHotSliceCapacity);
+      requestedCapacity == 0U ? computedMax : requestedCapacity,
+      kMinGovernedHotSliceCapacity, computedMax);
   const double scaledCapacity =
       static_cast<double>(baseCapacity) * governanceState_.hotSliceCapacityScale;
   return clampSize(static_cast<std::size_t>(std::llround(scaledCapacity)),
-                   kMinGovernedHotSliceCapacity, kMaxGovernedHotSliceCapacity);
+                   kMinGovernedHotSliceCapacity, computedMax);
 }
 
 runtime::RelevanceProfile CognitiveMemoryManager::resolvedRelevanceProfile(

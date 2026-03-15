@@ -9,9 +9,9 @@
   "currentExecutionNodeId": "",
   "dependencyReferences": [],
   "goal": "verification_test",
-  "isOverlayResident": true,
-  "lastMutationSequence": 18,
-  "memorySnapshotId": "17",
+  "isOverlayResident": false,
+  "lastMutationSequence": 23,
+  "memorySnapshotId": "",
   "parentId": "",
   "status": "Active",
   "subBranches": []

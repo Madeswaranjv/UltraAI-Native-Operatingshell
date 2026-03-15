@@ -122,11 +122,13 @@ bool compactPayloadItems(nlohmann::ordered_json& items,
 bool compactContextSlice(ContextSlice& slice,
                          const ContextKind kind,
                          const TokenBudgetManager& budgetManager) {
+  // Refresh token count without touching the truncated flag.
+  // truncated is only set to true inside the loop, when content is
+  // actually erased from the payload due to budget pressure.
   auto refresh = [&slice, &budgetManager]() {
     slice.json = slice.payload.dump();
     slice.estimatedTokens = budgetManager.estimateTextTokens(slice.json);
     slice.payload["metadata"]["estimatedTokens"] = slice.estimatedTokens;
-    slice.payload["metadata"]["truncated"] = true;
   };
 
   refresh();
@@ -185,6 +187,8 @@ bool compactContextSlice(ContextSlice& slice,
       break;
     }
 
+    // Only mark truncated when we actually removed content.
+    slice.payload["metadata"]["truncated"] = true;
     refresh();
   }
 
@@ -658,9 +662,12 @@ ContextSlice ContextBuilder::buildSlice(
   metadata["selectedFileCount"] = selectedFiles.size();
   metadata["selectedNodeCount"] = selectedSymbols.size();
   metadata["tokenBudget"] = budgetManager.budget();
-  metadata["truncated"] =
-      selectedFiles.size() < rankedFiles.size() ||
-      selectedSymbols.size() < rankedSymbols.size();
+  // truncated = false here: candidates may be deselected by the ranker/pruner
+  // for relevance reasons even when the slice fits comfortably inside the
+  // budget. "truncated" means budget-driven content removal, not ranking-driven
+  // selection. compactContextSlice (and compactCompressedSlice) set it to true
+  // only when they actually erase fields from the JSON payload.
+  metadata["truncated"] = false;
   payload["metadata"] = metadata;
 
   ContextSlice slice;
