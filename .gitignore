@@ -1,0 +1,16 @@
+@"
+build/
+bin/
+out/
+*.exe
+*.lib
+*.obj
+*.pdb
+*.dll
+*.log
+.vs/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+.cache/
+"@ | Set-Content -Path ".gitignore" -Encoding UTF8
