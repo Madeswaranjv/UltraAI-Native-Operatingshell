@@ -204,6 +204,18 @@ bool AgentExportBuilder::writeAgentContext(
         symbolJson["visibility"] =
             visibilityToString(symbol.visibility);
         symbolJson["line"] = symbol.lineNumber;
+        if (!symbol.signature.empty()) {
+          symbolJson["signature"] = symbol.signature;
+        }
+        if (!symbol.calls.empty()) {
+          symbolJson["calls"] = symbol.calls;
+        }
+        if (!symbol.bases.empty()) {
+          symbolJson["bases"] = symbol.bases;
+        }
+        if (!symbol.typeRefs.empty()) {
+          symbolJson["type_refs"] = symbol.typeRefs;
+        }
 
         fileSummary["symbols"].push_back(symbolJson);
       }

@@ -26,17 +26,25 @@ struct QueryPattern {
 
 const std::vector<QueryPattern>& patternsForLanguage(const Language language) {
   static const std::vector<QueryPattern> kCpp{
-      {SymbolKind::Function, "function", "(function_definition) @function", false, false},
-      {SymbolKind::Function, "function", "(function_declaration) @function", false, false},
-      {SymbolKind::Class, "class", "(class_specifier) @class", false, false},
-      {SymbolKind::Class, "struct", "(struct_specifier) @struct", true, false},
-      {SymbolKind::Namespace, "namespace", "(namespace_definition) @namespace", false, false},
-      {SymbolKind::Import, "include", "(preproc_include) @include", false, true},
-      {SymbolKind::Call, "call", "(call_expression) @call", false, false},
-      {SymbolKind::Variable, "variable", "(init_declarator) @variable", false, false},
-      {SymbolKind::Variable, "variable", "(field_declaration) @variable", false, false},
-      {SymbolKind::TypeRef, "typeref", "(type_identifier) @typeref", false, false},
-      {SymbolKind::TypeRef, "typeref", "(qualified_identifier) @typeref", false, false}};
+  {SymbolKind::Function, "function", "(function_definition) @function", false, false},
+  {SymbolKind::Function, "function", "(function_declaration) @function", false, false},
+  {SymbolKind::Class, "class", "(class_specifier) @class", false, false},
+  {SymbolKind::Class, "struct", "(struct_specifier) @struct", true, false},
+  {SymbolKind::Namespace, "namespace", "(namespace_definition) @namespace", false, false},
+  {SymbolKind::Import, "include", "(preproc_include) @include", false, true},
+
+  {SymbolKind::Call, "call", "(call_expression) @call", false, false},
+  {SymbolKind::Call, "call", "(field_expression) @call", false, false},
+  {SymbolKind::Call, "call", "(member_expression) @call", false, false},
+
+  {SymbolKind::Variable, "variable", "(init_declarator) @variable", false, false},
+  {SymbolKind::Variable, "variable", "(field_declaration) @variable", false, false},
+
+  {SymbolKind::TypeRef, "typeref", "(type_identifier) @typeref", false, false},
+  {SymbolKind::TypeRef, "typeref", "(qualified_identifier) @typeref", false, false},
+  {SymbolKind::TypeRef, "typeref", "(scoped_identifier) @typeref", false, false},
+  {SymbolKind::TypeRef, "typeref", "(template_type) @typeref", false, false}
+};
   static const std::vector<QueryPattern> kJs{
       {SymbolKind::Function, "function", "(function_declaration) @function", false, false},
       {SymbolKind::Method, "method", "(method_definition) @method", false, false},

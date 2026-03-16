@@ -1307,7 +1307,7 @@ bool TreeSitterParser::parseFile(const std::filesystem::path& path,
   }
 
   ast.usedTreeSitterBackend = true;
-
+  printf("[Ultra] Tree-sitter backend used for %s\n", path.string().c_str());
   sortAstDeterministic(ast.root);
 
   ast.valid = true;

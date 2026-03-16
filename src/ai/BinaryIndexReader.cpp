@@ -240,6 +240,68 @@ bool BinaryIndexReader::readSymbolsTable(
       error = "Failed reading symbols.tbl record";
       return false;
     }
+
+    std::uint32_t signatureLength = 0;
+    if (!readUint32(input, signatureLength) ||
+        !readString(input, signatureLength, record.signature)) {
+      error = "Failed reading symbols.tbl record (signature)";
+      return false;
+    }
+
+    std::uint32_t callCount = 0;
+    if (!readUint32(input, callCount)) {
+      error = "Failed reading symbols.tbl record (calls)";
+      return false;
+    }
+    record.calls.clear();
+    record.calls.reserve(callCount);
+    for (std::uint32_t j = 0; j < callCount; ++j) {
+      std::uint32_t valueLength = 0;
+      std::string value;
+      if (!readUint32(input, valueLength) ||
+          !readString(input, valueLength, value)) {
+        error = "Failed reading symbols.tbl record (calls)";
+        return false;
+      }
+      record.calls.push_back(std::move(value));
+    }
+
+    std::uint32_t baseCount = 0;
+    if (!readUint32(input, baseCount)) {
+      error = "Failed reading symbols.tbl record (bases)";
+      return false;
+    }
+    record.bases.clear();
+    record.bases.reserve(baseCount);
+    for (std::uint32_t j = 0; j < baseCount; ++j) {
+      std::uint32_t valueLength = 0;
+      std::string value;
+      if (!readUint32(input, valueLength) ||
+          !readString(input, valueLength, value)) {
+        error = "Failed reading symbols.tbl record (bases)";
+        return false;
+      }
+      record.bases.push_back(std::move(value));
+    }
+
+    std::uint32_t typeRefCount = 0;
+    if (!readUint32(input, typeRefCount)) {
+      error = "Failed reading symbols.tbl record (typeRefs)";
+      return false;
+    }
+    record.typeRefs.clear();
+    record.typeRefs.reserve(typeRefCount);
+    for (std::uint32_t j = 0; j < typeRefCount; ++j) {
+      std::uint32_t valueLength = 0;
+      std::string value;
+      if (!readUint32(input, valueLength) ||
+          !readString(input, valueLength, value)) {
+        error = "Failed reading symbols.tbl record (typeRefs)";
+        return false;
+      }
+      record.typeRefs.push_back(std::move(value));
+    }
+
     record.symbolType = static_cast<SymbolType>(symbolType);
     record.visibility = static_cast<Visibility>(visibility);
     outSymbols.push_back(std::move(record));

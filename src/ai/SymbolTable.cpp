@@ -1,5 +1,5 @@
 #include "SymbolTable.h"
-
+//E:\Projects\Ultra\src\ai\SymbolTable.cpp
 #include <algorithm>
 #include <tuple>
 
@@ -32,6 +32,9 @@ bool SymbolTable::buildFromExtracted(
     symbol.symbolType = item.symbolType;
     symbol.visibility = item.visibility;
     symbol.lineNumber = item.lineNumber;
+    symbol.calls = item.calls;
+    symbol.bases = item.bases;
+    symbol.typeRefs = item.typeRefs;
     outSymbols.push_back(std::move(symbol));
   }
 

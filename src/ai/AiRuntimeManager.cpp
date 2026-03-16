@@ -1226,6 +1226,49 @@ int AiRuntimeManager::wakeAi(const bool verbose) {
 
 int AiRuntimeManager::runDaemonLoop(const bool verbose) {
 
+#ifdef _WIN32
+  // Check if --project-root was passed — if so we are already the
+  // inner daemon spawned by cmd.exe and must NOT re-spawn again.
+  bool isInnerDaemon = false;
+  {
+    int argc = 0;
+    LPWSTR* argv = ::CommandLineToArgvW(::GetCommandLineW(), &argc);
+    if (argv != nullptr) {
+      for (int i = 0; i < argc; ++i) {
+        if (argv[i] != nullptr &&
+            std::wstring(argv[i]) == L"--project-root") {
+          isInnerDaemon = true;
+          break;
+        }
+      }
+      ::LocalFree(argv);
+    }
+  }
+
+  if (!isInnerDaemon) {
+    const std::filesystem::path execPath = currentExecutablePath();
+    if (!execPath.empty()) {
+      std::wstring cmd = L"cmd.exe /c start /b \"\" \"";
+      cmd += execPath.wstring();
+      cmd += L"\" --ultra-daemon --project-root \"";
+      cmd += projectRoot_.wstring();
+      cmd += L"\"";
+      STARTUPINFOW si{};
+      si.cb = sizeof(si);
+      PROCESS_INFORMATION pi{};
+      if (::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
+                           CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+                           nullptr, projectRoot_.wstring().c_str(), &si, &pi)) {
+        ::CloseHandle(pi.hThread);
+        ::CloseHandle(pi.hProcess);
+        return 0;
+      }
+    }
+  }
+#endif
+
+  
+
   ultra::runtime::UltraDaemon daemon(projectRoot_);
 
   auto dispatcher = std::make_shared<RuntimeDispatcher>(projectRoot_);

@@ -14,3 +14,4 @@ CMakeCache.txt
 cmake_install.cmake
 .cache/
 "@ | Set-Content -Path ".gitignore" -Encoding UTF8
+.aider*

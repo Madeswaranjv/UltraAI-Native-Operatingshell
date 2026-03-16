@@ -8,18 +8,22 @@
 #include <sstream>
 #include <system_error>
 #include <utility>
+
 //E:\Projects\Ultra\src\ipc\ultra_ipc_server.cpp
 #ifndef _WIN32
 #include <cerrno>
+
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+
 #include <unistd.h>
 #else
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <sddl.h>
 #endif
  
 namespace ultra::ipc {
@@ -255,8 +259,19 @@ bool UltraIPCServer::start() {
     return false;
   }
 #endif
- 
-  running_ = true;
+ // Write actual pipe name to disk so any client can find it
+// without recomputing the hash independently.
+#ifdef _WIN32
+{
+  const std::filesystem::path pipeFile = stateDirectory() / "pipe.name";
+  std::ofstream f(pipeFile, std::ios::trunc);
+  for (const wchar_t ch : pipeName_) {
+    f.put(static_cast<char>(ch));
+  }
+  f.put('\n');
+}
+#endif
+running_ = true;
   return true;
 }
  
@@ -323,50 +338,75 @@ bool UltraIPCServer::processNextRequest(const RequestHandler& handler,
   ::close(clientFd);
   return true;
 #else
-  const HANDLE pipeHandle = ::CreateNamedPipeW(
-      pipeName_.c_str(),
-      PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-      PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,  // byte-stream: newline-delimited JSON, NOT message-mode
-      PIPE_UNLIMITED_INSTANCES,
-      static_cast<DWORD>(kMaxMessageBytes),
-      static_cast<DWORD>(kMaxMessageBytes),
-      0,
-      nullptr);
-  if (pipeHandle == INVALID_HANDLE_VALUE) {
-    return false;
-  }
- 
-  if (!connectNamedPipeWithTimeout(pipeHandle, timeout)) {
-    ::CloseHandle(pipeHandle);
-    return false;
-  }
- 
-  std::string requestLine;
-  const bool readOk = readLineHandle(pipeHandle, requestLine);
-  Json response;
-  if (!readOk) {
-    response = errorResponse("client_disconnected");
+
+// Build a security descriptor allowing all local clients to connect
+PSECURITY_DESCRIPTOR sd = nullptr;
+
+if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        L"D:(A;;GA;;;WD)",
+        SDDL_REVISION_1,
+        &sd,
+        nullptr)) {
+  return false;
+}
+
+SECURITY_ATTRIBUTES sa{};
+sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+sa.lpSecurityDescriptor = sd;
+sa.bInheritHandle = FALSE;
+
+const HANDLE pipeHandle = ::CreateNamedPipeW(
+    pipeName_.c_str(),
+    PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+    PIPE_UNLIMITED_INSTANCES,
+    static_cast<DWORD>(kMaxMessageBytes),
+    static_cast<DWORD>(kMaxMessageBytes),
+    0,
+    &sa);
+
+if (pipeHandle == INVALID_HANDLE_VALUE) {
+  LocalFree(sd);
+  return false;
+}
+
+LocalFree(sd);
+
+if (!connectNamedPipeWithTimeout(pipeHandle, timeout)) {
+  ::CloseHandle(pipeHandle);
+  return false;
+}
+
+std::string requestLine;
+const bool readOk = readLineHandle(pipeHandle, requestLine);
+Json response;
+
+if (!readOk) {
+  response = errorResponse("client_disconnected");
+} else {
+  Json request = Json::parse(requestLine, nullptr, false);
+  if (request.is_discarded()) {
+    response = errorResponse("invalid_json");
   } else {
-    Json request = Json::parse(requestLine, nullptr, false);
-    if (request.is_discarded()) {
-      response = errorResponse("invalid_json");
-    } else {
-      try {
-        response = handler(request);
-      } catch (...) {
-        response = errorResponse("request_handler_failed");
-      }
+    try {
+      response = handler(request);
+    } catch (...) {
+      response = errorResponse("request_handler_failed");
     }
   }
- 
-  std::string payload = response.dump();
-  payload.push_back('\n');
-  writeAllHandle(pipeHandle, payload);
- 
-  ::FlushFileBuffers(pipeHandle);
-  ::DisconnectNamedPipe(pipeHandle);
-  ::CloseHandle(pipeHandle);
-  return true;
+}
+
+std::string payload = response.dump();
+payload.push_back('\n');
+
+writeAllHandle(pipeHandle, payload);
+
+::FlushFileBuffers(pipeHandle);
+::DisconnectNamedPipe(pipeHandle);
+::CloseHandle(pipeHandle);
+
+return true;
+
 #endif
 }
  

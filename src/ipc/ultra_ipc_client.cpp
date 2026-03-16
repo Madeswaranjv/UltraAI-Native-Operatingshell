@@ -4,6 +4,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -119,6 +120,24 @@ std::wstring pipeNameFor(const std::filesystem::path& projectRoot) {
   stream << std::hex << fnv1a64(normalized);
   return L"\\\\.\\pipe\\ultra_" + toWide(stream.str());
 }
+
+// Read the pipe name the daemon wrote to .ultra_daemon/pipe.name at startup.
+// If the file doesn't exist yet (daemon not running) fall back to computing
+// the hash — this keeps cold-start behaviour identical to before.
+std::wstring resolvePipeName(const std::filesystem::path& projectRoot) {
+  const std::filesystem::path pipeFile =
+      stateDirectoryFor(projectRoot) / "pipe.name";
+  std::ifstream f(pipeFile);
+  std::string line;
+  if (f && std::getline(f, line) && !line.empty()) {
+    // Strip any trailing \r so Windows line endings don't corrupt the name.
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    return std::wstring(line.begin(), line.end());
+  }
+  return pipeNameFor(projectRoot);
+}
  
 bool writeAllHandle(HANDLE handle, const std::string& payload) {
   std::size_t offset = 0U;
@@ -158,14 +177,30 @@ bool readLineHandle(HANDLE handle, std::string& output) {
  
 }  // namespace
  
+// Constructor — uses resolvePipeName() helper on Windows so the initializer
+// list stays syntactically valid. The helper reads pipe.name from disk and
+// falls back to the hash if the file is absent.
 UltraIPCClient::UltraIPCClient(std::filesystem::path projectRoot)
     : projectRoot_(normalizeProjectRoot(std::move(projectRoot)))
 #ifndef _WIN32
       , socketPath_(socketPathFor(projectRoot_))
 #else
-      , pipeName_(pipeNameFor(projectRoot_))
+      , pipeName_(pipeNameFor(projectRoot_))  // hash fallback as default
 #endif
 {
+#ifdef _WIN32
+  // Override with the pipe name the daemon wrote to disk.
+  // This fixes hash mismatches when different callers (Codex, Aider, etc.)
+  // normalize the project root path differently.
+  const std::filesystem::path pipeFile =
+      stateDirectoryFor(projectRoot_) / "pipe.name";
+  std::ifstream f(pipeFile);
+  std::string line;
+  if (f && std::getline(f, line) && !line.empty()) {
+    pipeName_ = std::wstring(line.begin(), line.end());
+  }
+  // else pipeName_ keeps the hash-computed fallback set in the initializer list
+#endif
 }
  
 UltraIPCClient::Json UltraIPCClient::sendRequest(

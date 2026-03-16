@@ -626,6 +626,22 @@ ContextSlice ContextBuilder::buildSlice(
     node["kind"] = "symbol";
     node["name"] = candidate.name;
     node["references"] = candidate.references;
+    const auto recordsIt = symbolsByName_.find(candidate.name);
+    if (recordsIt != symbolsByName_.end() && !recordsIt->second.empty()) {
+      const ai::SymbolRecord& rec = recordsIt->second.front();
+      if (!rec.signature.empty()) {
+        node["signature"] = rec.signature;
+      }
+      if (!rec.calls.empty()) {
+        node["calls"] = rec.calls;
+      }
+      if (!rec.bases.empty()) {
+        node["bases"] = rec.bases;
+      }
+      if (!rec.typeRefs.empty()) {
+        node["type_refs"] = rec.typeRefs;
+      }
+    }
     node["weight"] = roundFixed3(
         static_cast<double>(ranked.scoreMicros) / 1000000.0);
     nodes.push_back(std::move(node));

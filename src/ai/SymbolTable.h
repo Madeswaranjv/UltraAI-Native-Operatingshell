@@ -17,12 +17,17 @@ struct SymbolRecord {
   SymbolType symbolType{SymbolType::Unknown};
   Visibility visibility{Visibility::Unknown};
   std::uint32_t lineNumber{0};
+  std::vector<std::string> calls;
+  std::vector<std::string> bases;
+  std::vector<std::string> typeRefs;
 
   bool operator==(const SymbolRecord& other) const noexcept {
     return symbolId == other.symbolId && fileId == other.fileId &&
            name == other.name && signature == other.signature &&
            symbolType == other.symbolType &&
-           visibility == other.visibility && lineNumber == other.lineNumber;
+           visibility == other.visibility && lineNumber == other.lineNumber &&
+           calls == other.calls && bases == other.bases &&
+           typeRefs == other.typeRefs;
   }
   bool operator!=(const SymbolRecord& other) const noexcept {
     return !(*this == other);

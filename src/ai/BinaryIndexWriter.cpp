@@ -173,6 +173,28 @@ bool BinaryIndexWriter::writeSymbolsTable(const std::filesystem::path& tablePath
       writeUint8(output, static_cast<std::uint8_t>(symbol.symbolType));
       writeUint8(output, static_cast<std::uint8_t>(symbol.visibility));
       writeUint32(output, symbol.lineNumber);
+
+      writeUint32(output, static_cast<std::uint32_t>(symbol.signature.size()));
+      output.write(symbol.signature.data(),
+                   static_cast<std::streamsize>(symbol.signature.size()));
+
+      writeUint32(output, static_cast<std::uint32_t>(symbol.calls.size()));
+      for (const std::string& value : symbol.calls) {
+        writeUint32(output, static_cast<std::uint32_t>(value.size()));
+        output.write(value.data(), static_cast<std::streamsize>(value.size()));
+      }
+
+      writeUint32(output, static_cast<std::uint32_t>(symbol.bases.size()));
+      for (const std::string& value : symbol.bases) {
+        writeUint32(output, static_cast<std::uint32_t>(value.size()));
+        output.write(value.data(), static_cast<std::streamsize>(value.size()));
+      }
+
+      writeUint32(output, static_cast<std::uint32_t>(symbol.typeRefs.size()));
+      for (const std::string& value : symbol.typeRefs) {
+        writeUint32(output, static_cast<std::uint32_t>(value.size()));
+        output.write(value.data(), static_cast<std::streamsize>(value.size()));
+      }
     }
     return static_cast<bool>(output);
   }, error);

@@ -33,6 +33,9 @@ struct ExtractedSymbol {
   SymbolType symbolType{SymbolType::Unknown};
   Visibility visibility{Visibility::Unknown};
   std::uint32_t lineNumber{0};
+  std::vector<std::string> calls;
+  std::vector<std::string> bases;
+  std::vector<std::string> typeRefs;
 };
 
 struct SemanticSymbolDependency {

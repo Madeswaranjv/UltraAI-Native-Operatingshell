@@ -29,7 +29,7 @@ class IntegrityManager {
  public:
   static constexpr std::uint32_t kCoreMagic = 0x52494155U;  // "UAIR"
   static constexpr std::uint32_t kIndexVersion = 1U;
-  static constexpr std::uint32_t kSchemaVersion = 2U;
+  static constexpr std::uint32_t kSchemaVersion = 3U;
 
   static CoreIndex buildCoreIndex(bool runtimeActive,
                                   const Sha256Hash& filesTblHash,
