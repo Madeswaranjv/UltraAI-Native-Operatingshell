@@ -655,8 +655,8 @@
   ],
   "goal": "test",
   "isOverlayResident": false,
-  "lastMutationSequence": 24,
-  "memorySnapshotId": "3",
+  "lastMutationSequence": 28,
+  "memorySnapshotId": "",
   "parentId": "",
   "status": "Active",
   "subBranches": []

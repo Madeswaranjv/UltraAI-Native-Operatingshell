@@ -305,6 +305,49 @@ GovernorStats CPUGovernor::stats() const {
   return out;
 }
 
+std::size_t CPUGovernor::activeWorkloads() const {
+  return stats().activeWorkloads;
+}
+
+std::size_t CPUGovernor::workloadCount() const {
+  return stats().workloads.size();
+}
+
+double CPUGovernor::avgExecutionTimeMs() const {
+  return stats().movingAverageMs;
+}
+
+std::size_t CPUGovernor::hardwareThreads() const {
+  return stats().hardwareThreads;
+}
+
+std::size_t CPUGovernor::recommendedThreads() const {
+  return stats().recommendedThreadCount;
+}
+
+std::pair<std::size_t, std::size_t> CPUGovernor::recommendedThreadBounds() const {
+  const GovernorStats snapshot = stats();
+  return {snapshot.minRecommendedThreadCount, snapshot.maxRecommendedThreadCount};
+}
+
+std::size_t CPUGovernor::calibrationCount() const {
+  return stats().calibrationCount;
+}
+
+bool CPUGovernor::isIdle() const {
+  return stats().idle;
+}
+
+std::vector<std::string> CPUGovernor::workloadNames() const {
+  const GovernorStats snapshot = stats();
+  std::vector<std::string> names;
+  names.reserve(snapshot.workloads.size());
+  for (const auto& entry : snapshot.workloads) {
+    names.push_back(entry.first);
+  }
+  return names;
+}
+
 void CPUGovernor::runOverlayCleanupCheck() {
   ++overlayCleanupTicks_;
 }

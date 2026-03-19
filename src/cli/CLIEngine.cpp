@@ -781,7 +781,11 @@ struct DaemonRuntimeDispatcher {
       }
       nlohmann::json payloadOut;
       payloadOut["report"] = ultra::metrics::PerformanceMetrics::report();
-      payloadOut["meta_cognitive"] = nlohmann::json::object();
+      auto& orchestrator = ultra::metacognition::MetaCognitiveOrchestrator::instance();
+      payloadOut["meta_cognitive"] =
+          buildMetaCognitivePayload(orchestrator.latestQueryMetrics());
+      payloadOut["meta_cognitive"]["recalibration_count"] =
+          orchestrator.recalibrationCount();
       return makeOk(payloadOut, 0);
     }
 
@@ -1664,6 +1668,28 @@ void printMetaCognitivePayload(const nlohmann::json& payload) {
             << payload.value("branch_retention_hint", 0U) << '\n';
 }
 
+void printMetaCognitivePayload(
+    const ultra::ai::MetricsAggregate::MetaCognitive& payload) {
+  std::cout << "Meta-cognitive:\n";
+  std::cout << "  stability score: " << payload.stabilityScore << '\n';
+  std::cout << "  drift score: " << payload.driftScore << '\n';
+  std::cout << "  learning velocity: " << payload.learningVelocity << '\n';
+  std::cout << "  conservative mode: "
+            << (payload.conservativeMode ? "yes" : "no") << '\n';
+  std::cout << "  exploratory mode: "
+            << (payload.exploratoryMode ? "yes" : "no") << '\n';
+  std::cout << "  predicted next command: "
+            << (payload.predictedNextCommand.empty() ? "(none)"
+                                                     : payload.predictedNextCommand)
+            << '\n';
+  std::cout << "  query token budget: " << payload.queryTokenBudget << '\n';
+  std::cout << "  query cache capacity: " << payload.queryCacheCapacity << '\n';
+  std::cout << "  hot slice capacity: " << payload.hotSliceCapacity << '\n';
+  std::cout << "  branch retention hint: " << payload.branchRetentionHint
+            << '\n';
+}
+
+
 void printAiQueryPayload(const nlohmann::json& payload) {
   const std::string kind = payload.value("kind", "");
   if (kind == "file") {
@@ -1794,176 +1820,149 @@ void printKernelHealth(const nlohmann::json& payload) {
   }
 }
 
-void printMetricsReport(const nlohmann::json& report) {
-  if (!report.is_object()) {
-    std::cout << "[UAIR] Unexpected ai_metrics response payload.\n";
-    return;
-  }
+void printMetricsReport(const ultra::ai::MetricsAggregate& report) {
+  auto printRate = [](const std::string& label, const double value) {
+    const std::ios::fmtflags flags = std::cout.flags();
+    const std::streamsize precision = std::cout.precision();
+    std::cout << label << std::fixed << std::setprecision(4) << value << '\n';
+    std::cout.flags(flags);
+    std::cout.precision(precision);
+  };
+
+  auto joinList = [](const std::vector<std::string>& items) {
+    std::string out;
+    for (const auto& item : items) {
+      if (item.empty()) {
+        continue;
+      }
+      if (!out.empty()) {
+        out += ", ";
+      }
+      out += item;
+    }
+    return out;
+  };
 
   std::cout << "Metrics enabled: "
-            << (report.value("enabled", false) ? "yes" : "no") << '\n';
+            << (report.enabled ? "yes" : "no") << '\n';
 
-  const nlohmann::json snapshot =
-      report.value("snapshot", nlohmann::json::object());
   std::cout << "Snapshot:\n";
   std::cout << "  avg creation time (us): "
-            << snapshot.value("avg_creation_time_micros", 0.0) << '\n';
+            << static_cast<std::uint64_t>(report.snapshot.avgCreationTimeUs)
+            << '\n';
   std::cout << "  max creation time (us): "
-            << snapshot.value("max_creation_time_micros", 0ULL) << '\n';
-  const nlohmann::json nodeDistribution =
-      snapshot.value("node_count_distribution", nlohmann::json::array());
-  if (nodeDistribution.empty()) {
+            << static_cast<std::uint64_t>(report.snapshot.maxCreationTimeUs)
+            << '\n';
+
+  if (report.snapshot.nodeCountDistribution.empty()) {
     std::cout << "  node count distribution: (none)\n";
   } else {
-    std::cout << "  node count distribution:\n";
-    for (const nlohmann::json& entry : nodeDistribution) {
-      std::cout << "    " << entry.value("node_count", 0U) << " -> "
-                << entry.value("count", 0U) << '\n';
+    std::size_t under100 = 0U;
+    std::size_t under1k = 0U;
+    std::size_t over1k = 0U;
+    for (const auto& entry : report.snapshot.nodeCountDistribution) {
+      if (entry.nodeCount < 100U) {
+        under100 += entry.count;
+      } else if (entry.nodeCount < 1000U) {
+        under1k += entry.count;
+      } else {
+        over1k += entry.count;
+      }
     }
+    std::cout << "  node count distribution: <100: " << under100
+              << ", 100-1k: " << under1k
+              << ", >1k: " << over1k << '\n';
   }
 
-  const nlohmann::json context =
-      report.value("context", nlohmann::json::object());
   std::cout << "Context:\n";
   std::cout << "  avg compression time (us): "
-            << context.value("avg_compression_time_micros", 0.0) << '\n';
-  std::cout << "  avg tokens saved: " << context.value("avg_tokens_saved", 0.0)
+            << static_cast<std::uint64_t>(report.context.avgCompressionTimeUs)
             << '\n';
-  std::cout << "  compression ratio: " << context.value("compression_ratio", 0.0)
-            << '\n';
-  std::cout << "  context reuse rate: "
-            << context.value("context_reuse_rate", 0.0) << '\n';
-  std::cout << "  hot slice hit rate: "
-            << context.value("hot_slice_hit_rate", 0.0) << '\n';
+  std::cout << "  avg tokens saved: " << report.context.avgTokensSaved << '\n';
+  printRate("  compression ratio: ", report.context.compressionRatio);
+  printRate("  context reuse rate: ", report.context.contextReuseRate);
+  printRate("  hot slice hit rate: ", report.context.hotSliceHitRate);
 
-  const nlohmann::json branch = report.value("branch", nlohmann::json::object());
   std::cout << "Branch:\n";
   std::cout << "  avg churn time (us): "
-            << branch.value("avg_churn_time_micros", 0.0) << '\n';
-  std::cout << "  eviction count: " << branch.value("eviction_count", 0U) << '\n';
-  std::cout << "  overlay reuse rate: "
-            << branch.value("overlay_reuse_rate", 0.0) << '\n';
+            << static_cast<std::uint64_t>(report.branch.avgChurnTimeUs) << '\n';
+  std::cout << "  eviction count: " << report.branch.evictionCount << '\n';
+  printRate("  overlay reuse rate: ", report.branch.overlayReuseRate);
 
-  const nlohmann::json token = report.value("token", nlohmann::json::object());
   std::cout << "Token:\n";
-  std::cout << "  total tokens saved: "
-            << token.value("total_tokens_saved", 0ULL) << '\n';
-  std::cout << "  avg savings %: " << token.value("avg_savings_percent", 0.0)
+  std::cout << "  total tokens saved: " << report.token.totalTokensSaved
             << '\n';
+  std::cout << "  avg savings %: " << report.token.avgSavingsPercent << '\n';
   std::cout << "  estimated LLM calls avoided: "
-            << token.value("estimated_llm_calls_avoided", 0ULL) << '\n';
+            << report.token.estimatedLlmCallsAvoided << '\n';
 
-  const nlohmann::json memoryGovernance =
-      report.value("memory_governance", nlohmann::json::object());
-  if (!memoryGovernance.empty()) {
-    std::cout << "Memory Governance:\n";
-    std::cout << "  snapshot version: "
-              << memoryGovernance.value("snapshot_version", 0ULL) << '\n';
-    std::cout << "  branch id: "
-              << memoryGovernance.value("branch_id", std::string{}) << '\n';
-    std::cout << "  overlays: "
-              << memoryGovernance.value("active_overlay_count", 0U) << " / "
-              << memoryGovernance.value("active_overlay_limit", 0U) << '\n';
-    std::cout << "  hot slice size: "
-              << memoryGovernance.value("hot_slice_current_size", 0U)
-              << " / "
-              << memoryGovernance.value("hot_slice_target_capacity", 0U)
-              << '\n';
-    std::cout << "  hot slice hit rate: "
-              << memoryGovernance.value("hot_slice_hit_rate", 0.0) << '\n';
-    std::cout << "  context reuse rate: "
-              << memoryGovernance.value("context_reuse_rate", 0.0) << '\n';
-    std::cout << "  token budget scale: "
-              << memoryGovernance.value("token_budget_scale", 1.0) << '\n';
-    std::cout << "  compression depth: "
-              << memoryGovernance.value("compression_depth", 1U) << '\n';
-    std::cout << "  pruning threshold: "
-              << memoryGovernance.value("pruning_threshold", 0.0) << '\n';
-    std::cout << "  impact prediction accuracy: "
-              << memoryGovernance.value("impact_prediction_accuracy", 0.0)
-              << '\n';
-    std::cout << "  recalibrations: "
-              << memoryGovernance.value("hot_slice_recalibration_count", 0U)
-              << '\n';
-    std::cout << "  evictions: "
-              << memoryGovernance.value("hot_slice_eviction_count", 0U)
-              << '\n';
+  std::cout << "Memory Governance:\n";
+  std::cout << "  snapshot version: "
+            << report.memoryGovernance.snapshotVersion << '\n';
+  std::cout << "  branch id: " << report.memoryGovernance.branchId << '\n';
+  std::cout << "  overlays: " << report.memoryGovernance.activeOverlayCount
+            << " / " << report.memoryGovernance.activeOverlayLimit << '\n';
+  std::cout << "  hot slice size: " << report.memoryGovernance.hotSliceCurrentSize
+            << " / " << report.memoryGovernance.hotSliceTargetCapacity << '\n';
+  printRate("  hot slice hit rate: ", report.memoryGovernance.hotSliceHitRate);
+  printRate("  context reuse rate: ", report.memoryGovernance.contextReuseRate);
+  printRate("  token budget scale: ", report.memoryGovernance.tokenBudgetScale);
+  std::cout << "  compression depth: "
+            << report.memoryGovernance.compressionDepth << '\n';
+  printRate("  pruning threshold: ", report.memoryGovernance.pruningThreshold);
+  printRate("  impact prediction accuracy: ",
+            report.memoryGovernance.impactPredictionAccuracy);
+  std::cout << "  recalibrations: "
+            << report.memoryGovernance.recalibrationCount << '\n';
+  std::cout << "  evictions: " << report.memoryGovernance.evictions << '\n';
+
+  std::cout << "Reflective Optimization:\n";
+  printRate("  token savings: ", report.reflectiveOptimization.tokenSavings);
+  printRate("  context reuse rate: ",
+            report.reflectiveOptimization.contextReuseRate);
+  printRate("  hot slice hit rate: ",
+            report.reflectiveOptimization.hotSliceHitRate);
+  printRate("  impact prediction accuracy: ",
+            report.reflectiveOptimization.impactPredictionAccuracy);
+  printRate("  compression efficiency: ",
+            report.reflectiveOptimization.compressionEfficiency);
+  std::cout << "  weight adjustment count: "
+            << report.reflectiveOptimization.weightAdjustmentCount << '\n';
+  const std::string weightList =
+      joinList(report.reflectiveOptimization.weightAdjustments);
+  if (weightList.empty()) {
+    std::cout << "  weight adjustments: (none)\n";
+  } else {
+    std::cout << "  weight adjustments: " << weightList << '\n';
   }
 
-  const nlohmann::json reflective =
-      report.value("reflective_optimization", nlohmann::json::object());
-  if (!reflective.empty()) {
-    std::cout << "Reflective Optimization:\n";
-    std::cout << "  token savings: "
-              << reflective.value("token_savings", 0.0) << '\n';
-    std::cout << "  context reuse rate: "
-              << reflective.value("context_reuse_rate", 0.0) << '\n';
-    std::cout << "  hot slice hit rate: "
-              << reflective.value("hot_slice_hit_rate", 0.0) << '\n';
-    std::cout << "  impact prediction accuracy: "
-              << reflective.value("impact_prediction_accuracy", 0.0) << '\n';
-    std::cout << "  compression efficiency: "
-              << reflective.value("compression_efficiency", 0.0) << '\n';
-    std::cout << "  weight adjustment count: "
-              << reflective.value("weight_adjustment_count", 0U) << '\n';
-    const nlohmann::json weightAdjustments =
-        reflective.value("weight_adjustments", nlohmann::json::array());
-    if (weightAdjustments.empty()) {
-      std::cout << "  weight adjustments: (none)\n";
-    } else {
-      std::cout << "  weight adjustments:\n";
-      for (const nlohmann::json& entry : weightAdjustments) {
-        std::cout << "    " << entry.value("name", std::string{}) << " -> "
-                  << entry.value("previous", 0.0) << " => "
-                  << entry.value("current", 0.0) << '\n';
-      }
-    }
-  }
-
-  const nlohmann::json cpuGovernor =
-      report.value("cpu_governor", nlohmann::json::object());
-  if (!cpuGovernor.empty()) {
-    std::cout << "CPU Governor:\n";
-    std::cout << "  active workloads: "
-              << cpuGovernor.value("active_workloads", 0U) << '\n';
-    std::cout << "  workload count: "
-              << cpuGovernor.value("workload_count", 0U) << '\n';
+  std::cout << "CPU Governor:\n";
+  std::cout << "  active workloads: " << report.cpuGovernor.activeWorkloads
+            << '\n';
+  std::cout << "  workload count: " << report.cpuGovernor.workloadCount << '\n';
   std::cout << "  average execution time (ms): "
-            << cpuGovernor.value("average_execution_time_ms", 0.0) << '\n';
-    std::cout << "  hardware threads: "
-              << cpuGovernor.value("hardware_threads", 0U) << '\n';
-    std::cout << "  recommended threads: "
-              << cpuGovernor.value("recommended_threads", 0U) << '\n';
-    std::cout << "  recommended thread bounds: "
-              << cpuGovernor.value("min_recommended_threads", 0U) << " - "
-              << cpuGovernor.value("max_recommended_threads", 0U) << '\n';
-    std::cout << "  calibration count: "
-              << cpuGovernor.value("calibration_count", 0U) << '\n';
-    std::cout << "  idle: "
-              << (cpuGovernor.value("idle", false) ? "yes" : "no") << '\n';
+            << report.cpuGovernor.avgExecutionTimeMs << '\n';
+  std::cout << "  hardware threads: " << report.cpuGovernor.hardwareThreads
+            << '\n';
+  std::cout << "  recommended threads: "
+            << report.cpuGovernor.recommendedThreads << '\n';
+  std::cout << "  recommended thread bounds: "
+            << report.cpuGovernor.minRecommendedThreads << " - "
+            << report.cpuGovernor.maxRecommendedThreads << '\n';
+  std::cout << "  calibration count: "
+            << report.cpuGovernor.calibrationCount << '\n';
+  std::cout << "  idle: " << (report.cpuGovernor.idle ? "yes" : "no")
+            << '\n';
 
-    const nlohmann::json workloads =
-        cpuGovernor.value("workloads", nlohmann::json::array());
-    if (workloads.empty()) {
-      std::cout << "  workloads: (none)\n";
-    } else {
-      std::cout << "  workloads:\n";
-      for (const nlohmann::json& workload : workloads) {
-        std::cout << "    " << workload.value("name", std::string{})
-                  << " -> rec="
-                  << workload.value("recommended_threads", 0U)
-                  << ", avg_ms="
-                  << workload.value("average_execution_time_ms", 0.0)
-                  << ", active="
-                  << workload.value("active_count", 0U)
-                  << ", samples="
-                  << workload.value("sample_count", 0U)
-                  << ", registrations="
-                  << workload.value("registration_count", 0U) << '\n';
-      }
-    }
+  const std::string workloads = joinList(report.cpuGovernor.activeWorkloadNames);
+  if (workloads.empty()) {
+    std::cout << "  workloads: (none)\n";
+  } else {
+    std::cout << "  workloads: " << workloads << '\n';
   }
 }
+
+
 
 std::string joinArgs(const std::vector<std::string>& args,
                      const std::size_t startIndex) {
@@ -3350,34 +3349,30 @@ void CLIEngine::registerHandlers() {
     requestDaemonCommand("ai_status", true, requestPayload, verboseStatus);
   });
   m_router.registerCommand("metrics", [this](const std::vector<std::string>& args) {
-    nlohmann::json requestPayload = nlohmann::json::object();
+    std::string action;
     if (!args.empty()) {
       if (args[0] == "--enable") {
-        requestPayload["action"] = "enable";
+        action = "enable";
       } else if (args[0] == "--disable") {
-        requestPayload["action"] = "disable";
+        action = "disable";
       } else if (args[0] == "--reset") {
-        requestPayload["action"] = "reset";
+        action = "reset";
       }
     }
 
-    nlohmann::json response;
+    ultra::ai::AiRuntimeManager runtime(m_projectRoot);
     std::string error;
-    if (!ultra::ai::AiRuntimeManager::requestDaemon(m_projectRoot, "ai_metrics",
-                                                    requestPayload, response,
-                                                    error)) {
+    const ultra::ai::MetricsAggregate metrics =
+        runtime.collectMetrics(action, error);
+    if (!error.empty()) {
       ultra::core::Logger::error(error);
       m_lastExitCode = 1;
       return;
     }
 
-    const nlohmann::json payload =
-        response.value("payload", nlohmann::json::object());
-    printMetricsReport(payload.value("report", nlohmann::json::object()));
-    printMetaCognitivePayload(
-        payload.value("meta_cognitive", nlohmann::json::object()));
-    m_lastExitCode =
-        response.value("exit_code", response.value("ok", false) ? 0 : 1);
+    printMetricsReport(metrics);
+    printMetaCognitivePayload(metrics.metaCognitive);
+    m_lastExitCode = 0;
   });
   m_router.registerCommand("rebuild_ai", [requestDaemonCommand](const std::vector<std::string>&) {
     requestDaemonCommand("rebuild_ai", false, nlohmann::json::object(), false);

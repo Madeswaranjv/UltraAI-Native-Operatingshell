@@ -162,6 +162,34 @@ ContextSlice ContextExtractor::getMinimalContext(const CognitiveState& state,
         cache.cache.capacity(),
         cache.hotSlice.maxSize());
     (void)_;
+    if (metrics::PerformanceMetrics::isEnabled()) {
+      metrics::ContextMetrics contextMetric;
+      contextMetric.durationMicros = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - startedAt)
+              .count());
+      contextMetric.candidateSymbolCount = builtSlice.candidateSymbolCount;
+      contextMetric.selectedSymbolCount = builtSlice.includedNodes.size();
+      contextMetric.jsonSizeBytes = builtSlice.json.size();
+      contextMetric.estimatedTokens = builtSlice.estimatedTokens;
+      contextMetric.rawEstimatedTokens =
+          builtSlice.rawEstimatedTokens == 0U ? builtSlice.estimatedTokens
+                                              : builtSlice.rawEstimatedTokens;
+      if (builtSlice.candidateSymbolCount == 0U) {
+        contextMetric.truncationRatio = 0.0;
+      } else {
+        contextMetric.truncationRatio =
+            static_cast<double>(builtSlice.candidateSymbolCount -
+                                builtSlice.includedNodes.size()) /
+            static_cast<double>(builtSlice.candidateSymbolCount);
+      }
+      contextMetric.hotSliceHits = 0U;
+      contextMetric.hotSliceLookups = 0U;
+      metrics::PerformanceMetrics::recordContextMetric(contextMetric);
+      metrics::PerformanceMetrics::recordTokenSavings(
+          contextMetric.rawEstimatedTokens, builtSlice.estimatedTokens);
+      metrics::PerformanceMetrics::recordContextReuse(1U, 1U);
+    }
     return toRuntimeSlice(builtSlice);
   }
 
@@ -216,13 +244,6 @@ ContextSlice ContextExtractor::getMinimalContext(const CognitiveState& state,
   (void)_;
 
   if (metrics::PerformanceMetrics::isEnabled()) {
-    std::size_t hotSliceHits = 0U;
-    for (const SymbolID symbolId : builtSlice.includedNodes) {
-      if (cache.hotSlice.containsNode(symbolNodeId(symbolId),
-                                      state.snapshot.version)) {
-        ++hotSliceHits;
-      }
-    }
     metrics::ContextMetrics contextMetric;
     contextMetric.durationMicros = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -243,15 +264,12 @@ ContextSlice ContextExtractor::getMinimalContext(const CognitiveState& state,
                               builtSlice.includedNodes.size()) /
           static_cast<double>(builtSlice.candidateSymbolCount);
     }
-    contextMetric.hotSliceHits = hotSliceHits;
-    contextMetric.hotSliceLookups = builtSlice.includedNodes.size();
+    contextMetric.hotSliceHits = 0U;
+    contextMetric.hotSliceLookups = 0U;
     metrics::PerformanceMetrics::recordContextMetric(contextMetric);
     metrics::PerformanceMetrics::recordTokenSavings(
         contextMetric.rawEstimatedTokens, builtSlice.estimatedTokens);
-    metrics::PerformanceMetrics::recordHotSliceLookup(contextMetric.hotSliceHits,
-                                                      contextMetric.hotSliceLookups);
-    metrics::PerformanceMetrics::recordContextReuse(
-        contextMetric.hotSliceHits, contextMetric.selectedSymbolCount);
+    metrics::PerformanceMetrics::recordContextReuse(0U, 1U);
   }
 
   return toRuntimeSlice(builtSlice);

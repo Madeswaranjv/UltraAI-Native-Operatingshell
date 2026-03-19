@@ -68,6 +68,7 @@ struct MemoryGovernanceMetrics {
 
 class PerformanceMetrics {
  public:
+  static PerformanceMetrics& instance();
   static void configureFromEnvironment();
   static void setEnabled(bool enabled);
   [[nodiscard]] static bool isEnabled();
@@ -88,11 +89,41 @@ class PerformanceMetrics {
                                      double previousValue,
                                      double newValue);
 
+  void recordSnapshotCreation(std::uint64_t durationMicros);
+  void recordCompressionTime(std::uint64_t durationMicros);
+  void recordTokensSaved(std::uint64_t tokensSaved);
+  void recordHotSliceHit();
+  void recordHotSliceMiss();
+  void recordContextReuse();
+  void recordBranchChurn(std::uint64_t durationMicros);
+  void recordBranchEviction();
+
+  [[nodiscard]] double avgSnapshotCreationUs() const;
+  [[nodiscard]] double maxSnapshotCreationUs() const;
+  [[nodiscard]] double avgCompressionUs() const;
+  [[nodiscard]] double avgTokensSaved() const;
+  [[nodiscard]] double compressionRatio() const;
+  [[nodiscard]] double contextReuseRate() const;
+  [[nodiscard]] double hotSliceHitRate() const;
+  [[nodiscard]] double avgBranchChurnUs() const;
+  [[nodiscard]] double overlayReuseRate() const;
+  [[nodiscard]] double avgSavingsPercent() const;
+  [[nodiscard]] std::uint64_t estimatedLLMCallsAvoided() const;
+  [[nodiscard]] std::uint64_t totalTokensSaved() const;
+  [[nodiscard]] std::uint64_t branchEvictions() const;
+  [[nodiscard]] double impactPredictionAccuracy() const;
+  [[nodiscard]] std::size_t weightAdjustmentCount() const;
+  [[nodiscard]] std::vector<std::string> weightAdjustmentNames() const;
+  [[nodiscard]] std::vector<std::pair<std::size_t, std::size_t>>
+  snapshotNodeCountDistribution() const;
+
   [[nodiscard]] static double averageTokenSavingsRatio();
   [[nodiscard]] static nlohmann::ordered_json report();
   static void reset();
 
  private:
+  PerformanceMetrics() = default;
+
   static constexpr std::size_t kMaxSampleCount = 4096U;
   static constexpr std::size_t kEstimatedTokensPerCall = 4000U;
 
@@ -122,6 +153,22 @@ class PerformanceMetrics {
   static std::vector<double> s_impactPredictionAccuracySamples_;
   static std::map<std::string, std::pair<double, double>> s_weightAdjustments_;
   static std::size_t s_weightAdjustmentCount_;
+
+  static std::atomic<std::uint64_t> s_snapshotCreationTimeSumUs_;
+  static std::atomic<std::uint64_t> s_snapshotCreationTimeMaxUs_;
+  static std::atomic<std::uint64_t> s_snapshotCount_;
+  static std::atomic<std::uint64_t> s_compressionTimeSumUs_;
+  static std::atomic<std::uint64_t> s_compressionCount_;
+  static std::atomic<std::uint64_t> s_tokensSavedTotal_;
+  static std::atomic<std::uint64_t> s_contextRequests_;
+  static std::atomic<std::uint64_t> s_contextReuses_;
+  static std::atomic<std::uint64_t> s_hotSliceHitsAtomic_;
+  static std::atomic<std::uint64_t> s_hotSliceAccessesAtomic_;
+  static std::atomic<std::uint64_t> s_branchChurnTimeSumUs_;
+  static std::atomic<std::uint64_t> s_branchChurnCount_;
+  static std::atomic<std::uint64_t> s_branchEvictions_;
+  static std::atomic<std::uint64_t> s_overlayReuses_;
+  static std::atomic<std::uint64_t> s_llmCallsAvoided_;
 };
 
 }  // namespace ultra::metrics

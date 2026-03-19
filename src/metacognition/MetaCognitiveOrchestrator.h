@@ -3,6 +3,7 @@
 #include "../memory/EpisodicMemory.h"
 #include "../memory/StrategicMemory.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstddef>
@@ -50,6 +51,13 @@ class MetaCognitiveOrchestrator {
                                          std::size_t hotSliceCapacity);
 
   [[nodiscard]] QueryMetrics latestQueryMetrics() const;
+  [[nodiscard]] double stabilityScore() const;
+  [[nodiscard]] double driftScore() const;
+  [[nodiscard]] double learningVelocity() const;
+  [[nodiscard]] bool conservativeMode() const;
+  [[nodiscard]] bool exploratoryMode() const;
+  [[nodiscard]] std::string predictedNextCommand() const;
+  [[nodiscard]] std::size_t recalibrationCount() const;
 
  private:
   struct QuerySample {
@@ -84,6 +92,7 @@ class MetaCognitiveOrchestrator {
   mutable std::shared_mutex queryMutex_;
   std::deque<QuerySample> recentQueries_;
   QueryMetrics lastQueryMetrics_{};
+  std::atomic<std::size_t> recalibrationCount_{0U};
 };
 
 }  // namespace ultra::metacognition

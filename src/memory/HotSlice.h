@@ -111,6 +111,8 @@ class HotSlice {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     return maxSize_;
   }
+  [[nodiscard]] std::size_t capacity() const { return maxSize(); }
+  [[nodiscard]] double hitRate() const;
   [[nodiscard]] GovernanceStats stats() const noexcept;
 
  private:

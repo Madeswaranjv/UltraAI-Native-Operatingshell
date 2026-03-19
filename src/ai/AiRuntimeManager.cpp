@@ -618,7 +618,11 @@ struct RuntimeDispatcher {
       }
       nlohmann::json payloadOut;
       payloadOut["report"] = ultra::metrics::PerformanceMetrics::report();
-      payloadOut["meta_cognitive"] = nlohmann::json::object();
+      auto& orchestrator = ultra::metacognition::MetaCognitiveOrchestrator::instance();
+      payloadOut["meta_cognitive"] =
+          buildMetaCognitivePayload(orchestrator.latestQueryMetrics());
+      payloadOut["meta_cognitive"]["recalibration_count"] =
+          orchestrator.recalibrationCount();
       return makeOk(payloadOut, 0);
     }
 
@@ -1382,6 +1386,171 @@ bool AiRuntimeManager::contextDiff(nlohmann::json& payloadOut,
   }
 
   return false;
+}
+
+
+MetricsAggregate AiRuntimeManager::collectMetrics() const {
+  std::string error;
+  return collectMetrics(std::string{}, error);
+}
+
+MetricsAggregate AiRuntimeManager::collectMetrics(const std::string& action,
+                                                 std::string& error) const {
+  MetricsAggregate out;
+  nlohmann::json requestPayload = nlohmann::json::object();
+  if (!action.empty()) {
+    requestPayload["action"] = action;
+  }
+
+  nlohmann::json response;
+  if (!requestDaemon(projectRoot_, "ai_metrics", requestPayload, response, error)) {
+    return out;
+  }
+
+  const nlohmann::json payload =
+      response.value("payload", nlohmann::json::object());
+  const nlohmann::json report =
+      payload.value("report", nlohmann::json::object());
+  const nlohmann::json meta =
+      payload.value("meta_cognitive", nlohmann::json::object());
+
+  out.enabled = report.value("enabled", false);
+
+  const nlohmann::json snapshot =
+      report.value("snapshot", nlohmann::json::object());
+  out.snapshot.avgCreationTimeUs =
+      snapshot.value("avg_creation_time_micros", 0.0);
+  out.snapshot.maxCreationTimeUs =
+      static_cast<double>(snapshot.value("max_creation_time_micros", 0ULL));
+  const nlohmann::json nodeDistribution =
+      snapshot.value("node_count_distribution", nlohmann::json::array());
+  for (const nlohmann::json& entry : nodeDistribution) {
+    MetricsAggregate::NodeCountEntry nodeEntry;
+    nodeEntry.nodeCount = entry.value("node_count", 0U);
+    nodeEntry.count = entry.value("count", 0U);
+    out.snapshot.nodeCountDistribution.push_back(nodeEntry);
+  }
+
+  const nlohmann::json context =
+      report.value("context", nlohmann::json::object());
+  out.context.avgCompressionTimeUs =
+      context.value("avg_compression_time_micros", 0.0);
+  out.context.avgTokensSaved = context.value("avg_tokens_saved", 0.0);
+  out.context.compressionRatio = context.value("compression_ratio", 0.0);
+  out.context.contextReuseRate = context.value("context_reuse_rate", 0.0);
+  out.context.hotSliceHitRate = context.value("hot_slice_hit_rate", 0.0);
+
+  const nlohmann::json branch =
+      report.value("branch", nlohmann::json::object());
+  out.branch.avgChurnTimeUs = branch.value("avg_churn_time_micros", 0.0);
+  out.branch.evictionCount = branch.value("eviction_count", 0ULL);
+  out.branch.overlayReuseRate = branch.value("overlay_reuse_rate", 0.0);
+
+  const nlohmann::json token =
+      report.value("token", nlohmann::json::object());
+  out.token.totalTokensSaved = token.value("total_tokens_saved", 0ULL);
+  out.token.avgSavingsPercent = token.value("avg_savings_percent", 0.0);
+  out.token.estimatedLlmCallsAvoided =
+      token.value("estimated_llm_calls_avoided", 0ULL);
+
+  const nlohmann::json memory =
+      report.value("memory_governance", nlohmann::json::object());
+  out.memoryGovernance.snapshotVersion =
+      memory.value("snapshot_version", 0ULL);
+  out.memoryGovernance.branchId =
+      memory.value("branch_id", std::string{});
+  out.memoryGovernance.activeOverlayCount =
+      memory.value("active_overlay_count", 0U);
+  out.memoryGovernance.activeOverlayLimit =
+      memory.value("active_overlay_limit", 0U);
+  out.memoryGovernance.hotSliceCurrentSize =
+      memory.value("hot_slice_current_size", 0U);
+  out.memoryGovernance.hotSliceTargetCapacity =
+      memory.value("hot_slice_target_capacity", 0U);
+  out.memoryGovernance.hotSliceHitRate =
+      memory.value("hot_slice_hit_rate", 0.0);
+  out.memoryGovernance.contextReuseRate =
+      memory.value("context_reuse_rate", 0.0);
+  out.memoryGovernance.tokenBudgetScale =
+      memory.value("token_budget_scale", 1.0);
+  out.memoryGovernance.compressionDepth =
+      memory.value("compression_depth", 1U);
+  out.memoryGovernance.pruningThreshold =
+      memory.value("pruning_threshold", 0.0);
+  out.memoryGovernance.impactPredictionAccuracy =
+      memory.value("impact_prediction_accuracy", 0.0);
+  out.memoryGovernance.recalibrationCount =
+      meta.value("recalibration_count",
+                 memory.value("hot_slice_recalibration_count", 0U));
+  out.memoryGovernance.evictions =
+      memory.value("evictions", out.branch.evictionCount);
+
+  const nlohmann::json reflective =
+      report.value("reflective_optimization", nlohmann::json::object());
+  out.reflectiveOptimization.tokenSavings =
+      reflective.value("token_savings", 0.0);
+  out.reflectiveOptimization.contextReuseRate =
+      reflective.value("context_reuse_rate", 0.0);
+  out.reflectiveOptimization.hotSliceHitRate =
+      reflective.value("hot_slice_hit_rate", 0.0);
+  out.reflectiveOptimization.impactPredictionAccuracy =
+      reflective.value("impact_prediction_accuracy", 0.0);
+  out.reflectiveOptimization.compressionEfficiency =
+      reflective.value("compression_efficiency", 0.0);
+  out.reflectiveOptimization.weightAdjustmentCount =
+      reflective.value("weight_adjustment_count", 0U);
+  const nlohmann::json adjustments =
+      reflective.value("weight_adjustments", nlohmann::json::array());
+  for (const nlohmann::json& entry : adjustments) {
+    const std::string name = entry.value("name", std::string{});
+    if (!name.empty()) {
+      out.reflectiveOptimization.weightAdjustments.push_back(name);
+    }
+  }
+
+  const nlohmann::json cpu =
+      report.value("cpu_governor", nlohmann::json::object());
+  out.cpuGovernor.activeWorkloads = cpu.value("active_workloads", 0U);
+  out.cpuGovernor.workloadCount = cpu.value("workload_count", 0U);
+  out.cpuGovernor.avgExecutionTimeMs =
+      cpu.value("average_execution_time_ms", 0.0);
+  out.cpuGovernor.hardwareThreads = cpu.value("hardware_threads", 0U);
+  out.cpuGovernor.recommendedThreads = cpu.value("recommended_threads", 0U);
+  out.cpuGovernor.minRecommendedThreads =
+      cpu.value("min_recommended_threads", 0U);
+  out.cpuGovernor.maxRecommendedThreads =
+      cpu.value("max_recommended_threads", 0U);
+  out.cpuGovernor.calibrationCount = cpu.value("calibration_count", 0U);
+  out.cpuGovernor.idle = cpu.value("idle", false);
+  const nlohmann::json workloads =
+      cpu.value("workloads", nlohmann::json::array());
+  for (const nlohmann::json& workload : workloads) {
+    if (workload.value("active_count", 0U) == 0U) {
+      continue;
+    }
+    const std::string name = workload.value("name", std::string{});
+    if (!name.empty()) {
+      out.cpuGovernor.activeWorkloadNames.push_back(name);
+    }
+  }
+
+  out.metaCognitive.stabilityScore = meta.value("stability_score", 0.0);
+  out.metaCognitive.driftScore = meta.value("drift_score", 0.0);
+  out.metaCognitive.learningVelocity = meta.value("learning_velocity", 0.0);
+  out.metaCognitive.conservativeMode =
+      meta.value("conservative_mode", false);
+  out.metaCognitive.exploratoryMode = meta.value("exploratory_mode", false);
+  out.metaCognitive.predictedNextCommand =
+      meta.value("predicted_next_command", std::string{});
+  out.metaCognitive.queryTokenBudget = meta.value("query_token_budget", 0U);
+  out.metaCognitive.queryCacheCapacity = meta.value("query_cache_capacity", 0U);
+  out.metaCognitive.hotSliceCapacity = meta.value("hot_slice_capacity", 0U);
+  out.metaCognitive.branchRetentionHint =
+      meta.value("branch_retention_hint", 0U);
+  out.metaCognitive.recalibrationCount =
+      meta.value("recalibration_count", 0U);
+
+  return out;
 }
 
 void AiRuntimeManager::silentIncrementalUpdate() {

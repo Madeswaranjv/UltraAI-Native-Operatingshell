@@ -1,4 +1,7 @@
 #include "HotSlice.h"
+
+#include "../metrics/PerformanceMetrics.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -163,37 +166,58 @@ void HotSlice::storeNodeLocked(const StateNode& node,
 }
 
 StateNode HotSlice::getNode(const std::string& nodeId) const {
-  std::shared_lock<std::shared_mutex> lock(mutex_);
-  lookupCount_.fetch_add(1U, std::memory_order_relaxed);
-  auto it = nodes_.find(nodeId);
-  if (it != nodes_.end() &&
-      (boundSnapshotVersion_ == 0ULL ||
-       it->second.versionStamp >= boundSnapshotVersion_)) {
-    hitCount_.fetch_add(1U, std::memory_order_relaxed);
-    return it->second.data;
+  bool hit = false;
+  StateNode result{};
+  {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    lookupCount_.fetch_add(1U, std::memory_order_relaxed);
+    auto it = nodes_.find(nodeId);
+    if (it != nodes_.end() &&
+        (boundSnapshotVersion_ == 0ULL ||
+         it->second.versionStamp >= boundSnapshotVersion_)) {
+      hitCount_.fetch_add(1U, std::memory_order_relaxed);
+      result = it->second.data;
+      hit = true;
+    }
   }
-  return StateNode{};
+
+  if (metrics::PerformanceMetrics::isEnabled()) {
+    hit ? metrics::PerformanceMetrics::instance().recordHotSliceHit()
+        : metrics::PerformanceMetrics::instance().recordHotSliceMiss();
+  }
+  return result;
 }
 
 StateNode HotSlice::getNode(const std::string& nodeId,
                             const std::uint64_t currentVersion) {
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  const std::uint64_t effective = effectiveVersion(currentVersion);
-  lookupCount_.fetch_add(1U, std::memory_order_relaxed);
-  const auto it = nodes_.find(nodeId);
-  if (it == nodes_.end()) {
-    return StateNode{};
+  bool hit = false;
+  StateNode result{};
+  {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    const std::uint64_t effective = effectiveVersion(currentVersion);
+    lookupCount_.fetch_add(1U, std::memory_order_relaxed);
+    const auto it = nodes_.find(nodeId);
+    if (it == nodes_.end()) {
+      hit = false;
+    } else if (eraseIfStale(it, effective)) {
+      hit = false;
+    } else {
+      hitCount_.fetch_add(1U, std::memory_order_relaxed);
+      nodes_.at(nodeId).accessCount++;
+      nodes_.at(nodeId).relevanceScore += 0.1;
+      if (effective != 0ULL) {
+        nodes_.at(nodeId).versionStamp = effective;
+      }
+      result = nodes_.at(nodeId).data;
+      hit = true;
+    }
   }
-  if (eraseIfStale(it, effective)) {
-    return StateNode{};
+
+  if (metrics::PerformanceMetrics::isEnabled()) {
+    hit ? metrics::PerformanceMetrics::instance().recordHotSliceHit()
+        : metrics::PerformanceMetrics::instance().recordHotSliceMiss();
   }
-  hitCount_.fetch_add(1U, std::memory_order_relaxed);
-  nodes_.at(nodeId).accessCount++;
-  nodes_.at(nodeId).relevanceScore += 0.1;
-  if (effective != 0ULL) {
-    nodes_.at(nodeId).versionStamp = effective;
-  }
-  return nodes_.at(nodeId).data;
+  return result;
 }
 
 bool HotSlice::containsNode(const std::string& nodeId) const {
@@ -202,13 +226,21 @@ bool HotSlice::containsNode(const std::string& nodeId) const {
 
 bool HotSlice::containsNode(const std::string& nodeId,
                             const std::uint64_t currentVersion) const {
-  std::shared_lock<std::shared_mutex> lock(mutex_);
-  const std::uint64_t effective = effectiveVersion(currentVersion);
-  const auto it = nodes_.find(nodeId);
-  if (it == nodes_.end()) {
-    return false;
+  bool hit = false;
+  {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    const std::uint64_t effective = effectiveVersion(currentVersion);
+    const auto it = nodes_.find(nodeId);
+    if (it != nodes_.end()) {
+      hit = effective == 0ULL || it->second.versionStamp >= effective;
+    }
   }
-  return effective == 0ULL || it->second.versionStamp >= effective;
+
+  if (metrics::PerformanceMetrics::isEnabled()) {
+    hit ? metrics::PerformanceMetrics::instance().recordHotSliceHit()
+        : metrics::PerformanceMetrics::instance().recordHotSliceMiss();
+  }
+  return hit;
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +529,10 @@ HotSlice::GovernanceStats HotSlice::stats() const noexcept {
                     : static_cast<double>(out.hitCount) /
                           static_cast<double>(lookups);
   return out;
+}
+
+double HotSlice::hitRate() const {
+  return metrics::PerformanceMetrics::instance().hotSliceHitRate();
 }
 
 std::uint64_t HotSlice::effectiveVersion(const std::uint64_t currentVersion) const {

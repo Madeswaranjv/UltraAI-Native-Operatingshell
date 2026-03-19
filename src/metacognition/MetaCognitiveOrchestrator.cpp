@@ -333,24 +333,9 @@ QueryMetrics MetaCognitiveOrchestrator::recordQuery(const std::string& symbol,
     // which is the closest available signal to "how well we predicted impact".
     metrics::PerformanceMetrics::recordImpactPredictionAccuracy(
         lastQueryMetrics_.stabilityScore);
-
-    // Record hot slice lookup using hotSliceCapacity as a proxy for
-    // whether the hot slice is active; treat any query as a lookup,
-    // and count it as a hit when the index was already built (stability > 0).
-    if (hotSliceCapacity > 0U) {
-      const std::size_t hits =
-          lastQueryMetrics_.stabilityScore > 0.0 ? 1U : 0U;
-      metrics::PerformanceMetrics::recordHotSliceLookup(hits, 1U);
-    }
-
-    // Context reuse: treat consecutive queries to the same symbol
-    // (drift < 0.5 means low symbol diversity = high reuse) as cache hits.
-    {
-      const std::size_t reused =
-          lastQueryMetrics_.driftScore < 0.5 ? 1U : 0U;
-      metrics::PerformanceMetrics::recordContextReuse(reused, 1U);
-    }
   }
+
+  recalibrationCount_.fetch_add(1U, std::memory_order_relaxed);
 
   return lastQueryMetrics_;
 }
@@ -358,6 +343,42 @@ QueryMetrics MetaCognitiveOrchestrator::recordQuery(const std::string& symbol,
 QueryMetrics MetaCognitiveOrchestrator::latestQueryMetrics() const {
   std::shared_lock<std::shared_mutex> lock(queryMutex_);
   return lastQueryMetrics_;
+}
+
+double MetaCognitiveOrchestrator::stabilityScore() const {
+  std::shared_lock<std::shared_mutex> lock(queryMutex_);
+  return lastQueryMetrics_.stabilityScore;
+}
+
+double MetaCognitiveOrchestrator::driftScore() const {
+  std::shared_lock<std::shared_mutex> lock(queryMutex_);
+  return lastQueryMetrics_.driftScore;
+}
+
+double MetaCognitiveOrchestrator::learningVelocity() const {
+  std::shared_lock<std::shared_mutex> lock(queryMutex_);
+  return lastQueryMetrics_.learningVelocity;
+}
+
+bool MetaCognitiveOrchestrator::conservativeMode() const {
+  std::shared_lock<std::shared_mutex> lock(queryMutex_);
+  return lastQueryMetrics_.stabilityScore < 0.4;
+}
+
+bool MetaCognitiveOrchestrator::exploratoryMode() const {
+  std::shared_lock<std::shared_mutex> lock(queryMutex_);
+  return lastQueryMetrics_.stabilityScore >= 0.4 &&
+         lastQueryMetrics_.learningVelocity < 0.2 &&
+         lastQueryMetrics_.driftScore < 0.1;
+}
+
+std::string MetaCognitiveOrchestrator::predictedNextCommand() const {
+  std::shared_lock<std::shared_mutex> lock(queryMutex_);
+  return lastQueryMetrics_.predictedNextCommand;
+}
+
+std::size_t MetaCognitiveOrchestrator::recalibrationCount() const {
+  return recalibrationCount_.load(std::memory_order_relaxed);
 }
 
 double MetaCognitiveOrchestrator::computeQueryStability(

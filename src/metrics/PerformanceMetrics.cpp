@@ -143,6 +143,26 @@ std::vector<double> PerformanceMetrics::s_impactPredictionAccuracySamples_;
 std::map<std::string, std::pair<double, double>>
     PerformanceMetrics::s_weightAdjustments_;
 std::size_t PerformanceMetrics::s_weightAdjustmentCount_{0U};
+std::atomic<std::uint64_t> PerformanceMetrics::s_snapshotCreationTimeSumUs_{0U};
+std::atomic<std::uint64_t> PerformanceMetrics::s_snapshotCreationTimeMaxUs_{0U};
+std::atomic<std::uint64_t> PerformanceMetrics::s_snapshotCount_{0U};
+std::atomic<std::uint64_t> PerformanceMetrics::s_compressionTimeSumUs_{0U};
+std::atomic<std::uint64_t> PerformanceMetrics::s_compressionCount_{0U};
+std::atomic<std::uint64_t> PerformanceMetrics::s_tokensSavedTotal_{0U};
+std::atomic<std::uint64_t> PerformanceMetrics::s_contextRequests_{0U};
+std::atomic<std::uint64_t> PerformanceMetrics::s_contextReuses_{0U};
+std::atomic<std::uint64_t> PerformanceMetrics::s_hotSliceHitsAtomic_{0U};
+std::atomic<std::uint64_t> PerformanceMetrics::s_hotSliceAccessesAtomic_{0U};
+std::atomic<std::uint64_t> PerformanceMetrics::s_branchChurnTimeSumUs_{0U};
+std::atomic<std::uint64_t> PerformanceMetrics::s_branchChurnCount_{0U};
+std::atomic<std::uint64_t> PerformanceMetrics::s_branchEvictions_{0U};
+std::atomic<std::uint64_t> PerformanceMetrics::s_overlayReuses_{0U};
+std::atomic<std::uint64_t> PerformanceMetrics::s_llmCallsAvoided_{0U};
+
+PerformanceMetrics& PerformanceMetrics::instance() {
+  static PerformanceMetrics metrics;
+  return metrics;
+}
 
 void PerformanceMetrics::configureFromEnvironment() {
   std::call_once(s_envConfigured_, []() {
@@ -162,20 +182,82 @@ bool PerformanceMetrics::isEnabled() {
   return s_enabled_.load();
 }
 
+void PerformanceMetrics::recordSnapshotCreation(
+    const std::uint64_t durationMicros) {
+  if (!isEnabled()) return;
+  s_snapshotCreationTimeSumUs_.fetch_add(durationMicros,
+                                         std::memory_order_relaxed);
+  s_snapshotCount_.fetch_add(1U, std::memory_order_relaxed);
+  std::uint64_t currentMax =
+      s_snapshotCreationTimeMaxUs_.load(std::memory_order_relaxed);
+  while (durationMicros > currentMax &&
+         !s_snapshotCreationTimeMaxUs_.compare_exchange_weak(
+             currentMax, durationMicros, std::memory_order_relaxed)) {
+  }
+}
+
+void PerformanceMetrics::recordCompressionTime(
+    const std::uint64_t durationMicros) {
+  if (!isEnabled()) return;
+  s_compressionTimeSumUs_.fetch_add(durationMicros,
+                                    std::memory_order_relaxed);
+  s_compressionCount_.fetch_add(1U, std::memory_order_relaxed);
+}
+
+void PerformanceMetrics::recordTokensSaved(const std::uint64_t tokensSaved) {
+  if (!isEnabled()) return;
+  s_tokensSavedTotal_.fetch_add(tokensSaved, std::memory_order_relaxed);
+  const std::uint64_t total =
+      s_tokensSavedTotal_.load(std::memory_order_relaxed);
+  s_llmCallsAvoided_.store(total / kEstimatedTokensPerCall,
+                           std::memory_order_relaxed);
+}
+
+void PerformanceMetrics::recordHotSliceHit() {
+  recordHotSliceLookup(1U, 1U);
+}
+
+void PerformanceMetrics::recordHotSliceMiss() {
+  recordHotSliceLookup(0U, 1U);
+}
+
+void PerformanceMetrics::recordContextReuse() {
+  recordContextReuse(1U, 1U);
+}
+
+void PerformanceMetrics::recordBranchChurn(
+    const std::uint64_t durationMicros) {
+  if (!isEnabled()) return;
+  s_branchChurnTimeSumUs_.fetch_add(durationMicros,
+                                    std::memory_order_relaxed);
+  s_branchChurnCount_.fetch_add(1U, std::memory_order_relaxed);
+}
+
+void PerformanceMetrics::recordBranchEviction() {
+  if (!isEnabled()) return;
+  s_branchEvictions_.fetch_add(1U, std::memory_order_relaxed);
+}
+
 void PerformanceMetrics::recordSnapshotMetric(const SnapshotMetrics& m) {
   if (!isEnabled()) return;
+  instance().recordSnapshotCreation(m.durationMicros);
   std::scoped_lock lock(s_mutex_);
   pushBounded(s_snapshotMetrics_, m);
 }
 
 void PerformanceMetrics::recordContextMetric(const ContextMetrics& m) {
   if (!isEnabled()) return;
+  instance().recordCompressionTime(m.durationMicros);
   std::scoped_lock lock(s_mutex_);
   pushBounded(s_contextMetrics_, m);
 }
 
 void PerformanceMetrics::recordBranchMetric(const BranchMetrics& m) {
   if (!isEnabled()) return;
+  instance().recordBranchChurn(m.durationMicros);
+  if (m.evictionCount > 0U) {
+    s_branchEvictions_.fetch_add(m.evictionCount, std::memory_order_relaxed);
+  }
   std::scoped_lock lock(s_mutex_);
   pushBounded(s_branchMetrics_, m);
 }
@@ -194,12 +276,16 @@ void PerformanceMetrics::recordTokenSavings(std::size_t raw,
   s_tokenSavings_.savedTokensTotal += saved;
   s_tokenSavings_.sampleCount += 1U;
   s_tokenSavings_.cumulativeSavingsRatio += safeRatio(saved, r);
+  instance().recordTokensSaved(saved);
 }
 
 void PerformanceMetrics::recordOverlayReuse(bool reused) {
   if (!isEnabled()) return;
   std::scoped_lock lock(s_mutex_);
   reused ? ++s_overlayReuseCount_ : ++s_overlayReloadCount_;
+  if (reused) {
+    s_overlayReuses_.fetch_add(1U, std::memory_order_relaxed);
+  }
 }
 
 void PerformanceMetrics::recordSnapshotReuse() {
@@ -211,6 +297,8 @@ void PerformanceMetrics::recordSnapshotReuse() {
 void PerformanceMetrics::recordHotSliceLookup(std::size_t hits,
                                               std::size_t lookups) {
   if (!isEnabled()) return;
+  s_hotSliceHitsAtomic_.fetch_add(hits, std::memory_order_relaxed);
+  s_hotSliceAccessesAtomic_.fetch_add(lookups, std::memory_order_relaxed);
   std::scoped_lock lock(s_mutex_);
   s_hotSliceHits_ += hits;
   s_hotSliceLookups_ += lookups;
@@ -219,6 +307,8 @@ void PerformanceMetrics::recordHotSliceLookup(std::size_t hits,
 void PerformanceMetrics::recordContextReuse(std::size_t reused,
                                             std::size_t total) {
   if (!isEnabled()) return;
+  s_contextReuses_.fetch_add(reused, std::memory_order_relaxed);
+  s_contextRequests_.fetch_add(total, std::memory_order_relaxed);
   std::scoped_lock lock(s_mutex_);
   s_contextReuseHits_ += reused;
   s_contextReuseLookups_ += total;
@@ -251,6 +341,145 @@ void PerformanceMetrics::recordWeightAdjustment(
 double PerformanceMetrics::averageTokenSavingsRatio() {
   std::scoped_lock lock(s_mutex_);
   return averageTokenSavingsRatioUnlocked(s_tokenSavings_);
+}
+
+double PerformanceMetrics::avgSnapshotCreationUs() const {
+  const std::uint64_t count =
+      s_snapshotCount_.load(std::memory_order_relaxed);
+  const std::uint64_t sum =
+      s_snapshotCreationTimeSumUs_.load(std::memory_order_relaxed);
+  return count == 0U ? 0.0
+                     : static_cast<double>(sum) /
+                           static_cast<double>(count);
+}
+
+double PerformanceMetrics::maxSnapshotCreationUs() const {
+  return static_cast<double>(
+      s_snapshotCreationTimeMaxUs_.load(std::memory_order_relaxed));
+}
+
+double PerformanceMetrics::avgCompressionUs() const {
+  const std::uint64_t count =
+      s_compressionCount_.load(std::memory_order_relaxed);
+  const std::uint64_t sum =
+      s_compressionTimeSumUs_.load(std::memory_order_relaxed);
+  return count == 0U ? 0.0
+                     : static_cast<double>(sum) /
+                           static_cast<double>(count);
+}
+
+double PerformanceMetrics::avgTokensSaved() const {
+  const std::uint64_t count =
+      s_compressionCount_.load(std::memory_order_relaxed);
+  const std::uint64_t saved =
+      s_tokensSavedTotal_.load(std::memory_order_relaxed);
+  return count == 0U ? 0.0
+                     : static_cast<double>(saved) /
+                           static_cast<double>(count);
+}
+
+double PerformanceMetrics::compressionRatio() const {
+  std::scoped_lock lock(s_mutex_);
+  if (s_tokenSavings_.rawTokensTotal == 0U) {
+    return 0.0;
+  }
+  return static_cast<double>(s_tokenSavings_.compressedTokensTotal) /
+         static_cast<double>(s_tokenSavings_.rawTokensTotal);
+}
+
+double PerformanceMetrics::contextReuseRate() const {
+  const std::uint64_t total =
+      s_contextRequests_.load(std::memory_order_relaxed);
+  const std::uint64_t reused =
+      s_contextReuses_.load(std::memory_order_relaxed);
+  return total == 0U ? 0.0
+                     : static_cast<double>(reused) /
+                           static_cast<double>(total);
+}
+
+double PerformanceMetrics::hotSliceHitRate() const {
+  const std::uint64_t total =
+      s_hotSliceAccessesAtomic_.load(std::memory_order_relaxed);
+  const std::uint64_t hits =
+      s_hotSliceHitsAtomic_.load(std::memory_order_relaxed);
+  return total == 0U ? 0.0
+                     : static_cast<double>(hits) /
+                           static_cast<double>(total);
+}
+
+double PerformanceMetrics::avgBranchChurnUs() const {
+  const std::uint64_t count =
+      s_branchChurnCount_.load(std::memory_order_relaxed);
+  const std::uint64_t sum =
+      s_branchChurnTimeSumUs_.load(std::memory_order_relaxed);
+  return count == 0U ? 0.0
+                     : static_cast<double>(sum) /
+                           static_cast<double>(count);
+}
+
+double PerformanceMetrics::overlayReuseRate() const {
+  std::scoped_lock lock(s_mutex_);
+  const std::size_t total =
+      s_overlayReuseCount_ + s_overlayReloadCount_;
+  if (total == 0U) {
+    return 0.0;
+  }
+  return static_cast<double>(s_overlayReuseCount_) /
+         static_cast<double>(total);
+}
+
+double PerformanceMetrics::avgSavingsPercent() const {
+  return averageTokenSavingsRatio() * 100.0;
+}
+
+std::uint64_t PerformanceMetrics::estimatedLLMCallsAvoided() const {
+  const std::uint64_t saved =
+      s_tokensSavedTotal_.load(std::memory_order_relaxed);
+  return saved / kEstimatedTokensPerCall;
+}
+
+std::uint64_t PerformanceMetrics::totalTokensSaved() const {
+  return s_tokensSavedTotal_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t PerformanceMetrics::branchEvictions() const {
+  return s_branchEvictions_.load(std::memory_order_relaxed);
+}
+
+double PerformanceMetrics::impactPredictionAccuracy() const {
+  std::scoped_lock lock(s_mutex_);
+  return averageSamples(s_impactPredictionAccuracySamples_);
+}
+
+std::size_t PerformanceMetrics::weightAdjustmentCount() const {
+  std::scoped_lock lock(s_mutex_);
+  return s_weightAdjustmentCount_;
+}
+
+std::vector<std::string> PerformanceMetrics::weightAdjustmentNames() const {
+  std::scoped_lock lock(s_mutex_);
+  std::vector<std::string> names;
+  names.reserve(s_weightAdjustments_.size());
+  for (const auto& [name, _] : s_weightAdjustments_) {
+    (void)_;
+    names.push_back(name);
+  }
+  return names;
+}
+
+std::vector<std::pair<std::size_t, std::size_t>>
+PerformanceMetrics::snapshotNodeCountDistribution() const {
+  std::scoped_lock lock(s_mutex_);
+  std::map<std::size_t, std::size_t> counts;
+  for (const SnapshotMetrics& snapshot : s_snapshotMetrics_) {
+    ++counts[snapshot.nodeCount];
+  }
+  std::vector<std::pair<std::size_t, std::size_t>> distribution;
+  distribution.reserve(counts.size());
+  for (const auto& entry : counts) {
+    distribution.push_back(entry);
+  }
+  return distribution;
 }
 
 nlohmann::ordered_json PerformanceMetrics::report() {
@@ -371,10 +600,8 @@ nlohmann::ordered_json PerformanceMetrics::report() {
       s_memoryGovernance_.hotSliceEvictionCount;
   memoryGovernance["hot_slice_recalibration_count"] =
       s_memoryGovernance_.hotSliceRecalibrationCount;
-  memoryGovernance["hot_slice_hit_rate"] =
-      s_memoryGovernance_.hotSliceHitRate;
-  memoryGovernance["context_reuse_rate"] =
-      s_memoryGovernance_.contextReuseRate;
+  memoryGovernance["hot_slice_hit_rate"] = hotSliceHitRatio;
+  memoryGovernance["context_reuse_rate"] = contextReuseRate;
   memoryGovernance["token_budget_scale"] =
       s_memoryGovernance_.tokenBudgetScale;
   memoryGovernance["compression_depth"] =
@@ -383,6 +610,8 @@ nlohmann::ordered_json PerformanceMetrics::report() {
       s_memoryGovernance_.pruningThreshold;
   memoryGovernance["impact_prediction_accuracy"] =
       s_memoryGovernance_.impactPredictionAccuracy;
+  memoryGovernance["evictions"] =
+      s_branchEvictions_.load(std::memory_order_relaxed);
 
   nlohmann::ordered_json reflectiveOptimization;
   reflectiveOptimization["token_savings"] = avgTokenSavingsRatio;
@@ -470,6 +699,22 @@ void PerformanceMetrics::reset() {
   s_weightAdjustments_.clear();
   s_weightAdjustmentCount_ = 0U;
   s_memoryGovernance_ = MemoryGovernanceMetrics{};
+
+  s_snapshotCreationTimeSumUs_.store(0U, std::memory_order_relaxed);
+  s_snapshotCreationTimeMaxUs_.store(0U, std::memory_order_relaxed);
+  s_snapshotCount_.store(0U, std::memory_order_relaxed);
+  s_compressionTimeSumUs_.store(0U, std::memory_order_relaxed);
+  s_compressionCount_.store(0U, std::memory_order_relaxed);
+  s_tokensSavedTotal_.store(0U, std::memory_order_relaxed);
+  s_contextRequests_.store(0U, std::memory_order_relaxed);
+  s_contextReuses_.store(0U, std::memory_order_relaxed);
+  s_hotSliceHitsAtomic_.store(0U, std::memory_order_relaxed);
+  s_hotSliceAccessesAtomic_.store(0U, std::memory_order_relaxed);
+  s_branchChurnTimeSumUs_.store(0U, std::memory_order_relaxed);
+  s_branchChurnCount_.store(0U, std::memory_order_relaxed);
+  s_branchEvictions_.store(0U, std::memory_order_relaxed);
+  s_overlayReuses_.store(0U, std::memory_order_relaxed);
+  s_llmCallsAvoided_.store(0U, std::memory_order_relaxed);
 }
 
 }  // namespace ultra::metrics

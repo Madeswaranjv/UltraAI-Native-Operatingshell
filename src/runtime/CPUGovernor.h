@@ -4,6 +4,8 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace ultra::runtime {
 
@@ -45,6 +47,16 @@ class CPUGovernor {
   void exitIdle();
 
   [[nodiscard]] GovernorStats stats() const;
+
+  [[nodiscard]] std::size_t activeWorkloads() const;
+  [[nodiscard]] std::size_t workloadCount() const;
+  [[nodiscard]] double avgExecutionTimeMs() const;
+  [[nodiscard]] std::size_t hardwareThreads() const;
+  [[nodiscard]] std::size_t recommendedThreads() const;
+  [[nodiscard]] std::pair<std::size_t, std::size_t> recommendedThreadBounds() const;
+  [[nodiscard]] std::size_t calibrationCount() const;
+  [[nodiscard]] bool isIdle() const;
+  [[nodiscard]] std::vector<std::string> workloadNames() const;
 
  private:
   CPUGovernor() = default;
