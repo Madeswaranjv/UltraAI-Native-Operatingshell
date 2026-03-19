@@ -1,0 +1,80 @@
+Screen {
+    background: #000000;
+    color: #d3d3d3;
+}
+
+#header {
+    height: 3;
+    dock: top;
+    border-bottom: solid #444444;
+    padding: 0 2;
+    background: #000000;
+}
+
+#logo {
+    width: 50%;
+    content-align: left middle;
+    text-style: bold;
+    color: #8a2be2; /* Fallback */
+}
+
+/* Gradient simulation for logo via Textual markup (if needed, but handled by base color here) */
+
+#status {
+    width: 50%;
+    content-align: right middle;
+    color: #888888;
+}
+
+#main-area {
+    height: 100%;
+}
+
+#left-panel {
+    width: 30;
+    height: 100%;
+    border-right: dashed #333333;
+    background: #020202;
+    padding: 1 0;
+}
+
+#right-panel {
+    height: 100%;
+    width: 1fr;
+    padding: 1 2;
+}
+
+#hollow-purple-core {
+    height: 13;
+    width: 100%;
+    border: round #333333;
+    margin-bottom: 1;
+    background: #000000;
+}
+
+#output-stream {
+    height: 1fr;
+    border: solid #333333;
+    background: #020202;
+    padding: 1;
+    scrollbar-size-vertical: 1;
+    scrollbar-color: #555555;
+    scrollbar-color-hover: #8a2be2;
+}
+
+#command-input {
+    dock: bottom;
+    margin-top: 1;
+    border: tall #555555;
+    background: #000000;
+    color: #ffffff;
+}
+
+#command-input:focus {
+    border: tall #8a2be2;
+}
+
+Footer {
+    background: #000000;
+    color: #555555;
+}
