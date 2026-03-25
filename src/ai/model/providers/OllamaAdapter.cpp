@@ -4,6 +4,8 @@
 #include <sstream>
 #include <utility>
 
+#include "../http/HttpTransport.h"
+
 namespace ultra::ai::model::providers {
 
 namespace {
@@ -153,14 +155,50 @@ ModelResponse OllamaAdapter::generate(const ModelRequest& request) {
                      "Ollama adapter is not initialized.");
   }
 
-  (void)buildProviderRequest(request);
-
-  if (!config_.contains("mock_response")) {
-    return makeError(ModelErrorCode::ProviderUnavailable,
-                     "Ollama transport is not configured.");
+  // Mock path — for unit tests only.
+  if (config_.contains("mock_response")) {
+    return translateResponse(config_.at("mock_response"));
   }
 
-  return translateResponse(config_.at("mock_response"));
+  // Real path — POST to Ollama /api/generate (non-streaming).
+  const std::string endpoint =
+      config_.value("endpoint", std::string{"http://localhost:11434"});
+  const std::string url = endpoint + "/api/generate";
+
+  const nlohmann::ordered_json payload = buildProviderRequest(request);
+  const std::string body = payload.dump();
+
+  // 3-minute timeout — local LLMs need time to load into VRAM on first call
+  const http::HttpResponse httpResp =
+      http::httpPost(url, body, {}, 180000U);
+
+  if (!httpResp.ok) {
+    // Distinguish transport failure from HTTP error response.
+    if (httpResp.statusCode == 0) {
+      return makeError(ModelErrorCode::ProviderUnavailable,
+                       "Ollama HTTP transport error: " + httpResp.errorMessage);
+    }
+    // Ollama returns JSON error: { "error": "..." }
+    try {
+      const nlohmann::ordered_json errJson =
+          nlohmann::ordered_json::parse(httpResp.body);
+      if (errJson.contains("error") && errJson.at("error").is_string()) {
+        return makeError(ModelErrorCode::ProviderUnavailable,
+                         "Ollama error: " + errJson.at("error").get<std::string>());
+      }
+    } catch (...) {}
+    return makeError(ModelErrorCode::ProviderUnavailable,
+                     "Ollama returned HTTP " + std::to_string(httpResp.statusCode));
+  }
+
+  try {
+    const nlohmann::ordered_json responseJson =
+        nlohmann::ordered_json::parse(httpResp.body);
+    return translateResponse(responseJson);
+  } catch (const nlohmann::json::exception& ex) {
+    return makeError(ModelErrorCode::InvalidResponse,
+                     std::string("Ollama response JSON parse failed: ") + ex.what());
+  }
 }
 
 ModelResponse OllamaAdapter::stream(const ModelRequest& request,
@@ -234,14 +272,13 @@ nlohmann::ordered_json OllamaAdapter::buildProviderRequest(
   }
 
   nlohmann::ordered_json payload = nlohmann::ordered_json::object();
-  payload["context"] = request.contextPayload;
   payload["model"] = info_.modelName;
   payload["options"] = {{"num_predict", request.maxTokens},
                         {"temperature", request.temperature}};
   payload["prompt"] = request.prompt;
   payload["stream"] = false;
   payload["system"] = request.systemPrompt;
-  payload["tools"] = std::move(toolsPayload);
+  // Note: tools only supported on /api/chat, not /api/generate
   return payload;
 }
 

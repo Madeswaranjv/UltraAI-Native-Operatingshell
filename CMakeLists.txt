@@ -91,12 +91,10 @@ add_library(ts_typescript STATIC
 
 add_library(ts_java STATIC
     third_party/grammars/tree-sitter-java/src/parser.c
-    #third_party/grammars/tree-sitter-java/src/scanner.c
 )
 
 add_library(ts_go STATIC
     third_party/grammars/tree-sitter-go/src/parser.c
-    #third_party/grammars/tree-sitter-go/src/scanner.c
 )
 
 add_library(ts_rust STATIC
@@ -108,6 +106,7 @@ add_library(ts_csharp STATIC
     third_party/grammars/tree-sitter-c-sharp/src/parser.c
     third_party/grammars/tree-sitter-c-sharp/src/scanner.c
 )
+
 if(MSVC)
   target_compile_options(ts_cpp PRIVATE /W0)
   target_compile_options(ts_python PRIVATE /W0)
@@ -118,6 +117,7 @@ if(MSVC)
   target_compile_options(ts_rust PRIVATE /W0)
   target_compile_options(ts_csharp PRIVATE /W0)
 endif()
+
 # ============================================================================
 # Ultra Core
 # ============================================================================
@@ -138,9 +138,16 @@ target_link_libraries(ultra_core PRIVATE
     ts_csharp
 )
 
+# ✅ PATCH 1 APPLIED HERE
 target_sources(ultra_core PRIVATE
     src/metrics/PerformanceMetrics.cpp
+    src/ai/model/http/HttpTransport.cpp
 )
+
+# ✅ PATCH 2 APPLIED HERE
+if(WIN32)
+  target_link_libraries(ultra_core PRIVATE winhttp)
+endif()
 
 target_include_directories(ultra_core
     PRIVATE
@@ -180,7 +187,6 @@ endif()
 if(ULTRA_USE_LIBCLANG)
   message(WARNING "ULTRA_USE_LIBCLANG is deprecated and ignored; Ultra uses the unified Tree-sitter semantic pipeline.")
 endif()
-
 
 # ============================================================================
 # Ultra Executable

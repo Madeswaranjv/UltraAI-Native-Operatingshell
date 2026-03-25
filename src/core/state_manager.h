@@ -111,6 +111,8 @@ class StateManager {
       const WriteMutation& mutation);
   void ensureSnapshotCurrent(const runtime::GraphSnapshot& snapshot) const;
 
+  [[nodiscard]] const std::filesystem::path& projectRoot() const noexcept;
+
   void withReadLock(const ReadView& view) const;
   bool withWriteLock(const WriteMutation& mutation);
 
@@ -123,6 +125,7 @@ class StateManager {
       const std::vector<runtime::SymbolID>& affectedSymbols);
   void rebuildGraphLocked();
 
+  std::filesystem::path projectRoot_;
   mutable std::shared_mutex graphMutex_;
   std::shared_ptr<memory::StateGraph> graph_{std::make_shared<memory::StateGraph>()};
   std::uint64_t globalVersion_{0};

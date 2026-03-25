@@ -71,10 +71,13 @@ nlohmann::ordered_json sortJsonKeys(const nlohmann::ordered_json& value) {
 }
 
 nlohmann::ordered_json defaultRoutingConfiguration() {
+  // Default routing: best model per task type.
+  // Users override this via .ultra/model_routing.json.
   nlohmann::ordered_json routing = nlohmann::ordered_json::object();
-  routing["analysis"] = "openai";
-  routing["coding"] = "ollama";
-  routing["planning"] = "deepseek";
+  routing["analysis"]  = "anthropic";
+  routing["coding"]    = "ollama";
+  routing["coding"]    = "gemini";
+  routing["planning"]  = "deepseek";
   routing["reasoning"] = "deepseek";
 
   nlohmann::ordered_json payload = nlohmann::ordered_json::object();

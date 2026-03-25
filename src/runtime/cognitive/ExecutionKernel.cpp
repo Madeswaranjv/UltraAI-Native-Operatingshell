@@ -1,25 +1,34 @@
 #include "ExecutionKernel.h"
 
 #include "CognitiveRuntime.h"
+#include "tool_router/ToolRouter.h"
 
 #include "../ContextExtractor.h"
 #include "../governance/GovernanceEngine.h"
 #include "../impact_analyzer.h"
 #include "../intent/IntentEvaluator.h"
 #include "../../ai/orchestration/MultiModelOrchestrator.h"
+#include "../../core/Logger.h"
 #include "../../core/state_manager.h"
 #include "../../diff/DiffEngine.h"
 #include "../../engine/impact/ImpactPredictionEngine.h"
+#include "../CPUGovernor.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
-
+#include<iostream>
 namespace ultra::runtime {
 
 namespace {
@@ -108,6 +117,144 @@ const ai::RuntimeState& requireRuntimeState(const GraphSnapshot& snapshot) {
   return *snapshot.runtimeState;
 }
 
+std::string quoteForShell(const std::string& raw) {
+  std::string escaped;
+  escaped.reserve(raw.size() + 2U);
+  escaped.push_back('"');
+  for (const char ch : raw) {
+    if (ch == '"') {
+      escaped += "\\\"";
+      continue;
+    }
+    escaped.push_back(ch);
+  }
+  escaped.push_back('"');
+  return escaped;
+}
+
+std::string slurpTextFile(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input.is_open()) {
+    return {};
+  }
+
+  std::ostringstream stream;
+  stream << input.rdbuf();
+  return stream.str();
+}
+
+struct CommandProbe {
+  int exitCode{1};
+  std::string output;
+};
+
+CommandProbe runCapturedCommand(const std::string& command) {
+  CommandProbe probe;
+
+  std::error_code ec;
+  const std::filesystem::path tempDir = std::filesystem::temp_directory_path(ec);
+  const std::filesystem::path outputPath =
+      ec ? std::filesystem::path("ultra_governance_query.log")
+         : tempDir /
+               ("ultra_governance_query_" +
+                std::to_string(
+                    std::chrono::steady_clock::now().time_since_epoch().count()) +
+                ".log");
+
+  const std::string redirected =
+      command + " > " + quoteForShell(outputPath.string()) + " 2>&1";
+  probe.exitCode = std::system(redirected.c_str());
+  probe.output = slurpTextFile(outputPath);
+
+  std::error_code removeError;
+  std::filesystem::remove(outputPath, removeError);
+  return probe;
+}
+
+bool hasUltraQueryError(const std::string& output) {
+  return output.find("[ERROR]") != std::string::npos;
+}
+
+bool isUltraQueryTargetMissing(const std::string& output) {
+  return output.find("[UAIR] target not found") != std::string::npos;
+}
+
+bool isBinaryBoundaryByte(const unsigned char byte) {
+  return byte == 0U || byte < 32U || byte > 126U;
+}
+
+std::optional<std::filesystem::path> resolveSymbolsTablePath() {
+  const std::filesystem::path preferred =
+      "E:/Projects/UltraInfinity.ultra/ai/symbols.tbl";
+  const std::filesystem::path fallback =
+      "E:/Projects/UltraInfinity/.ultra/ai/symbols.tbl";
+
+  std::error_code ec;
+  if (std::filesystem::exists(preferred, ec) && !ec) {
+    return preferred;
+  }
+
+  ec.clear();
+  if (std::filesystem::exists(fallback, ec) && !ec) {
+    return fallback;
+  }
+
+  return std::nullopt;
+}
+
+bool symbolsTableContains(const std::filesystem::path& tablePath,
+                          const std::string_view symbol) {
+  if (symbol.empty()) {
+    return false;
+  }
+
+  std::ifstream input(tablePath, std::ios::binary);
+  if (!input.is_open()) {
+    return false;
+  }
+
+  std::vector<char> tableBytes((std::istreambuf_iterator<char>(input)),
+                               std::istreambuf_iterator<char>());
+  if (tableBytes.size() < symbol.size()) {
+    return false;
+  }
+
+  for (std::size_t offset = 0U; offset + symbol.size() <= tableBytes.size(); ++offset) {
+    if (!std::equal(symbol.begin(),
+                    symbol.end(),
+                    tableBytes.begin() + static_cast<std::ptrdiff_t>(offset))) {
+      continue;
+    }
+
+    const bool beforeBoundary =
+        offset == 0U ||
+        isBinaryBoundaryByte(static_cast<unsigned char>(tableBytes[offset - 1U]));
+    const std::size_t afterOffset = offset + symbol.size();
+    const bool afterBoundary =
+        afterOffset >= tableBytes.size() ||
+        isBinaryBoundaryByte(static_cast<unsigned char>(tableBytes[afterOffset]));
+    if (beforeBoundary && afterBoundary) {
+      return true;
+    }
+  }
+
+  return false;
+}
+std::string joinReasons(const std::vector<std::string>& reasons) {
+  if (reasons.empty()) {
+    return {};
+  }
+
+  std::ostringstream stream;
+  for (std::size_t index = 0U; index < reasons.size(); ++index) {
+    if (index > 0U) {
+      stream << "; ";
+    }
+    stream << reasons[index];
+  }
+  return stream.str();
+}
+
 RiskLevel toRiskLevel(const double value) {
   if (value >= 0.67) {
     return RiskLevel::High;
@@ -146,6 +293,8 @@ std::string toString(const ActionType type) {
       return "IntentEvaluation";
     case ActionType::ModelGenerate:
       return "ModelGenerate";
+    case ActionType::ToolExecution:
+      return "ToolExecution";
   }
   return "Mutation";
 }
@@ -158,6 +307,8 @@ std::string toString(const RiskLevel level) {
       return "MEDIUM";
     case RiskLevel::High:
       return "HIGH";
+    case RiskLevel::Critical:
+      return "CRITICAL";
   }
   return "MEDIUM";
 }
@@ -538,16 +689,179 @@ bool isKnownSymbolTarget(const GraphSnapshot& snapshot,
   return false;
 }
 
+const std::map<std::string, std::vector<std::string>>& fallbackToolInputParams() {
+  static const std::map<std::string, std::vector<std::string>> kToolInputs = {
+      {"read_file", {"path"}},
+      {"write_file", {"path", "content"}},
+      {"append_file", {"path", "content"}},
+      {"delete_file", {"path"}},
+      {"list_dir", {}},
+      {"search_files", {"pattern"}},
+      {"run_command", {"command"}},
+  };
+  return kToolInputs;
+}
+
+bool isNativeToolRouterTool(const std::string& toolName) {
+  return fallbackToolInputParams().find(toolName) !=
+         fallbackToolInputParams().end();
+}
+
+bool requiresModelGeneration(const intent::ActionKind kind) {
+  switch (kind) {
+    case intent::ActionKind::ModifySymbolBody:
+    case intent::ActionKind::RefactorModule:
+    case intent::ActionKind::AddDependency:
+    case intent::ActionKind::RemoveDependency:
+    case intent::ActionKind::RenameSymbol:
+    case intent::ActionKind::ChangeSignature:
+    case intent::ActionKind::UpdatePublicAPI:
+    case intent::ActionKind::MoveAcrossModules:
+      return true;
+    case intent::ActionKind::ReduceImpactRadius:
+    case intent::ActionKind::ImproveCentrality:
+    case intent::ActionKind::MinimizeTokenUsage:
+      return false;
+  }
+  return false;
+}
+
+ai::orchestration::TaskType taskTypeForStrategyAction(
+    const intent::Action& strategyAction) {
+  switch (strategyAction.kind) {
+    case intent::ActionKind::ModifySymbolBody:
+    case intent::ActionKind::RefactorModule:
+    case intent::ActionKind::AddDependency:
+    case intent::ActionKind::RemoveDependency:
+    case intent::ActionKind::RenameSymbol:
+    case intent::ActionKind::ChangeSignature:
+    case intent::ActionKind::UpdatePublicAPI:
+    case intent::ActionKind::MoveAcrossModules:
+      return ai::orchestration::TaskType::Coding;
+    case intent::ActionKind::ReduceImpactRadius:
+    case intent::ActionKind::ImproveCentrality:
+    case intent::ActionKind::MinimizeTokenUsage:
+      return ai::orchestration::TaskType::Analysis;
+  }
+  return ai::orchestration::TaskType::Analysis;
+}
+
+std::string selectProviderForAction(const intent::Action& strategyAction) {
+  if (strategyAction.publicApiSurface ||
+      strategyAction.kind == intent::ActionKind::ChangeSignature ||
+      strategyAction.kind == intent::ActionKind::UpdatePublicAPI) {
+    return "deepseek";
+  }
+  return "ollama";
+}
+
+ai::model::ModelRequest buildModelRequestForStrategyAction(
+    const intent::Action& strategyAction,
+    const CognitiveState& state) {
+  ai::model::ModelRequest request;
+  request.systemPrompt =
+      "You are UltraInfinity coding execution stage. Generate deterministic "
+      "code-level changes and actionable implementation output.";
+
+  std::ostringstream prompt;
+  prompt << "Action Kind: " << intent::toString(strategyAction.kind) << "\n";
+  prompt << "Target: " << strategyAction.target << "\n";
+  prompt << "Details: " << strategyAction.details << "\n";
+  prompt << "Estimated Files Changed: " << strategyAction.estimatedFilesChanged
+         << "\n";
+  prompt << "Estimated Dependency Depth: "
+         << strategyAction.estimatedDependencyDepth << "\n";
+  prompt << "Branch: " << state.snapshot.branch.toString() << "\n";
+  prompt << "Snapshot Version: " << state.snapshot.version << "\n";
+  prompt << "Return concrete implementation content suitable for deterministic "
+            "execution.";
+  request.prompt = prompt.str();
+
+  request.temperature = 0.10;
+  request.maxTokens = std::max<std::size_t>(
+      512U,
+      strategyAction.estimatedFilesChanged *
+          std::max<std::size_t>(256U, strategyAction.estimatedDependencyDepth * 128U));
+
+  request.toolsAvailable = {
+      "read_file",
+      "write_file",
+      "append_file",
+      "delete_file",
+      "list_dir",
+      "search_files",
+      "run_command",
+  };
+
+  request.contextPayload = {
+      {"action_kind", intent::toString(strategyAction.kind)},
+      {"target", strategyAction.target},
+      {"details", strategyAction.details},
+      {"estimated_files_changed", strategyAction.estimatedFilesChanged},
+      {"estimated_dependency_depth", strategyAction.estimatedDependencyDepth},
+      {"branch", state.snapshot.branch.toString()},
+      {"snapshot_version", state.snapshot.version},
+  };
+  return request;
+}
+
+ai::orchestration::OrchestrationContext buildModelOrchestrationForStrategyAction(
+    const intent::Action& strategyAction,
+    const ai::model::ModelRequest& request) {
+  ai::orchestration::OrchestrationContext context;
+  context.taskType = taskTypeForStrategyAction(strategyAction);
+  context.complexity =
+      (strategyAction.estimatedDependencyDepth >= 3U ||
+       strategyAction.estimatedFilesChanged >= 4U)
+          ? ai::orchestration::TaskComplexity::High
+          : ai::orchestration::TaskComplexity::Medium;
+  context.priority = strategyAction.publicApiSurface
+                         ? ai::orchestration::TaskPriority::Urgent
+                         : ai::orchestration::TaskPriority::Standard;
+  context.tokenBudget = request.maxTokens;
+  context.availableModels = {
+      selectProviderForAction(strategyAction),
+      "ollama",
+      "gemini",
+      "openai",
+      "anthropic",
+      "deepseek",
+  };
+  return context;
+}
+
 Action strategyActionToKernelAction(const intent::Action& strategyAction,
                                     const CognitiveState& state) {
   Action action;
-  action.type = ActionType::SimulateChange;
   action.id = intent::toString(strategyAction.kind) + ":" + strategyAction.target;
-  action.target = strategyAction.target;
+  action.target = strategyAction.target.empty() ? "workspace_root" : strategyAction.target;
   action.branch = state.snapshot.branch.toString();
   action.snapshotVersion = state.snapshot.version;
+
+  if (strategyAction.kind == intent::ActionKind::ReduceImpactRadius ||
+      strategyAction.kind == intent::ActionKind::ImproveCentrality) {
+    action.type = ActionType::ImpactPrediction;
+    return action;
+  }
+
+  if (strategyAction.kind == intent::ActionKind::MinimizeTokenUsage) {
+    action.type = ActionType::ContextExtraction;
+    return action;
+  }
+
+  if (requiresModelGeneration(strategyAction.kind)) {
+    action.type = ActionType::ModelGenerate;
+    action.modelProvider = selectProviderForAction(strategyAction);
+    action.modelRequest = buildModelRequestForStrategyAction(strategyAction, state);
+    action.orchestrationContext =
+        buildModelOrchestrationForStrategyAction(strategyAction, *action.modelRequest);
+    return action;
+  }
+
+  action.type = ActionType::SimulateChange;
   return action;
 }
+
 
 ai::orchestration::OrchestrationContext buildOrchestrationContext(
     const Action& action) {
@@ -572,7 +886,171 @@ ExecutionKernel::ExecutionKernel(
       modelOrchestrator_(modelOrchestrator != nullptr
                              ? std::move(modelOrchestrator)
                              : ai::orchestration::MultiModelOrchestrator::
-                                   createDefault()) {}
+                                   createDefault(stateManager.projectRoot())) {}
+
+RiskLevel ExecutionKernel::maxRisk(const RiskLevel left,
+                                   const RiskLevel right) noexcept {
+  return static_cast<int>(right) > static_cast<int>(left) ? right : left;
+}
+
+GovernanceDecision ExecutionKernel::evaluate_action(
+    const std::string& tool,
+    const std::map<std::string, std::string>& args) {
+  GovernanceDecision decision;
+  decision.allowed = true;
+  decision.risk = RiskLevel::Low;
+  decision.confidence = 0.92F;
+
+  std::vector<std::string> reasons;
+  std::size_t unknownParameterCount = 0U;
+
+  const cognitive::tools::ToolDefinition* definition =
+      toolExecutor_.registry().get_tool(tool);
+  std::vector<std::string> requiredArgs;
+  if (definition != nullptr) {
+    requiredArgs = definition->input_params;
+  } else {
+    const auto fallbackTool = fallbackToolInputParams().find(tool);
+    if (fallbackTool != fallbackToolInputParams().end()) {
+      requiredArgs = fallbackTool->second;
+    } else {
+      decision.allowed = false;
+      decision.risk = RiskLevel::Critical;
+      decision.confidence = 0.0F;
+      decision.reason = "Unknown tool: " + tool;
+      core::Logger::warning(core::LogCategory::General,
+                            "Governance blocked unknown tool '" + tool + "'.");
+      return decision;
+    }
+  }
+
+  if (tool == "query_symbol" || tool == "read_source" ||
+      tool == "read_file" || tool == "list_dir" ||
+      tool == "search_files") {
+    decision.risk = RiskLevel::Low;
+  } else if (tool == "impact_analysis" || tool == "get_context" ||
+             tool == "get_status") {
+    decision.risk = RiskLevel::Medium;
+  } else if (tool == "write_file" || tool == "append_file" ||
+             tool == "delete_file" || tool == "run_command") {
+    decision.risk = RiskLevel::High;
+    reasons.push_back("Mutable tool execution requires strict governance.");
+  } else {
+    decision.risk = RiskLevel::Critical;
+    reasons.push_back("Tool is outside deterministic governance policy");
+  }
+
+  if (!requiredArgs.empty() && args.empty()) {
+    decision.risk = maxRisk(decision.risk, RiskLevel::Critical);
+    decision.confidence -= 0.70F;
+    reasons.push_back("Required arguments are empty");
+  }
+
+  for (const std::string& required : requiredArgs) {
+    const auto it = args.find(required);
+    if (it == args.end() || it->second.empty()) {
+      decision.risk = maxRisk(decision.risk, RiskLevel::Critical);
+      decision.confidence -= 0.35F;
+      reasons.push_back("Missing required argument: " + required);
+    }
+  }
+
+  for (const auto& [key, value] : args) {
+    if (value.empty()) {
+      decision.risk = maxRisk(decision.risk, RiskLevel::Critical);
+      decision.confidence -= 0.20F;
+      reasons.push_back("Argument '" + key + "' is empty");
+      continue;
+    }
+
+    const bool known =
+        std::find(requiredArgs.begin(), requiredArgs.end(), key) != requiredArgs.end();
+    if (!known) {
+      ++unknownParameterCount;
+      decision.risk = maxRisk(decision.risk, RiskLevel::High);
+      decision.confidence -= 0.15F;
+      reasons.push_back("Unknown parameter: " + key);
+    }
+  }
+
+  if (tool == "query_symbol" || tool == "impact_analysis") {
+    const auto symbolsTablePath = resolveSymbolsTablePath();
+    if (!symbolsTablePath.has_value()) {
+      decision.risk = maxRisk(decision.risk, RiskLevel::Critical);
+      decision.confidence -= 0.35F;
+      reasons.push_back("symbols.tbl is unavailable for validation");
+    }
+
+    const auto targetIt = args.find("target");
+    if (targetIt != args.end() && !targetIt->second.empty() &&
+        !validateSymbolWithUltra(targetIt->second)) {
+      decision.risk = maxRisk(decision.risk, RiskLevel::Critical);
+      decision.confidence -= 0.70F;
+      reasons.push_back("Target symbol is not indexed: " + targetIt->second);
+    }
+  }
+
+  const std::size_t historyFailures =
+      std::max(toolExecutor_.consecutive_failures(tool),
+               toolFailureCounts_[tool]);
+  if (historyFailures >= 2U) {
+    decision.risk = maxRisk(decision.risk, RiskLevel::High);
+    decision.confidence -=
+        std::min(0.30F, 0.10F * static_cast<float>(historyFailures));
+    reasons.push_back("Repeated failures detected for tool execution");
+  }
+
+  CognitiveRuntime runtime(stateManager_);
+  const GovernanceSignal signal = runtime.currentGovernanceSignal();
+  const bool overloaded =
+      !signal.idle &&
+      signal.activeWorkloads >= std::max<std::size_t>(1U, signal.recommendedThreads);
+  if (overloaded) {
+    decision.risk = maxRisk(decision.risk, RiskLevel::High);
+    decision.confidence -= 0.25F;
+    reasons.push_back("CPUGovernor reports overloaded execution environment");
+  }
+  if (signal.movingAverageMs >= 120.0) {
+    decision.risk = maxRisk(decision.risk, RiskLevel::High);
+    decision.confidence -= 0.10F;
+    reasons.push_back("CPUGovernor moving-average latency is elevated");
+  }
+  if (signal.idle) {
+    decision.confidence = std::min(1.0F, decision.confidence + 0.05F);
+  }
+
+  decision.confidence = std::clamp(decision.confidence, 0.0F, 1.0F);
+
+  if (decision.confidence < 0.4F) {
+    decision.allowed = false;
+    reasons.push_back("Confidence dropped below governance threshold");
+  }
+
+  if (decision.risk == RiskLevel::Critical) {
+    decision.allowed = false;
+  }
+
+  if (decision.risk == RiskLevel::High &&
+      (unknownParameterCount > 0U || historyFailures >= 2U || overloaded)) {
+    decision.allowed = false;
+  }
+
+  decision.reason = joinReasons(reasons);
+  if (decision.reason.empty()) {
+    decision.reason =
+        decision.allowed ? "Governance approved action." : "Governance blocked action.";
+  }
+
+  core::Logger::info(
+      core::LogCategory::General,
+      "Governance decision tool='" + tool + "' risk=" +
+          toString(decision.risk) + " confidence=" +
+          std::to_string(decision.confidence) + " allowed=" +
+          (decision.allowed ? "true" : "false") + " reason='" +
+          decision.reason + "'.");
+
+  return decision;
+}
 
 std::string ExecutionKernel::stableActionId(const Action& action) const {
   if (!action.id.empty()) {
@@ -582,6 +1060,12 @@ std::string ExecutionKernel::stableActionId(const Action& action) const {
   std::string id = toString(action.type);
   if (!action.target.empty()) {
     id += ":" + action.target;
+  }
+  if (!action.toolName.empty()) {
+    id += ":tool:" + action.toolName;
+    for (const auto& [key, value] : action.toolArgs) {
+      id += ":" + key + "=" + value;
+    }
   }
   if (action.intentRequest.has_value()) {
     id += ":intent:" + intent::toString(action.intentRequest->goal.type) + ":" +
@@ -671,6 +1155,11 @@ void ExecutionKernel::validateAction(const Action& action,
       if (!action.orchestrationContext.has_value() && action.modelProvider.empty()) {
         throw std::runtime_error(
             "Model generation requires an orchestration context or provider hint.");
+      }
+      return;
+    case ActionType::ToolExecution:
+      if (action.toolName.empty()) {
+        throw std::runtime_error("Tool execution requires a registered tool name.");
       }
       return;
   }
@@ -794,6 +1283,8 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
     }
 
     case ActionType::SimulateChange: {
+      // DEBUG — if you see this, strategyActionToKernelAction mapped to SimulateChange
+      std::cerr << "[ULTRA-DEBUG] SimulateChange entered. target=" << action.target << "\n";
       const ai::RuntimeState& runtimeState = requireRuntimeState(state.snapshot);
       engine::impact::ImpactPredictionEngine engine(
           runtimeState, state.snapshot.graphStore, state.snapshot.version);
@@ -815,6 +1306,16 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
       const ai::orchestration::OrchestrationContext orchestrationContext =
           buildOrchestrationContext(action);
 
+      // DEBUG — printed to stderr so it doesn't pollute the JSON stdout
+      std::cerr << "[ULTRA-DEBUG] ModelGenerate entered."
+                << " provider=" << action.modelProvider
+                << " prompt_len=" << (action.modelRequest.has_value()
+                                          ? action.modelRequest->prompt.size()
+                                          : 0U)
+                << " orchestrator="
+                << (modelOrchestrator_ != nullptr ? "set" : "NULL")
+                << "\n";
+
       if (modelOrchestrator_ == nullptr) {
         ai::model::ModelResponse response;
         response.ok = false;
@@ -832,6 +1333,31 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
 
       const ai::model::ModelResponse response =
           modelOrchestrator_->generate(*action.modelRequest, orchestrationContext);
+
+      // DEBUG
+      std::cerr << "[ULTRA-DEBUG] ModelGenerate response."
+                << " ok=" << (response.ok ? "true" : "false")
+                << " error=" << response.errorMessage
+                << " output_len=" << response.textOutput.size()
+                << "\n";
+
+      // DUMP model response to file for inspection
+      {
+        std::ofstream debugFile("C:/Temp/ultra_model_response.txt",
+                                std::ios::binary | std::ios::trunc);
+        if (debugFile.is_open()) {
+          debugFile << "=== ModelGenerate Response ===\n";
+          debugFile << "ok: " << (response.ok ? "true" : "false") << "\n";
+          debugFile << "error: " << response.errorMessage << "\n";
+          debugFile << "output_len: " << response.textOutput.size() << "\n";
+          debugFile << "=== text_output ===\n";
+          debugFile << response.textOutput << "\n";
+          debugFile << "=== payload json ===\n";
+          // Also dump what toJson produces so we can see the key name
+          debugFile << ai::model::toJson(response).dump(2) << "\n";
+        }
+      }
+
       result.payload = buildModelExecutionJson(orchestrationContext,
                                                action.modelProvider,
                                                *action.modelRequest, response);
@@ -843,6 +1369,53 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
                                           ? "Model generation failed."
                                           : response.errorMessage);
       break;
+    }
+
+    case ActionType::ToolExecution: {
+      const GovernanceDecision decision =
+          evaluate_action(action.toolName, action.toolArgs);
+      result.payload = {
+          {"args", action.toolArgs},
+          {"governance",
+           {{"allowed", decision.allowed},
+            {"confidence", decision.confidence},
+            {"reason", decision.reason},
+            {"risk", toString(decision.risk)}}},
+          {"tool", action.toolName},
+      };
+
+      result.risk = decision.risk;
+      if (!decision.allowed) {
+        result.ok = false;
+        result.message = "Governance blocked tool execution: " + decision.reason;
+        result.normalizedPaths = collectNormalizedPaths(result.payload);
+        break;
+      }
+
+      std::string toolOutput;
+      bool toolSucceeded = false;
+
+      if (toolExecutor_.registry().get_tool(action.toolName) != nullptr) {
+        toolOutput = toolExecutor_.execute(action.toolName, action.toolArgs);
+        toolSucceeded = toolExecutor_.last_execution_succeeded();
+      } else if (isNativeToolRouterTool(action.toolName)) {
+        cognitive::tool_router::ToolRouter directRouter;
+        toolOutput = directRouter.route_and_execute(action.toolName, action.toolArgs);
+        toolSucceeded = toolOutput.rfind("ERROR:", 0U) != 0U &&
+                        toolOutput.rfind("[ERROR]", 0U) != 0U;
+        result.payload["router_fallback"] = true;
+      } else {
+        toolOutput = "ERROR: tool '" + action.toolName + "' is not registered.";
+      }
+
+      result.payload["output"] = toolOutput;
+      result.normalizedPaths = collectNormalizedPaths(result.payload);
+      result.ok = toolSucceeded;
+      result.risk = result.ok ? decision.risk : maxRisk(decision.risk, RiskLevel::High);
+      result.message =
+          result.ok ? "Tool execution completed deterministically." : toolOutput;
+      break;
+
     }
 
     case ActionType::IntentEvaluation: {
@@ -910,6 +1483,8 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
                                       childResult.normalizedPaths.end());
       }
 
+      bool intentLoopFailed = false;
+      std::string intentLoopFailReason;
       for (const intent::Action& strategyAction :
            evaluation.bestPlan.strategy.proposedActions) {
         Action childAction = strategyActionToKernelAction(strategyAction, state);
@@ -930,9 +1505,25 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
         result.normalizedPaths.insert(result.normalizedPaths.end(),
                                       childResult.normalizedPaths.begin(),
                                       childResult.normalizedPaths.end());
+
+        // If a generative action failed, stop — do NOT fall through to next
+        // (analysis/SimulateChange) action in the list.
+        if (!childResult.ok && childAction.type == ActionType::ModelGenerate) {
+          intentLoopFailed = true;
+          intentLoopFailReason = childResult.message;
+          break;
+        }
       }
 
       result.payload["child_results"] = std::move(childResults);
+
+      if (intentLoopFailed) {
+        result.risk = RiskLevel::Medium;
+        result.ok = false;
+        result.message = intentLoopFailReason;
+        break;
+      }
+
       result.risk = toRiskLevel(evaluation.bestPlan.riskClassification);
       result.ok = true;
       result.message = "Intent plan executed deterministically.";
@@ -976,6 +1567,11 @@ Result ExecutionKernel::execute(const Action& action,
   try {
     validateAction(action, state);
     CognitiveRuntime runtime(stateManager_);
+    if (action.type == ActionType::ToolExecution &&
+        runtime.toolRegistry().get_tool(action.toolName) == nullptr) {
+      throw std::runtime_error(
+          "Tool execution requested an unregistered Layer 16 tool.");
+    }
     SnapshotPinGuard pinGuard = runtime.pin(state);
 
     std::lock_guard<std::mutex> queueLock(mutationQueueMutex_);
@@ -984,6 +1580,7 @@ Result ExecutionKernel::execute(const Action& action,
 
     result = executeActionLocked(action, state);
     result.queueOrder = queueOrder;
+    updateToolFailureHistory(action, result);
   } catch (const std::exception& ex) {
     result.ok = false;
     result.type = action.type;
@@ -996,7 +1593,83 @@ Result ExecutionKernel::execute(const Action& action,
 
   sortOutputs(result);
   recordOutcome();
+  // Cache last successful result so CognitiveRuntime can extract model output.
+  if (result.ok) {
+    lastResult_ = result;
+    hasLastResult_ = true;
+  }
   return result;
+}
+
+bool ExecutionKernel::validateSymbolWithUltra(const std::string& symbol) const {
+  if (symbol.empty()) {
+    return false;
+  }
+
+  const std::string command = "ultra ai_query " + quoteForShell(symbol);
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    const CommandProbe probe = runCapturedCommand(command);
+    if (probe.exitCode == 0 && !hasUltraQueryError(probe.output)) {
+      return true;
+    }
+    if (isUltraQueryTargetMissing(probe.output)) {
+      return false;
+    }
+
+    core::Logger::warning(
+        core::LogCategory::General,
+        "Governance symbol validation retry " + std::to_string(attempt + 1) +
+            " failed for '" + symbol + "'.");
+  }
+
+  const auto symbolsTablePath = resolveSymbolsTablePath();
+  if (!symbolsTablePath.has_value()) {
+    return false;
+  }
+
+  const bool fallbackFound = symbolsTableContains(*symbolsTablePath, symbol);
+  if (fallbackFound) {
+    core::Logger::warning(
+        core::LogCategory::General,
+        "Governance symbol validation used symbols.tbl fallback for '" + symbol +
+            "'.");
+  }
+  return fallbackFound;
+}
+void ExecutionKernel::updateToolFailureHistory(
+    const Action& action,
+    const Result& result) {
+  if (action.type != ActionType::ToolExecution || action.toolName.empty()) {
+    return;
+  }
+
+  if (result.ok) {
+    toolFailureCounts_[action.toolName] = 0U;
+    return;
+  }
+
+  ++toolFailureCounts_[action.toolName];
+}
+
+bool ExecutionKernel::hasToolCognitionLayer() const noexcept {
+  static const char* const kRequiredTools[] = {
+      "query_symbol",
+      "read_source",
+      "impact_analysis",
+      "get_context",
+      "get_status",
+  };
+
+  for (const char* tool : kRequiredTools) {
+    if (toolExecutor_.registry().get_tool(tool) == nullptr) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ExecutionKernel::hasToolRouterLayer() const noexcept {
+  return toolExecutor_.has_router();
 }
 
 }  // namespace ultra::runtime

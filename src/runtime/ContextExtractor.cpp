@@ -9,6 +9,7 @@
 
 #include <chrono>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 
 namespace ultra::runtime {
@@ -29,6 +30,28 @@ std::string symbolNodeId(const SymbolID symbolId) {
   return "symbol:" + std::to_string(symbolId);
 }
 
+std::string queryKindKey(const QueryKind kind) {
+  switch (kind) {
+    case QueryKind::Symbol:
+      return "symbol";
+    case QueryKind::File:
+      return "file";
+    case QueryKind::Impact:
+      return "impact";
+    case QueryKind::Auto:
+    default:
+      return "auto";
+  }
+}
+
+std::string buildContextCacheKey(const CognitiveState& state, const Query& query) {
+  std::ostringstream stream;
+  stream << queryKindKey(query.kind) << '|' << query.target << "|depth="
+         << query.impactDepth << "|budget=" << state.budget << "|weights="
+         << state.weights.recencyWeight << ',' << state.weights.centralityWeight
+         << ',' << state.weights.usageWeight << ',' << state.weights.impactWeight;
+  return stream.str();
+}
 struct ContextRuntimeCache {
   engine::query::QueryCache cache{128U};
   memory::HotSlice hotSlice{memory::HotSlice::kMaxHotSliceEntries};
@@ -149,7 +172,7 @@ ContextSlice ContextExtractor::getMinimalContext(const CognitiveState& state,
   }
 
   ContextRuntimeCache& cache = contextCache();
-  const std::string cacheKey = query.target;
+  const std::string cacheKey = buildContextCacheKey(state, query);
   engine::context::ContextSlice builtSlice;
 
   if (!cacheKey.empty() &&
@@ -276,5 +299,3 @@ ContextSlice ContextExtractor::getMinimalContext(const CognitiveState& state,
 }
 
 }  // namespace ultra::runtime
-
-

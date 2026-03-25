@@ -1,116 +1,124 @@
-import asyncio
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
-from textual.widgets import Footer, Static, Input
-from textual.reactive import reactive
+from textual import work
+from textual.binding import Binding
 
-# Import custom components
-from components import PhasePanel, HollowPurpleCore, OutputStream
+from components.header import UltraHeader
+from components.output import OutputPanel
+from components.input_bar import UltraInput
+from components.mode_bar import ModeBar
+from components.session_setup import SessionSetup
+from core.streamer import EngineStreamer
+from core.state_manager import StateManager, AppState, UltraMode
+from core.intent_parser import IntentParser
+from core.session import UltraSession
 
-class UltraInfinity(App):
-    """ULTRA INFINITY — Cognitive Interface"""
+
+class UltraInfinityApp(App):
+    """The Ultra Infinity Cognitive Terminal."""
 
     CSS_PATH = "styles.tcss"
 
-    # Reactive states for animation and UI
-    global_frame = reactive(0)
-    action_frame = reactive(0)
-    is_animating = reactive(False)
-    current_status = reactive("IDLE")
+    BINDINGS = [
+        Binding("ctrl+c", "quit", "Quit", show=False),
+        Binding("ctrl+s", "toggle_mode", "Switch Mode", show=False),
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
 
     def compose(self) -> ComposeResult:
-        """Compose the cinematic layout."""
-        # HEADER
-        with Horizontal(id="header"):
-            yield Static("ULTRA ∞", id="logo")
-            yield Static(f"MODE: ACTIVE | STATUS: {self.current_status}", id="status")
-
-        # MAIN AREA
-        with Horizontal(id="main-area"):
-            yield PhasePanel(id="left-panel")
-
-            with Vertical(id="right-panel"):
-                yield HollowPurpleCore(id="hollow-purple-core")
-                yield OutputStream(id="output-stream")
-                yield Input(placeholder=">> Enter command to initiate process...", id="command-input")
-
-        # FOOTER
-        yield Footer()
+        yield UltraHeader()
+        yield ModeBar()
+        yield SessionSetup(id="session-setup")
+        yield OutputPanel(id="main-output")
+        yield UltraInput(id="bottom-input")
 
     def on_mount(self) -> None:
-        """Start the animation engine (12.5 FPS)."""
-        self.set_interval(0.08, self.tick_frame)
+        self.state_manager = StateManager()
+        self.session = UltraSession()
+        self.output_panel = self.query_one("#main-output", OutputPanel)
+        self.streamer = EngineStreamer(self.output_panel, self.state_manager)
+        self.intent_parser = IntentParser()
 
-    def tick_frame(self) -> None:
-        """Global animation loop driving all mathematical rendering."""
-        self.global_frame += 1
-        
-        if self.is_animating:
-            self.action_frame += 1
-            # Reset after animation completes (Phase 3 ends around frame 50-55)
-            if self.action_frame > 55:
-                self.is_animating = False
-                self.action_frame = 0
+        # Start in session setup — hide output, show setup panel
+        self.query_one("#main-output").display = False
+        self.query_one("#bottom-input").display = False
+        self.query_one("#session-setup").display = True
 
-        # Safely push frame data to custom widgets
-        try:
-            self.query_one(PhasePanel).update_frame(self.global_frame)
-            self.query_one(HollowPurpleCore).update_frame(
-                self.global_frame, self.action_frame, self.is_animating
+    # ── Session Setup ────────────────────────────────────────────────────────
+
+    def on_session_setup_completed(self, message) -> None:
+        """Fired when user finishes governance/policy setup."""
+        self.session.apply(message.config)
+        self.state_manager.set_mode(message.config["mode"])
+
+        # Switch to main terminal view
+        self.query_one("#session-setup").display = False
+        self.query_one("#main-output").display = True
+        self.query_one("#bottom-input").display = True
+        self.query_one(ModeBar).set_mode(message.config["mode"])
+
+        self.streamer.set_session(self.session)
+        self._show_welcome()
+        self.query_one("#cmd-input").focus()
+
+    def _show_welcome(self) -> None:
+        mode = self.session.mode
+        if mode == UltraMode.ARCHITECTURAL:
+            self.output_panel.add_system_message(
+                "ARCHITECTURAL MODE — Provide your project structure and Ultra will plan autonomously within your governance rules."
             )
-        except Exception:
-            pass # Ignore errors during initial widget mounting
+        else:
+            self.output_panel.add_system_message(
+                "USER-DRIVEN MODE — Describe what you want. Ultra will parse your intent, build a task graph, and execute."
+            )
 
-    def watch_current_status(self, old_value: str, new_value: str) -> None:
-        """Automatically update the header status text when the reactive variable changes."""
-        try:
-            self.query_one("#status", Static).update(f"MODE: ACTIVE | STATUS: {new_value}")
-        except Exception:
-            pass
+    # ── Input Handling ───────────────────────────────────────────────────────
 
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Trigger the cinematic AI evaluation sequence."""
-        command = event.value.strip()
-        if not command:
+    async def on_input_submitted(self, message) -> None:
+        input_widget = message.input
+        prompt = input_widget.value.strip()
+        if not prompt:
+            return
+        if self.state_manager.current_state != AppState.IDLE:
             return
 
-        input_widget = self.query_one(Input)
         input_widget.value = ""
-        input_widget.disabled = True # Prevent interruption
+        self.state_manager.set_state(AppState.THINKING)
+        self.output_panel.add_user_message(prompt)
+        self._dispatch(prompt)
 
-        output = self.query_one(OutputStream)
-        phases = self.query_one(PhasePanel)
+    @work(exclusive=True)
+    async def _dispatch(self, prompt: str) -> None:
+        """Route to correct pipeline based on active mode."""
+        mode = self.state_manager.current_mode
+        if mode == UltraMode.ARCHITECTURAL:
+            await self.streamer.run_architectural_pipeline(prompt, self.session)
+        else:
+            parsed = await self.intent_parser.parse(prompt, self.session)
+            await self.streamer.run_user_driven_pipeline(prompt, parsed, self.session)
 
-        # Initiate animation states
-        self.current_status = "EVALUATING"
-        self.is_animating = True
-        self.action_frame = 0
+        self.state_manager.set_state(AppState.IDLE)
+        self.query_one("#cmd-input").focus()
 
-        # 5-step sequence syncing with the 50-frame animation (~4 seconds)
-        sequence = [
-            f">> {command}",
-            "Analyzing topology...",
-            "Decomposing parameters...",
-            "Fusing Reversal and Amplification...",
-            "Executing Hollow Purple...",
-            "Complete."
-        ]
+    # ── Keybindings ──────────────────────────────────────────────────────────
 
-        phase_mapping = ["PLAN", "MICRO-PLAN", "EXECUTE", "VERIFY", "REFLECT"]
+    def action_toggle_mode(self) -> None:
+        if self.state_manager.current_state != AppState.IDLE:
+            return
+        new_mode = (
+            UltraMode.USER_DRIVEN
+            if self.state_manager.current_mode == UltraMode.ARCHITECTURAL
+            else UltraMode.ARCHITECTURAL
+        )
+        self.state_manager.set_mode(new_mode)
+        self.query_one(ModeBar).set_mode(new_mode)
+        label = "ARCHITECTURAL" if new_mode == UltraMode.ARCHITECTURAL else "USER-DRIVEN"
+        self.output_panel.add_system_message(f"Switched to {label} MODE")
 
-        # 50 frames @ 0.08s = 4.0 seconds total. 5 steps = 0.8s per step.
-        for i, step in enumerate(sequence[1:]):
-            active_phase = phase_mapping[min(i, len(phase_mapping) - 1)]
-            phases.set_active(active_phase)
-            
-            output.stream_line(step)
-            await asyncio.sleep(0.8)
+    def action_cancel(self) -> None:
+        if self.state_manager.current_state not in (AppState.IDLE, AppState.COMPLETE):
+            self.output_panel.add_system_message("Task cancelled.")
+            self.state_manager.set_state(AppState.IDLE)
 
-        phases.set_active("REPLAN")
-        self.current_status = "IDLE"
-        input_widget.disabled = False
-        input_widget.focus()
 
 if __name__ == "__main__":
-    app = UltraInfinity()
-    app.run()
+    UltraInfinityApp().run()

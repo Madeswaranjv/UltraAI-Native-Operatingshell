@@ -196,6 +196,19 @@ bool compactContextSlice(ContextSlice& slice,
   return budgetManager.fits(slice.estimatedTokens);
 }
 
+void markSliceTruncated(ContextSlice& slice) {
+  if (!slice.payload.is_object()) {
+    return;
+  }
+
+  auto& metadata = slice.payload["metadata"];
+  if (!metadata.is_object()) {
+    metadata = nlohmann::ordered_json::object();
+  }
+  metadata["truncated"] = true;
+  slice.json = slice.payload.dump();
+}
+
 template <typename RankedCandidate>
 std::vector<RankedCandidate> selectedOnly(
     const std::vector<RankedCandidate>& ranked) {
@@ -375,6 +388,7 @@ ContextSlice ContextBuilder::buildContext(const ContextPlan& plan) const {
         plan, rankedSymbols, rankedFiles, budgetManager, fullSlice.estimatedTokens);
     candidateSlice.rawEstimatedTokens = fullSlice.estimatedTokens;
     if (budgetManager.fits(candidateSlice.estimatedTokens)) {
+      markSliceTruncated(candidateSlice);
       return maybeCompressSlice(plan, budgetManager, std::move(candidateSlice));
     }
   }
@@ -387,6 +401,7 @@ ContextSlice ContextBuilder::buildContext(const ContextPlan& plan) const {
     throw std::runtime_error(
         "Token budget too small for deterministic context envelope.");
   }
+  markSliceTruncated(minimalSlice);
   return maybeCompressSlice(plan, budgetManager, std::move(minimalSlice));
 }
 

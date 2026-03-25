@@ -4,6 +4,8 @@
 #include <sstream>
 #include <utility>
 
+#include "../http/HttpTransport.h"
+
 namespace ultra::ai::model::providers {
 
 namespace {
@@ -150,14 +152,50 @@ ModelResponse DeepSeekAdapter::generate(const ModelRequest& request) {
                      "DeepSeek adapter is not initialized.");
   }
 
-  (void)buildProviderRequest(request);
-
-  if (!config_.contains("mock_response")) {
-    return makeError(ModelErrorCode::ProviderUnavailable,
-                     "DeepSeek transport is not configured.");
+  if (config_.contains("mock_response")) {
+    return translateResponse(config_.at("mock_response"));
   }
 
-  return translateResponse(config_.at("mock_response"));
+  const std::string apiKey  = config_.value("api_key", std::string{});
+  const std::string baseUrl =
+      config_.value("base_url", std::string{"https://api.deepseek.com"});
+  const std::string url = baseUrl + "/v1/chat/completions";
+
+  const nlohmann::ordered_json payload = buildProviderRequest(request);
+  const std::string body = payload.dump();
+
+  const std::unordered_map<std::string, std::string> headers = {
+      {"Authorization", "Bearer " + apiKey},
+  };
+
+  const http::HttpResponse httpResp = http::httpPost(url, body, headers);
+
+  if (!httpResp.ok) {
+    if (httpResp.statusCode == 0) {
+      return makeError(ModelErrorCode::ProviderUnavailable,
+                       "DeepSeek HTTP transport error: " + httpResp.errorMessage);
+    }
+    try {
+      const nlohmann::ordered_json errJson =
+          nlohmann::ordered_json::parse(httpResp.body);
+      if (errJson.contains("error") && errJson.at("error").is_object()) {
+        return makeError(ModelErrorCode::ProviderUnavailable,
+                         "DeepSeek error: " +
+                         errJson.at("error").value("message", std::string{"unknown"}));
+      }
+    } catch (...) {}
+    return makeError(ModelErrorCode::ProviderUnavailable,
+                     "DeepSeek returned HTTP " + std::to_string(httpResp.statusCode));
+  }
+
+  try {
+    const nlohmann::ordered_json responseJson =
+        nlohmann::ordered_json::parse(httpResp.body);
+    return translateResponse(responseJson);
+  } catch (const nlohmann::json::exception& ex) {
+    return makeError(ModelErrorCode::InvalidResponse,
+                     std::string("DeepSeek response JSON parse failed: ") + ex.what());
+  }
 }
 
 ModelResponse DeepSeekAdapter::stream(const ModelRequest& request,

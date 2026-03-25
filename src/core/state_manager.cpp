@@ -137,9 +137,14 @@ std::shared_ptr<memory::HotSlice> aliasHotSlice(memory::HotSlice& hotSlice) {
 }  // namespace
 
 StateManager::StateManager(const std::filesystem::path& projectRoot)
-    : graphStore_(projectRoot / ".ultra" /"graph"),
+    : projectRoot_(std::filesystem::absolute(projectRoot).lexically_normal()),
+      graphStore_(projectRoot / ".ultra" /"graph"),
       symbolQueryEngine_(&graphStore_),
       cognitiveMemoryManager_(projectRoot) {}
+
+const std::filesystem::path& StateManager::projectRoot() const noexcept {
+  return projectRoot_;
+}
 
 std::size_t StateManager::clampTokenBudget(const std::size_t tokenBudget) {
   if (tokenBudget == 0U) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CognitiveState.h"
+#include "tools/ToolExecutor.h"
 
 #include "../../ai/orchestration/OrchestrationContext.h"
 #include "../../ai/model/ModelRequest.h"
@@ -13,8 +14,10 @@
 
 #include <external/json.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -41,13 +44,22 @@ enum class ActionType : std::uint8_t {
   BranchDiff = 3U,
   SimulateChange = 4U,
   IntentEvaluation = 5U,
-  ModelGenerate = 6U
+  ModelGenerate = 6U,
+  ToolExecution = 7U
 };
 
 enum class RiskLevel : std::uint8_t {
   Low = 0U,
   Medium = 1U,
-  High = 2U
+  High = 2U,
+  Critical = 3U
+};
+
+struct GovernanceDecision {
+  bool allowed{false};
+  RiskLevel risk{RiskLevel::Critical};
+  float confidence{0.0F};
+  std::string reason;
 };
 
 struct Action {
@@ -55,6 +67,8 @@ struct Action {
   std::string id;
   std::string target;
   std::string branch;
+  std::string toolName;
+  std::map<std::string, std::string> toolArgs;
   std::uint64_t snapshotVersion{0U};
   double riskScore{0.0};
   double confidenceScore{0.0};
@@ -99,17 +113,34 @@ class ExecutionKernel {
                        const CognitiveState& state,
                        const governance::Policy& policy = {});
 
+  GovernanceDecision evaluate_action(
+      const std::string& tool,
+      const std::map<std::string, std::string>& args);
+
+  [[nodiscard]] bool hasToolCognitionLayer() const noexcept;
+  [[nodiscard]] bool hasToolRouterLayer() const noexcept;
+  [[nodiscard]] bool hasLastResult() const noexcept { return hasLastResult_; }
+  [[nodiscard]] const Result& lastResult() const noexcept { return lastResult_; }
+
  private:
   [[nodiscard]] std::string stableActionId(const Action& action) const;
   void validateAction(const Action& action, const CognitiveState& state) const;
   void sortOutputs(Result& result) const;
   Result executeActionLocked(const Action& action, const CognitiveState& state);
 
+  [[nodiscard]] bool validateSymbolWithUltra(const std::string& symbol) const;
+  [[nodiscard]] static RiskLevel maxRisk(RiskLevel left, RiskLevel right) noexcept;
+  void updateToolFailureHistory(const Action& action, const Result& result);
+
   core::StateManager& stateManager_;
   std::shared_ptr<ai::orchestration::IMultiModelOrchestrator>
       modelOrchestrator_;
+  cognitive::tools::ToolExecutor toolExecutor_{};
+  std::map<std::string, std::size_t> toolFailureCounts_;
   std::mutex mutationQueueMutex_;
   std::uint64_t queueCounter_{0U};
+  Result lastResult_{};
+  bool hasLastResult_{false};
 };
 
 }  // namespace ultra::runtime

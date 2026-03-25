@@ -1,20 +1,39 @@
 {
   "providers": {
+    "anthropic": {
+      "api_key": "${ANTHROPIC_API_KEY}",
+      "context_window": 200000,
+      "model": "claude-sonnet-4-5",
+      "reasoning_capable": false
+    },
     "deepseek": {
       "api_key": "${DEEPSEEK_API_KEY}",
-      "context_window": 64000,
-      "endpoint": "https://api.deepseek.com/chat/completions",
+      "context_window": 65536,
       "model": "deepseek-reasoner"
     },
+    "gemini": {
+      "api_key": "${GEMINI_API_KEY}",
+      "context_window": 1000000,
+      "model": "gemini-2.0-flash"
+    },
+    "groq": {
+      "api_key": "${GROQ_API_KEY}",
+      "context_window": 128000,
+      "model": "llama-3.3-70b-versatile"
+    },
+    "mistral": {
+      "api_key": "${MISTRAL_API_KEY}",
+      "context_window": 131000,
+      "model": "mistral-large-latest"
+    },
     "ollama": {
-      "context_window": 8192,
+      "context_window": 16384,
       "endpoint": "http://localhost:11434",
-      "model": "llama3.2"
+      "model": "qwen2.5-coder:14b"
     },
     "openai": {
       "api_key": "${OPENAI_API_KEY}",
       "context_window": 128000,
-      "endpoint": "https://api.openai.com/v1/chat/completions",
       "model": "gpt-4o-mini"
     }
   }

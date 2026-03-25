@@ -1,10 +1,7 @@
 #include "ultra_loop.h"
 #include "failure_recovery.h"
-#include "../../authority/IntentSimulator.h"
-#include "../../authority/UltraAuthorityAPI.h"
-
+#include "../intent/IntentRuntime.h"
 #include <algorithm>
-#include <filesystem>
 #include <utility>
 
 namespace ultra::runtime::cognitive {
@@ -30,84 +27,6 @@ namespace {
   return std::string(stageName) +
          (success ? " stage requested successful termination."
                   : " stage requested failed termination.");
-}
-
-[[nodiscard]] ::ultra::authority::AuthorityIntentRequest buildAuthorityIntentRequest(
-    const UltraLoopFrame& frame) {
-  ::ultra::authority::AuthorityIntentRequest request;
-  request.goal = frame.intentGoal.empty() ? frame.intentId : frame.intentGoal;
-  request.target = frame.intentTarget;
-  request.branchId = frame.intentBranchId;
-  request.tokenBudget = frame.intentTokenBudget;
-  request.impactDepth = frame.intentImpactDepth;
-  request.maxFilesChanged = frame.intentMaxFilesChanged;
-  request.tolerance = frame.intentTolerance;
-  request.allowPublicApiChange = frame.intentAllowPublicApiChange;
-  request.threshold = frame.intentRiskThreshold;
-
-  if (request.target.empty()) {
-    request.target = request.goal;
-  }
-  return request;
-}
-
-[[nodiscard]] bool hasDependencyDiffType(
-    const ::ultra::authority::SimulatedIntentResult& simulation,
-    const ::ultra::diff::semantic::DiffType diffType) {
-  return std::any_of(
-      simulation.diffReport.dependencies.begin(),
-      simulation.diffReport.dependencies.end(),
-      [diffType](const ::ultra::diff::semantic::DependencyDiff& dependency) {
-        return dependency.type == diffType;
-      });
-}
-
-[[nodiscard]] ::ultra::runtime::intent::GoalType classifyIntentGoal(
-    const ::ultra::authority::AuthorityIntentRequest& request,
-    const ::ultra::authority::SimulatedIntentResult& simulation) {
-  using ::ultra::runtime::intent::GoalType;
-
-  if (hasDependencyDiffType(simulation, ::ultra::diff::semantic::DiffType::Removed)) {
-    return GoalType::RemoveDependency;
-  }
-
-  if (hasDependencyDiffType(simulation, ::ultra::diff::semantic::DiffType::Added)) {
-    return GoalType::AddDependency;
-  }
-
-  if (simulation.publicApiChanges > 0U || request.allowPublicApiChange) {
-    return GoalType::RefactorModule;
-  }
-
-  if (simulation.impactDepth > std::max<std::size_t>(1U, request.impactDepth)) {
-    return GoalType::ReduceImpactRadius;
-  }
-
-  if (request.tokenBudget > 0U && request.tokenBudget <= 512U) {
-    return GoalType::MinimizeTokenUsage;
-  }
-
-  return GoalType::ModifySymbol;
-}
-
-[[nodiscard]] ::ultra::runtime::intent::Intent buildStructuredIntent(
-    const ::ultra::authority::AuthorityIntentRequest& request,
-    const ::ultra::authority::SimulatedIntentResult& simulation,
-    const std::size_t fallbackTokenBudget) {
-  ::ultra::runtime::intent::Intent intent;
-  intent.goal.type = classifyIntentGoal(request, simulation);
-  intent.goal.target = request.target.empty() ? request.goal : request.target;
-  intent.constraints.maxImpactDepth =
-      std::max<std::size_t>(1U, request.impactDepth);
-  intent.constraints.maxFilesChanged =
-      std::max<std::size_t>(1U, request.maxFilesChanged);
-  intent.constraints.tokenBudget = request.tokenBudget;
-  intent.constraints.branchScope = request.branchId;
-  intent.constraints.determinismRequired = true;
-  intent.risk = request.tolerance;
-  intent.options.allowPublicAPIChange = request.allowPublicApiChange;
-
-  return ::ultra::runtime::intent::normalizeIntent(intent, fallbackTokenBudget);
 }
 
 }  // namespace
@@ -223,28 +142,30 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
   auto resolveStructuredIntent = [&]() {
     StageResult result;
 
-    const ::ultra::authority::AuthorityIntentRequest request =
-        buildAuthorityIntentRequest(frame);
-    if (request.goal.empty() && request.target.empty()) {
-      result.success = false;
-      result.signal = StageSignal::Replan;
-      result.message =
-          "Intent stage did not provide a goal or target for runtime resolution.";
-      return result;
-    }
+    const ::ultra::runtime::intent::ContextFrame context{
+        frame.intentGoal,
+        frame.intentTarget,
+        frame.intentBranchId,
+        frame.intentTokenBudget,
+        frame.intentImpactDepth,
+        frame.intentMaxFilesChanged,
+        frame.intentTolerance,
+        frame.intentAllowPublicApiChange,
+        frame.intentRiskThreshold,
+    };
+
+    const std::string resolvedGoal =
+        frame.intentGoal.empty() ? frame.intentId : frame.intentGoal;
+    const std::string resolvedTarget =
+        frame.intentTarget.empty() ? resolvedGoal : frame.intentTarget;
 
     try {
-      ::ultra::authority::IntentSimulator simulator(std::filesystem::current_path());
-      const ::ultra::authority::SimulatedIntentResult simulation =
-          simulator.simulate(request);
-
-      const std::size_t fallbackTokenBudget =
-          request.tokenBudget == 0U ? 4096U : request.tokenBudget;
+      ::ultra::runtime::intent::IntentRuntime intentRuntime;
       frame.structuredIntent =
-          buildStructuredIntent(request, simulation, fallbackTokenBudget);
+          intentRuntime.resolve_structured_intent(frame.intentId, context);
       frame.hasStructuredIntent = true;
-      frame.intentGoal = request.goal;
-      frame.intentTarget = request.target;
+      frame.intentGoal = resolvedGoal;
+      frame.intentTarget = resolvedTarget;
       frame.intentId =
           ::ultra::runtime::intent::toString(frame.structuredIntent.goal.type) +
           ":" + frame.structuredIntent.goal.target;
@@ -265,7 +186,6 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
       return result;
     }
   };
-
   auto executeTaskNode = [&](const TaskNode& taskNode) {
     StageResult executionResult;
 
@@ -323,10 +243,15 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
     }
 
     executionResult.success = false;
-    executionResult.signal = StageSignal::Retry;
     executionResult.message = frame.executionResult.message.empty()
                                   ? "Execution kernel reported failure."
                                   : frame.executionResult.message;
+    if (executionResult.message.find("Governance blocked") != std::string::npos) {
+      executionResult.signal = StageSignal::Replan;
+      return executionResult;
+    }
+
+    executionResult.signal = StageSignal::Retry;
     return executionResult;
   };
 
@@ -723,6 +648,16 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
             (void)frame.taskGraph.mark_failed(readyTask.id);
             notifyFailure(executionResult);
 
+            if (executionResult.signal == StageSignal::Replan) {
+              frame.replanRequested = true;
+              transitionTo(UltraLoopState::REPLAN,
+                           executionResult.message.empty()
+                               ? "Execution kernel requested replanning."
+                               : executionResult.message);
+              executeFailed = true;
+              break;
+            }
+
             applyFailureRecoveryDecision(readyTask, executionResult);
             executeFailed = true;
             break;
@@ -891,6 +826,13 @@ std::vector<std::string> UltraLoop::detectMissingLayers(
   }
   if (bindings.executionKernel == nullptr) {
     missing.emplace_back("L15 Execution Kernel");
+  } else {
+    if (!bindings.executionKernel->hasToolCognitionLayer()) {
+      missing.emplace_back("L16 Tool Cognition Layer");
+    }
+    if (!bindings.executionKernel->hasToolRouterLayer()) {
+      missing.emplace_back("L17 Tool Router");
+    }
   }
   if (bindings.governance == nullptr) {
     missing.emplace_back("L18 Governance");
@@ -915,6 +857,10 @@ std::vector<std::string> UltraLoop::detectMissingLayers(
 }
 
 }  // namespace ultra::runtime::cognitive
+
+
+
+
 
 
 

@@ -785,13 +785,84 @@ struct RuntimeDispatcher {
     return nlohmann::json{{"status", "error"}, {"error", error}};
   }
 
+  // Attempts to load the index from the binary files already on disk.
+  // Returns true  → index loaded into stateManager, no rebuild needed.
+  // Returns false → disk load failed or files absent; caller should rebuild.
+  // Never called by rebuildAi / rebuild_ai — those always go through rebuildIndex().
+  bool tryLoadFromDisk(std::string& error) {
+    const std::filesystem::path corePath    = aiDirectory / "core.idx";
+    const std::filesystem::path filesPath   = aiDirectory / "files.tbl";
+    const std::filesystem::path symbolsPath = aiDirectory / "symbols.tbl";
+    const std::filesystem::path depsPath    = aiDirectory / "deps.tbl";
+
+    // Step 1 — all four index files must exist
+    if (!std::filesystem::exists(corePath)    ||
+        !std::filesystem::exists(filesPath)   ||
+        !std::filesystem::exists(symbolsPath) ||
+        !std::filesystem::exists(depsPath)) {
+      return false;
+    }
+
+    // Step 2 — verify integrity of the stored index
+    // (reuses the full hash-chain check already implemented in verifyIntegrity)
+    nlohmann::json verifyPayload;
+    std::string verifyError;
+    if (!verifyIntegrity(verifyPayload, verifyError)) {
+      // Index is corrupt or stale — let caller do a full rebuild
+      return false;
+    }
+
+    // Step 3 — read all tables from disk into a fresh RuntimeState
+    ultra::ai::RuntimeState state;
+
+    if (!ultra::ai::BinaryIndexReader::readCoreIndex(corePath, state.core, error)) {
+      return false;
+    }
+    if (!ultra::ai::BinaryIndexReader::readFilesTable(
+            filesPath, state.core.schemaVersion, state.files, error)) {
+      return false;
+    }
+    if (!ultra::ai::BinaryIndexReader::readSymbolsTable(
+            symbolsPath, state.core.schemaVersion, state.symbols, error)) {
+      return false;
+    }
+    if (!ultra::ai::BinaryIndexReader::readDependenciesTable(
+            depsPath, state.core.schemaVersion, state.deps, error)) {
+      return false;
+    }
+
+    // Step 4 — rebuild in-memory symbol index and edges
+    // (identical to what rebuildIndex() does after a full scan)
+    rebuildSymbolEdges(state);
+    state.symbolIndex = buildSymbolIndex(state.files, state.symbols, state.deps);
+
+    // Step 5 — load into stateManager, same call path as after a full rebuild
+    stateManager.replaceState(std::move(state));
+    {
+      const ultra::runtime::GraphSnapshot snap = stateManager.getSnapshot();
+      const std::size_t nodeCount = snap.graph ? snap.graph->nodeCount() : 0U;
+      stateManager.cognitiveMemory().setGraphScale(nodeCount, 0U);
+    }
+
+    return true;
+  }
+
   bool ensureIndex(std::string& error) {
     if (indexingService.hasSemanticIndex()) {
+      // Already loaded in memory — nothing to do
       return true;
     }
-    // Lazy first-use build: startup rebuild was deferred so the IPC server
-    // could start and answer the parent's "wake" ping. Build now on first
-    // query that actually needs the index.
+
+    // Try loading the existing binary index from disk before doing a full build.
+    // This is the normal fast path: daemon restarts, first query arrives,
+    // index files are fresh on disk → load in milliseconds, no re-scan.
+    if (tryLoadFromDisk(error)) {
+      return true;
+    }
+
+    // Disk load failed (no index, corrupt, or integrity mismatch) —
+    // fall through to a full build. This is the same path as before.
+    error.clear();
     nlohmann::json payloadOut;
     return rebuildIndex(payloadOut, error);
   }

@@ -8,6 +8,7 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 //E:\Projects\Ultra\src\ipc\ultra_ipc_client.cpp
 #ifndef _WIN32
@@ -271,25 +272,29 @@ UltraIPCClient::Json UltraIPCClient::sendRequest(
     if (pipeHandle != INVALID_HANDLE_VALUE) {
       break;
     }
- 
     const DWORD error = ::GetLastError();
-    if (error != ERROR_PIPE_BUSY) {
+    if (error != ERROR_PIPE_BUSY && error != ERROR_FILE_NOT_FOUND) {
       return errorResponse("daemon_unreachable");
     }
- 
+
     if (std::chrono::steady_clock::now() >= deadline) {
       return errorResponse("daemon_unreachable");
     }
- 
-    const auto remaining =
-        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
-    const DWORD waitMs =
-        static_cast<DWORD>(std::max<std::int64_t>(1, remaining.count()));
-    if (!::WaitNamedPipeW(pipeName_.c_str(), waitMs)) {
-      if (std::chrono::steady_clock::now() >= deadline) {
+
+    if (error == ERROR_PIPE_BUSY) {
+      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+          deadline - std::chrono::steady_clock::now());
+      const DWORD waitMs =
+          static_cast<DWORD>(std::max<std::int64_t>(1, remaining.count()));
+      if (!::WaitNamedPipeW(pipeName_.c_str(), waitMs) &&
+          std::chrono::steady_clock::now() >= deadline) {
         return errorResponse("daemon_unreachable");
       }
+      continue;
     }
+
+    // Server may be between sequential ConnectNamedPipe cycles; retry briefly.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
  
   // Protocol is newline-delimited JSON (byte stream).

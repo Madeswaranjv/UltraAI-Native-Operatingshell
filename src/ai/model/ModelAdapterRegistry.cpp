@@ -1,6 +1,10 @@
 #include "ModelAdapterRegistry.h"
 
+#include "providers/AnthropicAdapter.h"
 #include "providers/DeepSeekAdapter.h"
+#include "providers/GeminiAdapter.h"
+#include "providers/GroqAdapter.h"
+#include "providers/MistralAdapter.h"
 #include "providers/OllamaAdapter.h"
 #include "providers/OpenAIAdapter.h"
 
@@ -256,8 +260,20 @@ std::string ModelAdapterRegistry::normalizeProviderName(std::string value) {
 }
 
 void ModelAdapterRegistry::registerBuiltIns() {
+  registerProvider("anthropic", []() {
+    return std::make_unique<providers::AnthropicAdapter>();
+  });
   registerProvider("deepseek", []() {
     return std::make_unique<providers::DeepSeekAdapter>();
+  });
+  registerProvider("gemini", []() {
+    return std::make_unique<providers::GeminiAdapter>();
+  });
+  registerProvider("groq", []() {
+    return std::make_unique<providers::GroqAdapter>();
+  });
+  registerProvider("mistral", []() {
+    return std::make_unique<providers::MistralAdapter>();
   });
   registerProvider("ollama", []() {
     return std::make_unique<providers::OllamaAdapter>();

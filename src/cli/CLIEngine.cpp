@@ -1,4 +1,4 @@
-﻿#include "CLIEngine.h"
+#include "CLIEngine.h"
 #include "CommandOptionsParser.h"
 #include "CommandRouter.h"
 #include "../authority/UltraAuthorityAPI.h"
@@ -22,6 +22,9 @@
 #include "../metrics/PerformanceMetrics.h"
 #include "../metacognition/MetaCognitiveOrchestrator.h"
 #include "../runtime/ContextExtractor.h"
+#include "../runtime/cognitive/CognitiveRuntime.h"
+#include "../runtime/governance/Policy.h"
+#include "../runtime/intent/IntentRuntime.h"
 #include "../runtime/precision_invalidation.h"
 #include "ultra/runtime/ultra_daemon.h"
 #include "../core/ConfigManager.h"
@@ -45,6 +48,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -2002,6 +2006,112 @@ bool parseDouble(const std::string& value, double& out) {
   return consumed == value.size();
 }
 
+std::string toLowerAscii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+  return value;
+}
+
+ultra::runtime::intent::RiskTolerance parseRiskToleranceLabel(
+    const std::string& value,
+    const ultra::runtime::intent::RiskTolerance fallback) {
+  const std::string normalized = toLowerAscii(value);
+  if (normalized == "low") {
+    return ultra::runtime::intent::RiskTolerance::LOW;
+  }
+  if (normalized == "high") {
+    return ultra::runtime::intent::RiskTolerance::HIGH;
+  }
+  if (normalized == "medium") {
+    return ultra::runtime::intent::RiskTolerance::MEDIUM;
+  }
+  return fallback;
+}
+
+double riskThresholdForTolerance(const ultra::runtime::intent::RiskTolerance tolerance) {
+  switch (tolerance) {
+    case ultra::runtime::intent::RiskTolerance::LOW:
+      return 0.33;
+    case ultra::runtime::intent::RiskTolerance::MEDIUM:
+      return 0.66;
+    case ultra::runtime::intent::RiskTolerance::HIGH:
+      return 0.85;
+  }
+  return 0.66;
+}
+
+bool parseJsonBool(const nlohmann::json& value, const bool fallback) {
+  if (value.is_boolean()) {
+    return value.get<bool>();
+  }
+  if (value.is_number_integer()) {
+    return value.get<long long>() != 0LL;
+  }
+  if (value.is_number_unsigned()) {
+    return value.get<unsigned long long>() != 0ULL;
+  }
+  if (value.is_string()) {
+    const std::string normalized = toLowerAscii(value.get<std::string>());
+    if (normalized == "true" || normalized == "1" || normalized == "yes") {
+      return true;
+    }
+    if (normalized == "false" || normalized == "0" || normalized == "no") {
+      return false;
+    }
+  }
+  return fallback;
+}
+
+int parseJsonInt(const nlohmann::json& value,
+                 const int fallback,
+                 const int minValue = 1) {
+  if (value.is_number_integer()) {
+    return std::max(minValue, value.get<int>());
+  }
+  if (value.is_number_unsigned()) {
+    const unsigned long long raw = value.get<unsigned long long>();
+    const int converted =
+        raw > static_cast<unsigned long long>(std::numeric_limits<int>::max())
+            ? std::numeric_limits<int>::max()
+            : static_cast<int>(raw);
+    return std::max(minValue, converted);
+  }
+  if (value.is_string()) {
+    const std::string token = value.get<std::string>();
+    try {
+      std::size_t consumed = 0U;
+      const long long parsed = std::stoll(token, &consumed);
+      if (consumed == token.size()) {
+        const long long bounded =
+            std::max<long long>(minValue,
+                                std::min<long long>(parsed,
+                                                    std::numeric_limits<int>::max()));
+        return static_cast<int>(bounded);
+      }
+    } catch (...) {
+    }
+  }
+  return std::max(minValue, fallback);
+}
+
+std::vector<std::string> parseStringArray(const nlohmann::json& value) {
+  std::vector<std::string> result;
+  if (!value.is_array()) {
+    return result;
+  }
+
+  for (const nlohmann::json& item : value) {
+    if (!item.is_string()) {
+      continue;
+    }
+    const std::string parsed = item.get<std::string>();
+    if (!parsed.empty()) {
+      result.push_back(parsed);
+    }
+  }
+  return result;
+}
 void printHelp() {
   std::cout << "Ultra CLI\n\n";
   std::cout << "Usage:\n";
@@ -2052,7 +2162,9 @@ void printHelp() {
   std::cout << "  ultra ai_impact <target>           Analyze transitive impact for file/symbol\n";
   std::cout << "  ultra rebuild_ai                   Trigger daemon full rebuild\n";
   std::cout << "  ultra sleep_ai                     Stop running UAIR daemon\n\n";
-  std::cout << "  ultra ai_verify                    Verify incremental vs rebuild index hash\n\n";
+  std::cout << "  ultra ai_verify                    Verify incremental vs rebuild index hash\n";
+  std::cout << "  ultra cognitive_run --json <payload>  Execute deterministic cognitive UltraLoop via JSON payload\n\n";
+
   std::cout << "  ultra metrics [--enable|--disable|--reset]"
             << "  Show/reset runtime performance metrics\n\n";
 
@@ -2256,6 +2368,13 @@ bool CLIEngine::validate(const ParsedCommand& cmd) const {
     if (cmd.args.size() != 1U) {
       ultra::core::Logger::error("Command '" + cmd.name +
                                  "' requires exactly one argument.");
+      return false;
+    }
+  }
+  if (cmd.name == "cognitive_run") {
+    if (cmd.args.empty()) {
+      ultra::core::Logger::error(
+          "Command 'cognitive_run' requires --json <payload> or a positional JSON payload.");
       return false;
     }
   }
@@ -3504,6 +3623,260 @@ void CLIEngine::registerHandlers() {
   m_router.registerCommand("ai_verify", [this](const std::vector<std::string>&) {
     handleAiVerify();
   });
+  m_router.registerCommand("cognitive_run", [this](const std::vector<std::string>& args) {
+    auto printErrorJson = [this](const std::string& message) {
+      nlohmann::json response = nlohmann::json::object();
+      response["status"] = "error";
+      response["verify_status"] = "FAIL";
+      response["confidence"] = "low";
+      response["output"] = "";
+      response["error"] = message;
+      std::cout << response.dump(2) << '\n';
+      m_lastExitCode = 1;
+    };
+
+    std::string payloadText;
+    if (!args.empty() && args[0] == "--file") {
+      // --file <path>: read JSON from a file on disk.
+      // This is the recommended path from PowerShell / any shell where
+      // passing multi-line JSON as a single quoted argument is unreliable.
+      if (args.size() < 2U) {
+        printErrorJson("cognitive_run --file requires a file path.");
+        return;
+      }
+      const std::filesystem::path jsonPath =
+          std::filesystem::absolute(args[1]).lexically_normal();
+      std::ifstream jsonFile(jsonPath, std::ios::binary);
+      if (!jsonFile) {
+        printErrorJson("cognitive_run --file: cannot open file: " +
+                       jsonPath.string());
+        return;
+      }
+      payloadText.assign(std::istreambuf_iterator<char>(jsonFile),
+                         std::istreambuf_iterator<char>());
+    } else if (!args.empty() && args[0] == "--json") {
+      if (args.size() < 2U) {
+        printErrorJson("cognitive_run requires a JSON payload after --json.");
+        return;
+      }
+      payloadText = joinArgs(args, 1U);
+    } else {
+      payloadText = joinArgs(args, 0U);
+    }
+
+    if (payloadText.empty()) {
+      printErrorJson("cognitive_run requires a non-empty JSON payload.");
+      return;
+    }
+
+    // Strip UTF-8 BOM (0xEF 0xBB 0xBF) that PowerShell Out-File -Encoding utf8
+    // injects, and all \r characters from Windows CRLF line endings.
+    // nlohmann::json::parse() handles bare \n fine inside JSON values,
+    // but rejects \r and the BOM before the opening brace.
+    {
+      if (payloadText.size() >= 3U &&
+          static_cast<unsigned char>(payloadText[0]) == 0xEFU &&
+          static_cast<unsigned char>(payloadText[1]) == 0xBBU &&
+          static_cast<unsigned char>(payloadText[2]) == 0xBFU) {
+        payloadText.erase(0U, 3U);
+      }
+      payloadText.erase(
+          std::remove(payloadText.begin(), payloadText.end(), '\r'),
+          payloadText.end());
+      const auto notSpace = [](unsigned char ch) {
+        return std::isspace(ch) == 0;
+      };
+      payloadText.erase(payloadText.begin(),
+                        std::find_if(payloadText.begin(), payloadText.end(),
+                                     notSpace));
+      payloadText.erase(
+          std::find_if(payloadText.rbegin(), payloadText.rend(),
+                       notSpace).base(),
+          payloadText.end());
+    }
+
+    if (payloadText.empty()) {
+      printErrorJson("cognitive_run requires a non-empty JSON payload after stripping whitespace.");
+      return;
+    }
+
+    try {
+      const nlohmann::json payload = nlohmann::json::parse(payloadText);
+      const nlohmann::json intentPayload =
+          payload.value("intent", nlohmann::json::object());
+      const nlohmann::json sessionPayload =
+          payload.value("session", nlohmann::json::object());
+      const nlohmann::json governancePayload =
+          sessionPayload.value("governance", nlohmann::json::object());
+      const nlohmann::json policyPayload =
+          sessionPayload.value("policy", nlohmann::json::object());
+
+      const std::string rawPrompt =
+          intentPayload.value("raw_prompt", std::string{});
+      const std::string actionLabel =
+          toLowerAscii(intentPayload.value("action", std::string{}));
+      const std::string goalSummary =
+          intentPayload.value("goal_summary", std::string{});
+      const std::string intentRisk =
+          intentPayload.value("risk_level", std::string{});
+      const bool requiresPlanning =
+          parseJsonBool(intentPayload.value("requires_planning", nlohmann::json{}),
+                        true);
+      const std::vector<std::string> targets = parseStringArray(
+          intentPayload.value("targets", nlohmann::json::array()));
+      const std::vector<std::string> constraints = parseStringArray(
+          intentPayload.value("constraints", nlohmann::json::array()));
+
+      const std::vector<std::string> protectedPaths = parseStringArray(
+          governancePayload.value("protected_paths", nlohmann::json::array()));
+      const std::vector<std::string> forbiddenActions = parseStringArray(
+          governancePayload.value("forbidden_actions", nlohmann::json::array()));
+
+      if (!actionLabel.empty()) {
+        for (const std::string& forbidden : forbiddenActions) {
+          if (toLowerAscii(forbidden) == actionLabel) {
+            printErrorJson("Requested action is forbidden by governance policy: " +
+                           actionLabel);
+            return;
+          }
+        }
+      }
+
+      std::filesystem::path projectRoot = m_projectRoot;
+      const std::string projectRootOverride =
+          sessionPayload.value("project_root", std::string{});
+      if (!projectRootOverride.empty()) {
+        projectRoot = std::filesystem::path(projectRootOverride);
+      }
+      projectRoot = std::filesystem::absolute(projectRoot).lexically_normal();
+
+      ultra::runtime::intent::ContextFrame contextFrame;
+      contextFrame.goal = rawPrompt.empty() ? goalSummary : rawPrompt;
+      if (contextFrame.goal.empty() && !targets.empty()) {
+        contextFrame.goal = targets.front();
+      }
+      contextFrame.target = targets.empty() ? contextFrame.goal : targets.front();
+
+      auto isProtectedTarget = [&protectedPaths](const std::string& target) {
+        for (const std::string& protectedPath : protectedPaths) {
+          if (protectedPath.empty()) {
+            continue;
+          }
+          if (target == protectedPath) {
+            return true;
+          }
+          if (target.size() > protectedPath.size() &&
+              target.compare(0, protectedPath.size(), protectedPath) == 0) {
+            return true;
+          }
+        }
+        return false;
+      };
+
+      if (!contextFrame.target.empty() && isProtectedTarget(contextFrame.target)) {
+        printErrorJson("Target is protected by governance policy: " +
+                       contextFrame.target);
+        return;
+      }
+
+      ultra::runtime::governance::Policy policy{};
+      const std::string riskTolerance =
+          policyPayload.value("risk_tolerance", intentRisk);
+      policy.maxRisk = parseRiskToleranceLabel(
+          riskTolerance, ultra::runtime::intent::RiskTolerance::MEDIUM);
+      policy.requireDeterminism = parseJsonBool(
+          governancePayload.value("require_plan_approval", nlohmann::json{}),
+          true);
+      if (parseJsonBool(
+              governancePayload.value("require_action_approval", nlohmann::json{}),
+              false)) {
+        policy.requireDeterminism = true;
+      }
+
+      policy.maxImpactDepth = parseJsonInt(
+          governancePayload.value("max_iterations", nlohmann::json{}),
+          policy.maxImpactDepth,
+          1);
+
+      const std::string strategyStyle =
+          toLowerAscii(policyPayload.value("strategy_style", std::string{}));
+      if (strategyStyle == "fast") {
+        policy.maxTokenBudget = std::max(256, policy.maxTokenBudget / 2);
+      } else if (strategyStyle == "thorough") {
+        policy.maxTokenBudget = std::max(policy.maxTokenBudget, 8192);
+        policy.maxFilesChanged = std::max(policy.maxFilesChanged, 16);
+      }
+
+      const bool autoCommit = parseJsonBool(
+          policyPayload.value("auto_commit", nlohmann::json{}), false);
+      const bool runTestsAfterChange = parseJsonBool(
+          policyPayload.value("run_tests_after_change", nlohmann::json{}),
+          false);
+      (void)autoCommit;
+      (void)runTestsAfterChange;
+
+      if (!requiresPlanning) {
+        policy.requireDeterminism = false;
+      }
+
+      contextFrame.tokenBudget =
+          static_cast<std::size_t>(std::max(1, policy.maxTokenBudget));
+      contextFrame.impactDepth =
+          static_cast<std::size_t>(std::max(1, policy.maxImpactDepth));
+      contextFrame.maxFilesChanged =
+          static_cast<std::size_t>(std::max(1, policy.maxFilesChanged));
+      contextFrame.tolerance = policy.maxRisk;
+      contextFrame.allowPublicApiChange = std::any_of(
+          constraints.begin(), constraints.end(), [](const std::string& constraint) {
+            return toLowerAscii(constraint).find("public api") != std::string::npos;
+          });
+      contextFrame.riskThreshold = riskThresholdForTolerance(contextFrame.tolerance);
+
+      const std::string intentInput = rawPrompt.empty() ? contextFrame.goal : rawPrompt;
+      if (intentInput.empty()) {
+        printErrorJson("cognitive_run payload requires intent.raw_prompt or intent.goal_summary.");
+        return;
+      }
+
+      ultra::runtime::intent::IntentRuntime intentRuntime;
+      const ultra::runtime::intent::Intent resolvedIntent =
+          intentRuntime.resolve_structured_intent(intentInput, contextFrame);
+
+      ultra::core::StateManager stateManager(projectRoot);
+      std::string loadError;
+      if (!stateManager.loadPersistedGraph(loadError)) {
+        if (loadError.empty()) {
+          loadError = "Failed to load persisted graph for cognitive runtime.";
+        }
+        printErrorJson(loadError);
+        return;
+      }
+
+      ultra::runtime::CognitiveRuntime runtime(stateManager);
+      const ultra::runtime::CognitiveLoopResult loopResult =
+          runtime.run(resolvedIntent, policy);
+
+      nlohmann::json response = nlohmann::json::object();
+      response["status"] = loopResult.ok ? "ok" : "error";
+      response["verify_status"] =
+          loopResult.verifyStatus.empty()
+              ? (loopResult.ok ? "PASS" : "FAIL")
+              : loopResult.verifyStatus;
+      response["confidence"] =
+          loopResult.confidence.empty() ? std::string("low") : loopResult.confidence;
+      response["output"] = loopResult.output;
+      if (!loopResult.ok) {
+        response["error"] = loopResult.errorMessage;
+      }
+
+      std::cout << response.dump(2) << '\n';
+      m_lastExitCode = loopResult.ok ? 0 : 1;
+    } catch (const std::exception& ex) {
+      printErrorJson(ex.what());
+    } catch (...) {
+      printErrorJson("cognitive_run failed with an unknown error.");
+    }
+  });
 }
 
 const std::vector<std::string>& CLIEngine::currentArgs() const noexcept {
@@ -3604,7 +3977,7 @@ int CLIEngine::run(int argc, char* argv[]) {
       cmd.name == "metrics" || cmd.name == "context" ||
       cmd.name == "context-diff" || cmd.name == "branch" ||
       cmd.name == "intent" || cmd.name == "commit" ||
-      cmd.name == "savings") {
+      cmd.name == "savings" || cmd.name == "cognitive_run") {
     return m_lastExitCode;
   }
   if (cmd.name == "init" || cmd.name == "install" || cmd.name == "dev" ||
