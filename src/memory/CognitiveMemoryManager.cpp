@@ -49,7 +49,135 @@ std::map<std::string, float> sortedWeights(
   return std::map<std::string, float>(weights.begin(), weights.end());
 }
 
+const char* episodicTypeName(const EpisodicEventType type) {
+  switch (type) {
+    case EpisodicEventType::SnapshotBound:
+      return "snapshot_bound";
+    case EpisodicEventType::IntentStart:
+      return "intent_start";
+    case EpisodicEventType::IntentEvaluation:
+      return "intent_evaluation";
+    case EpisodicEventType::RiskEvaluation:
+      return "risk_evaluation";
+    case EpisodicEventType::ExecutionSuccess:
+      return "execution_success";
+    case EpisodicEventType::ExecutionFailure:
+      return "execution_failure";
+    case EpisodicEventType::Rollback:
+      return "rollback";
+    case EpisodicEventType::MergeAttempt:
+      return "merge_attempt";
+    case EpisodicEventType::MergeSuccess:
+      return "merge_success";
+    case EpisodicEventType::MergeRejected:
+      return "merge_rejected";
+  }
+  return "intent_start";
+}
+
 }  // namespace
+
+MemoryQuery::MemoryQuery(const CognitiveMemoryManager& manager,
+                         const std::size_t limit) noexcept
+    : manager_(&manager), limit_(std::max<std::size_t>(1U, limit)) {}
+
+std::vector<EpisodicMemoryMatch> MemoryQuery::getEpisodic(
+    const std::string& intentSignature) const {
+  if (manager_ == nullptr) {
+    return {};
+  }
+
+  const std::vector<EpisodicEvent> matches =
+      manager_->episodic.querySubject(intentSignature, limit_);
+  std::vector<EpisodicMemoryMatch> out;
+  out.reserve(matches.size());
+  for (const EpisodicEvent& event : matches) {
+    out.push_back({event.version,
+                   event.branchId,
+                   episodicTypeName(event.type),
+                   event.subject,
+                   event.success,
+                   event.rolledBack,
+                   event.riskScore,
+                   event.confidenceScore,
+                   event.message});
+  }
+  return out;
+}
+
+std::vector<StrategicMemoryMatch> MemoryQuery::getStrategic(
+    const std::string& goalType) const {
+  if (manager_ == nullptr) {
+    return {};
+  }
+
+  const std::vector<StrategicOutcome> matches =
+      manager_->strategic.queryOutcomes(goalType, limit_);
+  std::vector<StrategicMemoryMatch> out;
+  out.reserve(matches.size());
+  for (const StrategicOutcome& outcome : matches) {
+    out.push_back({outcome.version,
+                   outcome.category,
+                   outcome.subject,
+                   outcome.success,
+                   outcome.rolledBack,
+                   outcome.predictedRisk,
+                   outcome.observedRisk,
+                   outcome.predictedConfidence,
+                   outcome.observedConfidence,
+                   outcome.estimatedTokens,
+                   outcome.compressedTokens});
+  }
+  return out;
+}
+
+std::vector<EpisodicMemoryMatch> MemoryQuery::getFailures(
+    const std::string& errorType) const {
+  if (manager_ == nullptr) {
+    return {};
+  }
+
+  const std::vector<EpisodicEvent> matches =
+      manager_->episodic.queryFailures(errorType, limit_);
+  std::vector<EpisodicMemoryMatch> out;
+  out.reserve(matches.size());
+  for (const EpisodicEvent& event : matches) {
+    out.push_back({event.version,
+                   event.branchId,
+                   episodicTypeName(event.type),
+                   event.subject,
+                   event.success,
+                   event.rolledBack,
+                   event.riskScore,
+                   event.confidenceScore,
+                   event.message});
+  }
+  return out;
+}
+
+std::vector<EpisodicMemoryMatch> MemoryQuery::getSuccessfulPatterns(
+    const std::string& taskType) const {
+  if (manager_ == nullptr) {
+    return {};
+  }
+
+  const std::vector<EpisodicEvent> matches =
+      manager_->episodic.querySuccessfulPatterns(taskType, limit_);
+  std::vector<EpisodicMemoryMatch> out;
+  out.reserve(matches.size());
+  for (const EpisodicEvent& event : matches) {
+    out.push_back({event.version,
+                   event.branchId,
+                   episodicTypeName(event.type),
+                   event.subject,
+                   event.success,
+                   event.rolledBack,
+                   event.riskScore,
+                   event.confidenceScore,
+                   event.message});
+  }
+  return out;
+}
 
 CognitiveMemoryManager::CognitiveMemoryManager(const std::filesystem::path& projectRoot)
     : projectRoot_(
@@ -299,6 +427,10 @@ void CognitiveMemoryManager::recordMergeOutcome(
   applyStrategicAdjustments();
   persistEpisodic();
   persistStrategic();
+}
+
+MemoryQuery CognitiveMemoryManager::query(const std::size_t limit) const noexcept {
+  return MemoryQuery(*this, limit);
 }
 
 void CognitiveMemoryManager::updateSemanticEvolution(

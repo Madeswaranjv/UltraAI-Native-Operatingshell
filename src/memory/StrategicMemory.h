@@ -6,6 +6,7 @@
 #include <map>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 //E:\Projects\Ultra\src\memory\StrategicMemory.h
 namespace ultra::calibration {
@@ -60,6 +61,12 @@ class StrategicMemory {
   void recordOutcome(const StrategicOutcome& outcome);
   [[nodiscard]] PolicyAdjustments getPolicyAdjustments(
       const PerformanceSnapshot* snapshot = nullptr) const;
+  [[nodiscard]] std::vector<StrategicOutcome> queryOutcomes(
+      const std::string& key,
+      std::size_t limit = 4U) const;
+  [[nodiscard]] std::vector<StrategicOutcome> querySuccessfulOutcomes(
+      const std::string& key,
+      std::size_t limit = 4U) const;
   [[nodiscard]] bool persistTuningState(const std::filesystem::path& path) const;
   [[nodiscard]] bool loadTuningState(const std::filesystem::path& path);
   void applyWeightTuning(
@@ -70,9 +77,18 @@ class StrategicMemory {
 
  private:
   static constexpr std::uint32_t kSchemaVersion = 1U;
+  static std::vector<std::string> tokenizeKey(std::string_view value);
+
+  [[nodiscard]] std::vector<StrategicOutcome> queryIndexed(
+      const std::map<std::string, std::vector<std::size_t>>& index,
+      const std::string& key,
+      std::size_t limit) const;
+  void rebuildIndexesLocked();
 
   mutable std::shared_mutex mutex_;
   std::vector<StrategicOutcome> outcomes_;
+  std::map<std::string, std::vector<std::size_t>> tokenIndex_;
+  std::map<std::string, std::vector<std::size_t>> successIndex_;
   std::size_t retentionLimit_{0U};
 
   std::uint64_t intentAttempts_{0U};

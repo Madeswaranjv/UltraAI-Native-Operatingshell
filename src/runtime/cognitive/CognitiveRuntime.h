@@ -2,6 +2,7 @@
 
 #include "CognitiveState.h"
 #include "tools/ToolRegistry.h"
+#include "ultra_loop.h"
 #include "../CPUGovernor.h"
 #include "../governance/Policy.h"
 #include "../intent/Intent.h"
@@ -39,7 +40,16 @@ struct CognitiveLoopResult {
   bool ok{false};
   std::string verifyStatus;
   std::string confidence;
+  std::string llm_output;
   std::string output;
+  std::string executionSummary;
+  std::string outputSource;
+  std::string providerUsed;
+  std::string providerEndpoint;
+  std::vector<cognitive::TransitionRecord> transitions;
+  std::vector<cognitive::RepairRecord> repairs;
+  std::vector<cognitive::ArbitrationDecisionRecord> arbitration;
+  std::vector<cognitive::IntentConsistencyRecord> intentConsistency;
   std::string errorMessage;
 };
 
@@ -64,4 +74,3 @@ class CognitiveRuntime {
 };
 
 }  // namespace ultra::runtime
-

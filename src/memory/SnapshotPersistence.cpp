@@ -44,7 +44,7 @@ bool SnapshotPersistence::loadGraph(
     return false;
   }
 
-  graph.restore(snap);
+  graph = StateGraph::fromSnapshot(snap);
 
   return true;
 }

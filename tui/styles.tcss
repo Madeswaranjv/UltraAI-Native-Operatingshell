@@ -94,6 +94,20 @@ OutputPanel {
     margin-bottom: 1;
 }
 
+.ai-status {
+    color: #8a8a8a;
+    text-style: bold;
+}
+
+.ai-detail {
+    color: #4f4f4f;
+    margin-bottom: 1;
+}
+
+.ai-body {
+    color: #ffffff;
+}
+
 .system-msg {
     color: #444444;
     margin-bottom: 1;

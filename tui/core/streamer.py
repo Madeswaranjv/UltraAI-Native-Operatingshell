@@ -1,267 +1,356 @@
 """
-EngineStreamer — drives all visual output and cognitive loop simulation.
+EngineStreamer — drives live TUI output from the real Ultra cognitive loop.
 
-Each public method maps to one Ultra execution path:
-  run_user_driven_pipeline()    → USER-DRIVEN mode
-  run_architectural_pipeline()  → ARCHITECTURAL mode
-
-Replace the _call_backend_* stubs with real ultra subprocess / IPC calls
-once the C++ bridge is ready. All animations and effects are preserved.
+The C++ backend keeps stdout reserved for the final JSON payload and emits
+structured loop diagnostics on stderr. This module preserves that contract
+while surfacing both channels in real time inside the TUI.
 """
 from __future__ import annotations
+
 import asyncio
+import contextlib
 import json
 import os
+import queue
 import random
+import re
 import shutil
+import subprocess
 import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
 from typing import Optional
 
-from utils.anime_words import ANIME_WORDS
-from utils.thinking_states import THINKING_FRAMES, LOOP_STATE_FRAMES
+from utils.anime_words import anime_words_for_phase
+from utils.thinking_states import LOOP_PHASE_LABELS, LOOP_STATE_FRAMES, THINKING_FRAMES
 from core.state_manager import AppState
 from core.intent_parser import IntentPayload
 
 
+TRANSITION_RE = re.compile(
+    r"^\[UltraLoop\]\[Transition\] from=(?P<from>[A-Z_]+) "
+    r"to=(?P<to>[A-Z_]+) reason=(?P<reason>.*)$"
+)
+ARBITRATION_RE = re.compile(
+    r"^\[UltraLoop\]\[Arbitration\] iteration=(?P<iteration>\d+) "
+    r"candidates=(?P<candidates>\d+) conflicts=(?P<conflicts>\d+) "
+    r"selected=(?P<selected>\d+) tasks=(?P<tasks>.*)$"
+)
+REPAIR_RE = re.compile(
+    r"^\[UltraLoop\]\[Repair\] iteration=(?P<iteration>\d+) "
+    r"attempt=(?P<attempt>\d+) site=(?P<site>\S+) "
+    r"decision=(?P<decision>\S+) tasks=(?P<tasks>\S*) "
+    r"reason=(?P<reason>.*)$"
+)
+TASK_OUTPUT_RE = re.compile(
+    r"^\[UltraLoop\] Task (?P<task>\S+) produced text_output bytes="
+    r"(?P<output_len>\d+)$"
+)
+PROVIDER_RE = re.compile(
+    r"^\[ULTRA-RUNTIME\] provider_used=(?P<provider>\S+)"
+    r"(?: endpoint=(?P<endpoint>.*))?$"
+)
+MODEL_ENTER_RE = re.compile(
+    r"^\[ULTRA-DEBUG\] ModelGenerate entered\..*provider=(?P<provider>\S+)"
+)
+MODEL_RESPONSE_RE = re.compile(
+    r"^\[ULTRA-DEBUG\] ModelGenerate response\. ok=(?P<ok>true|false) "
+    r"error=(?P<error>.*?) output_len=(?P<output_len>\d+)$"
+)
+
+LOOP_PHASE_TO_APP_STATE = {
+    "INIT": AppState.INITIALIZING,
+    "PLAN": AppState.PLANNING,
+    "ARBITRATION": AppState.ARBITRATING,
+    "MICRO_PLAN": AppState.MICRO_PLANNING,
+    "EXECUTE": AppState.EXECUTING,
+    "PARTIAL_REPAIR": AppState.REPAIRING,
+    "VERIFY": AppState.VERIFYING,
+    "REFLECT": AppState.REFLECTING,
+    "RE_ANCHOR": AppState.REANCHORING,
+    "REPLAN": AppState.REPLANNING,
+    "TERMINATE": AppState.COMPLETE,
+}
+
+
+@dataclass
+class LiveRenderState:
+    phase: str = "INIT"
+    status_reason: str = "Launching cognitive loop..."
+    event_detail: str = ""
+    anime_word: str = "Analyzing..."
+    frame_index: int = 0
+    anime_index: int = 0
+    provider_used: str = ""
+    provider_endpoint: str = ""
+    final_output_ready: bool = False
+    output_revealed: bool = False
+    stdout_lines: list[str] = field(default_factory=list)
+    stderr_lines: list[str] = field(default_factory=list)
+
+
 class EngineStreamer:
+    PROCESS_TIMEOUT_SECONDS = 300.0
 
     def __init__(self, output_component, state_manager):
         self.output = output_component
         self.sm = state_manager
         self.session = None
-        self._used_phrases: set = set()
 
     def set_session(self, session) -> None:
         self.session = session
 
-    # ── Anime phrase pool ────────────────────────────────────────────────────
-
-    def _phrase(self) -> str:
-        available = list(set(ANIME_WORDS) - self._used_phrases)
-        if not available:
-            self._used_phrases.clear()
-            available = list(ANIME_WORDS)
-        phrase = random.choice(available)
-        self._used_phrases.add(phrase)
-        return phrase
-
-    # ── Shared animations ────────────────────────────────────────────────────
-
-    async def _thinking_animation(self, cycles: int = 8) -> None:
-        for i in range(cycles):
-            frame = THINKING_FRAMES[i % len(THINKING_FRAMES)]
-            self.output.update_active(frame)
-            await asyncio.sleep(0.18)
-
-    async def _loop_state_animation(self, state_name: str, cycles: int = 4) -> None:
-        for i in range(cycles):
-            frame = LOOP_STATE_FRAMES[i % len(LOOP_STATE_FRAMES)]
-            self.output.update_active(f"{frame}  {state_name.upper()}")
-            await asyncio.sleep(0.15)
-
-    async def _stream_text(self, text: str, prefix: str = "", delay: float = 0.03) -> str:
-        """Stream text word-by-word, returning the full accumulated string."""
-        words = text.split(" ")
-        accumulated = prefix
-        for word in words:
-            accumulated += word + " "
-            self.output.update_active(accumulated)
-            await asyncio.sleep(delay)
-        return accumulated
-
-    async def _phase_line(self, accumulated: str, label: str, detail: str = "") -> str:
-        phrase = self._phrase()
-        line = f"  [ {phrase} ]  {label}"
-        if detail:
-            line += f"  →  {detail}"
-        line += "\n"
-        accumulated += line
-        self.output.update_active(accumulated)
-        await asyncio.sleep(0.45)
-        return accumulated
-
-    # ── USER-DRIVEN pipeline ─────────────────────────────────────────────────
-
     async def run_user_driven_pipeline(
         self, prompt: str, intent: IntentPayload, session
     ) -> None:
-        self.output.mount_new_response()
-        acc = ""
+        session_dict = self._session_payload(session)
+        intent_dict = intent.to_dict()
+        intent_dict.pop("context_hint", None)
 
-        # ── INTENT PARSE ──────────────────────────────────────────────────
-        self.sm.set_state(AppState.PARSING_INTENT)
-        await self._loop_state_animation("parsing intent", 5)
-        acc += f"INTENT PARSED\n"
-        acc += f"  action       →  {intent.action}\n"
-        acc += f"  targets      →  {', '.join(intent.targets) if intent.targets else 'unspecified'}\n"
-        acc += f"  goal         →  {intent.goal_summary}\n"
-        acc += f"  risk level   →  {intent.risk_level}\n"
-        if intent.constraints:
-            acc += f"  constraints  →  {', '.join(intent.constraints)}\n"
-        acc += "\n"
-        self.output.update_active(acc)
-        await asyncio.sleep(0.4)
-
-        # ── STRATEGY PLAN ─────────────────────────────────────────────────
-        self.sm.set_state(AppState.PLANNING)
-        await self._loop_state_animation("planning", 4)
-        acc += "STRATEGY PLAN\n"
-        acc = await self._phase_line(acc, "L11 Intent Runtime", "goal structured")
-        acc = await self._phase_line(acc, "L12 Strategy Planner", f"style: {session.policy.strategy_style}")
-        acc += "\n"
-
-        # ── MICRO PLAN ────────────────────────────────────────────────────
-        self.sm.set_state(AppState.MICRO_PLANNING)
-        await self._loop_state_animation("micro-planning", 4)
-        tasks = self._generate_micro_tasks(intent)
-        acc += "MICRO TASK GRAPH\n"
-        for i, task in enumerate(tasks, 1):
-            acc += f"  [{i}] {task}\n"
-            self.output.update_active(acc)
-            await asyncio.sleep(0.2)
-        acc += "\n"
-
-        # ── GOVERNANCE CHECK ──────────────────────────────────────────────
-        self.sm.set_state(AppState.GOVERNANCE_CHECK)
-        await self._loop_state_animation("governance check", 3)
-        gov_result, gov_detail = self._simulate_governance(intent, session)
-        phrase = self._phrase()
-        acc += f"GOVERNANCE  [ {phrase} ]\n"
-        acc += f"  status       →  {gov_result}\n"
-        acc += f"  detail       →  {gov_detail}\n"
-
-        if gov_result == "BLOCKED":
-            acc += "\n  ⚠ Execution halted by governance policy.\n"
-            self.output.update_active(acc)
-            self.sm.set_state(AppState.ERROR)
-            self.output.finalize_active()
-            return
-
-        if session.governance.require_plan_approval:
-            acc += "  approval     →  auto-approved (require_plan_approval=true stub)\n"
-        acc += "\n"
-        self.output.update_active(acc)
-        await asyncio.sleep(0.3)
-
-        # ── EXECUTE ───────────────────────────────────────────────────────
-        self.sm.set_state(AppState.EXECUTING)
-        await self._loop_state_animation("executing", 5)
-        acc += "EXECUTION\n"
-        for i, task in enumerate(tasks, 1):
-            acc = await self._phase_line(acc, f"task {i}/{len(tasks)}", task)
-
-        # ── STUB: call backend here ────────────────────────────────────────
-        backend_result = await self._call_backend_user_driven(intent, session)
-        acc += "\n"
-
-        # ── VERIFY ────────────────────────────────────────────────────────
-        self.sm.set_state(AppState.VERIFYING)
-        await self._loop_state_animation("verifying", 3)
-        acc += f"VERIFICATION  →  {backend_result['verify_status']}\n"
-        acc += f"  confidence   →  {backend_result['confidence']}\n\n"
-        if backend_result["status"] == "error":
-            acc += f"BACKEND ERROR →  {backend_result.get('error', 'backend_error')}\n\n"
-        self.output.update_active(acc)
-        await asyncio.sleep(0.3)
-
-        # ── REFLECT ───────────────────────────────────────────────────────
-        self.sm.set_state(AppState.REFLECTING)
-        await self._loop_state_animation("reflecting", 3)
-        if backend_result["status"] == "ok":
-            acc += "REFLECT  →  memory updated\n\n"
-        else:
-            acc += "REFLECT  →  skipped due to backend error\n\n"
-        self.output.update_active(acc)
-        await asyncio.sleep(0.2)
-
-        # ── FINAL OUTPUT ──────────────────────────────────────────────────
-        self.sm.set_state(AppState.COMPLETE if backend_result["status"] == "ok" else AppState.ERROR)
-        acc += "─" * 48 + "\n"
-        acc = await self._stream_text(
-            self._final_output_text(backend_result),
-            prefix=acc,
-            delay=0.03,
-        )
-        self.output.finalize_active()
-
-    # ── ARCHITECTURAL pipeline ───────────────────────────────────────────────
+        payload = {
+            "intent": intent_dict,
+            "session": session_dict,
+        }
+        launch_detail = f"{intent.action}: {intent.goal_summary}"
+        await self._run_live_cognitive_pipeline(payload, launch_detail)
 
     async def run_architectural_pipeline(self, prompt: str, session) -> None:
-        self.output.mount_new_response()
-        acc = ""
-
-        # ── THINKING ─────────────────────────────────────────────────────
-        self.sm.set_state(AppState.THINKING)
-        await self._thinking_animation(10)
-
-        acc += "ARCHITECTURAL MODE  —  Project Structure Received\n\n"
-        self.output.update_active(acc)
-        await asyncio.sleep(0.3)
-
-        # ── PLAN ──────────────────────────────────────────────────────────
-        self.sm.set_state(AppState.PLANNING)
-        await self._loop_state_animation("planning", 6)
-        acc += "AUTONOMOUS PLAN\n"
-        acc = await self._phase_line(acc, "L11 Intent Runtime", "structure analysed")
-        acc = await self._phase_line(acc, "L12 Strategy Planner", f"risk: {session.policy.risk_tolerance}")
-        acc = await self._phase_line(acc, "L13 Micro Planner", "task DAG generated")
-        acc = await self._phase_line(acc, "L18 Governance", "policies applied")
-        acc += "\n"
-
-        # ── GOVERNANCE ────────────────────────────────────────────────────
-        self.sm.set_state(AppState.GOVERNANCE_CHECK)
-        acc += f"GOVERNANCE POLICIES ACTIVE\n"
-        if session.governance.protected_paths:
-            acc += f"  protected    →  {', '.join(session.governance.protected_paths)}\n"
-        if session.governance.forbidden_actions:
-            acc += f"  forbidden    →  {', '.join(session.governance.forbidden_actions)}\n"
-        acc += f"  max iters    →  {session.governance.max_iterations}\n\n"
-        self.output.update_active(acc)
-        await asyncio.sleep(0.4)
-
-        # ── EXECUTE ───────────────────────────────────────────────────────
-        self.sm.set_state(AppState.EXECUTING)
-        await self._loop_state_animation("executing", 6)
-        acc += "SCAFFOLD GENERATION\n"
-        modules = self._extract_modules_from_prompt(prompt)
-        for mod in modules:
-            acc = await self._phase_line(acc, f"scaffold", mod)
-
-        backend_result = await self._call_backend_architectural(prompt, session)
-        acc += "\n"
-
-        # ── VERIFY + REFLECT ──────────────────────────────────────────────
-        self.sm.set_state(AppState.VERIFYING)
-        acc += f"VERIFICATION  →  {backend_result['verify_status']}\n"
-        if backend_result["status"] == "error":
-            acc += f"BACKEND ERROR →  {backend_result.get('error', 'backend_error')}\n"
-        self.sm.set_state(AppState.REFLECTING)
-        if backend_result["status"] == "ok":
-            acc += "REFLECT  →  architecture locked to memory\n\n"
-        else:
-            acc += "REFLECT  →  skipped due to backend error\n\n"
-        self.output.update_active(acc)
-        await asyncio.sleep(0.3)
-
-        self.sm.set_state(AppState.COMPLETE if backend_result["status"] == "ok" else AppState.ERROR)
-        acc += "─" * 48 + "\n"
-        acc = await self._stream_text(
-            self._final_output_text(backend_result),
-            prefix=acc,
-            delay=0.025,
+        payload = {
+            "intent": {
+                "raw_prompt": prompt,
+                "action": "add",
+                "targets": [],
+                "goal_summary": prompt[:80],
+                "constraints": [],
+                "risk_level": session.policy.risk_tolerance,
+                "requires_planning": True,
+            },
+            "session": self._session_payload(session),
+        }
+        await self._run_live_cognitive_pipeline(
+            payload,
+            "architectural pass: launching cognitive_run",
         )
-        self.output.finalize_active()
 
-    # ── Backend bridge ────────────────────────────────────────────────────────
+    async def _run_live_cognitive_pipeline(
+        self,
+        payload: dict,
+        launch_detail: str,
+    ) -> None:
+        self.output.mount_new_response()
+        live = LiveRenderState(
+            status_reason=launch_detail,
+            anime_word=anime_words_for_phase("INIT")[0],
+        )
+
+        self.sm.set_state(AppState.INITIALIZING)
+        self.output.update_active("")
+        self._render_live_status(live)
+
+        anime_task = asyncio.create_task(self._anime_loop(live))
+        try:
+            backend_result = await self._invoke_ultra("cognitive_run", payload, live)
+            await self._finalize_live_response(live, backend_result)
+        finally:
+            await self._stop_task(anime_task)
+
+    async def _anime_loop(self, live: LiveRenderState) -> None:
+        while not live.final_output_ready:
+            words = anime_words_for_phase(live.phase)
+            if words:
+                live.anime_word = words[live.anime_index % len(words)]
+                live.anime_index += 1
+            live.frame_index += 1
+            self._render_live_status(live)
+            await asyncio.sleep(random.uniform(3, 5))
+
+    async def _stop_task(self, task: Optional[asyncio.Task]) -> None:
+        if task is None:
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    def _render_live_status(self, live: LiveRenderState) -> None:
+        frame_source = THINKING_FRAMES if live.phase == "INIT" else LOOP_STATE_FRAMES
+        frame = frame_source[live.frame_index % len(frame_source)]
+        phase_label = LOOP_PHASE_LABELS.get(
+            live.phase,
+            live.phase.lower().replace("_", " "),
+        )
+        banner = f"{frame}  {phase_label.upper()}  {live.anime_word}"
+
+        detail_lines: list[str] = []
+        if live.status_reason:
+            detail_lines.append(live.status_reason)
+        if live.event_detail and live.event_detail not in detail_lines:
+            detail_lines.append(live.event_detail)
+        if live.provider_used:
+            provider_line = f"provider: {live.provider_used}"
+            if live.provider_endpoint:
+                provider_line += f" @ {live.provider_endpoint}"
+            if provider_line not in detail_lines:
+                detail_lines.append(provider_line)
+
+        self.output.update_active_status(banner, "\n".join(detail_lines[:2]))
+
+    def _set_loop_phase(
+        self,
+        live: LiveRenderState,
+        phase: str,
+        reason: str = "",
+    ) -> None:
+        live.phase = phase
+        if reason:
+            live.status_reason = reason
+        live.event_detail = ""
+
+        app_state = LOOP_PHASE_TO_APP_STATE.get(phase)
+        if app_state is not None:
+            self.sm.set_state(app_state)
+        self._render_live_status(live)
+
+    def _handle_stderr_line(self, line: str, live: LiveRenderState) -> None:
+        normalized = line.strip()
+        if not normalized:
+            return
+
+        transition_match = TRANSITION_RE.match(normalized)
+        if transition_match:
+            self._set_loop_phase(
+                live,
+                transition_match.group("to"),
+                transition_match.group("reason").strip(),
+            )
+            return
+
+        arbitration_match = ARBITRATION_RE.match(normalized)
+        if arbitration_match:
+            live.event_detail = (
+                f"arbitration iter {arbitration_match.group('iteration')}: "
+                f"{arbitration_match.group('selected')}/"
+                f"{arbitration_match.group('candidates')} selected, "
+                f"{arbitration_match.group('conflicts')} conflicts"
+            )
+            self._render_live_status(live)
+            return
+
+        repair_match = REPAIR_RE.match(normalized)
+        if repair_match:
+            live.event_detail = (
+                f"repair {repair_match.group('decision')} at "
+                f"{repair_match.group('site')} "
+                f"(attempt {repair_match.group('attempt')})"
+            )
+            self._render_live_status(live)
+            return
+
+        provider_match = PROVIDER_RE.match(normalized)
+        if provider_match:
+            live.provider_used = provider_match.group("provider")
+            live.provider_endpoint = (provider_match.group("endpoint") or "").strip()
+            self._render_live_status(live)
+            return
+
+        model_enter_match = MODEL_ENTER_RE.match(normalized)
+        if model_enter_match:
+            provider = model_enter_match.group("provider")
+            if provider and provider != "auto":
+                live.event_detail = f"model generation started via {provider}"
+            else:
+                live.event_detail = "model generation started"
+            self._render_live_status(live)
+            return
+
+        model_response_match = MODEL_RESPONSE_RE.match(normalized)
+        if model_response_match:
+            status_label = "ready" if model_response_match.group("ok") == "true" else "failed"
+            live.event_detail = (
+                f"model response {status_label} • "
+                f"{model_response_match.group('output_len')} bytes"
+            )
+            self._render_live_status(live)
+            return
+
+        task_output_match = TASK_OUTPUT_RE.match(normalized)
+        if task_output_match:
+            live.event_detail = (
+                f"task {task_output_match.group('task')} produced "
+                f"{task_output_match.group('output_len')} bytes"
+            )
+            self._render_live_status(live)
+            return
+
+        if normalized.startswith("[UltraLoop] "):
+            live.event_detail = normalized.replace("[UltraLoop] ", "", 1)
+            self._render_live_status(live)
+            return
+
+        if normalized.startswith("[FailureRecovery] "):
+            live.event_detail = normalized.replace("[FailureRecovery] ", "", 1)
+            self._render_live_status(live)
+
+    async def _progressively_reveal_output(
+        self,
+        live: LiveRenderState,
+        text: str,
+    ) -> None:
+        if not text:
+            live.output_revealed = True
+            return
+
+        rendered = 0
+        self.output.update_active("")
+        while rendered < len(text):
+            next_index = self._next_output_break(text, rendered)
+            self.output.append_active(text[rendered:next_index])
+            rendered = next_index
+            await asyncio.sleep(random.uniform(0.02, 0.05))
+
+        self.output.update_active(text)
+        live.output_revealed = True
+
+    def _next_output_break(self, text: str, start: int) -> int:
+        end = min(len(text), start + random.randint(14, 32))
+        while end < len(text) and not text[end - 1].isspace() and not text[end].isspace():
+            end += 1
+        return min(end, len(text))
+
+    async def _finalize_live_response(
+        self,
+        live: LiveRenderState,
+        backend_result: dict,
+    ) -> None:
+        final_text = self._final_output_text(backend_result)
+        if final_text and not live.output_revealed:
+            live.final_output_ready = True
+            await self._progressively_reveal_output(live, final_text)
+
+        self.output.update_active(final_text)
+        self.sm.set_state(
+            AppState.COMPLETE
+            if backend_result.get("status") == "ok"
+            else AppState.ERROR
+        )
+        self.output.finalize_active(clear_status=True)
 
     def _error_backend_response(self, message: str, output: str = "") -> dict:
         return {
             "status": "error",
             "verify_status": "FAIL",
             "confidence": "low",
+            "llm_output": "",
             "output": output,
             "error": message,
         }
+
+    def _combine_process_output(self, stdout_text: str, stderr_text: str) -> str:
+        stdout_text = stdout_text.strip()
+        stderr_text = stderr_text.strip()
+        if stdout_text and stderr_text:
+            return f"{stdout_text}\n\n[stderr]\n{stderr_text}"
+        return stdout_text or stderr_text
 
     def _nested_string(self, data: dict, path: tuple[str, ...]) -> str:
         current = data
@@ -271,7 +360,11 @@ class EngineStreamer:
             current = current.get(key)
         return current if isinstance(current, str) else ""
 
-    def _first_non_empty_string(self, data: dict, paths: tuple[tuple[str, ...], ...]) -> str:
+    def _first_non_empty_string(
+        self,
+        data: dict,
+        paths: tuple[tuple[str, ...], ...],
+    ) -> str:
         for path in paths:
             value = self._nested_string(data, path)
             if value and value.strip():
@@ -282,14 +375,16 @@ class EngineStreamer:
         return self._first_non_empty_string(
             data,
             (
-                ("output",),
+                ("llm_output",),
+                ("llmOutput",),
                 ("text_output",),
                 ("textOutput",),
+                ("output",),
                 ("response", "text_output"),
                 ("response", "textOutput"),
-                ("payload", "output"),
                 ("payload", "text_output"),
                 ("payload", "textOutput"),
+                ("payload", "output"),
                 ("payload", "response", "text_output"),
                 ("payload", "response", "textOutput"),
                 ("result", "output"),
@@ -314,12 +409,20 @@ class EngineStreamer:
         )
 
     def _final_output_text(self, backend_result: dict) -> str:
+        llm_output = str(
+            backend_result.get("llm_output", backend_result.get("llmOutput", "")) or ""
+        )
+        if llm_output.strip():
+            return llm_output
+
         output = str(backend_result.get("output", "") or "")
         if output.strip():
             return output
+
         error = str(backend_result.get("error", "") or "")
         if error.strip():
             return f"Backend error: {error}"
+
         return "(No output returned by cognitive_run.)"
 
     def _normalize_backend_result(self, result: dict) -> dict:
@@ -341,6 +444,8 @@ class EngineStreamer:
 
         output = self._extract_output_text(normalized)
         error = self._extract_error_text(normalized)
+        has_llm_output_field = "llm_output" in normalized or "llmOutput" in normalized
+        llm_output = str(normalized.get("llm_output", normalized.get("llmOutput", "")) or "")
         if status != "error" and error and not output:
             status = "error"
 
@@ -355,6 +460,10 @@ class EngineStreamer:
         normalized["status"] = status
         normalized["verify_status"] = verify if verify else ("PASS" if status == "ok" else "FAIL")
         normalized["confidence"] = confidence
+        if has_llm_output_field:
+            normalized["llm_output"] = llm_output
+            if llm_output.strip():
+                output = llm_output
         normalized["output"] = output
         if error:
             normalized["error"] = error
@@ -362,7 +471,12 @@ class EngineStreamer:
             normalized["error"] = "backend_error"
         return normalized
 
-    async def _invoke_ultra_via_ipc(self, cmd: str, payload: dict, project_root: str) -> Optional[dict]:
+    async def _invoke_ultra_via_ipc(
+        self,
+        cmd: str,
+        payload: dict,
+        project_root: str,
+    ) -> Optional[dict]:
         state_dirs = [
             os.path.join(project_root, ".ultra_daemon"),
             os.path.join(project_root, ".ultra"),
@@ -373,7 +487,9 @@ class EngineStreamer:
             daemon_pid = os.path.join(state_dir, "daemon.pid")
             pipe_name = os.path.join(state_dir, "pipe.name")
             daemon_sock = os.path.join(state_dir, "daemon.sock")
-            if os.path.isfile(daemon_pid) and (os.path.isfile(pipe_name) or os.path.exists(daemon_sock)):
+            if os.path.isfile(daemon_pid) and (
+                os.path.isfile(pipe_name) or os.path.exists(daemon_sock)
+            ):
                 selected_state_dir = state_dir
                 break
         if selected_state_dir is None:
@@ -454,15 +570,198 @@ class EngineStreamer:
             return self._normalize_backend_result(payload_result)
         if any(
             key in ipc_response
-            for key in ("status", "verify_status", "verifyStatus", "output", "error")
+            for key in (
+                "status",
+                "verify_status",
+                "verifyStatus",
+                "llm_output",
+                "llmOutput",
+                "output",
+                "error",
+            )
         ):
             return self._normalize_backend_result(ipc_response)
         return None
 
-    async def _invoke_ultra(self, cmd: str, payload: dict) -> dict:
+    def _pipe_reader(
+        self,
+        pipe,
+        channel: str,
+        event_queue: queue.Queue,
+    ) -> None:
+        try:
+            for line in iter(pipe.readline, ""):
+                if line == "":
+                    break
+                event_queue.put((channel, line))
+        finally:
+            with contextlib.suppress(Exception):
+                pipe.close()
+            event_queue.put((f"{channel}_closed", ""))
+
+    def _parse_backend_json(self, stdout_text: str) -> Optional[dict]:
+        candidate = stdout_text.strip()
+        if not candidate:
+            return None
+
+        try:
+            parsed = json.loads(candidate)
+            return parsed if isinstance(parsed, dict) else None
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        object_start = candidate.find("{")
+        object_end = candidate.rfind("}")
+        if object_start != -1 and object_end > object_start:
+            try:
+                parsed = json.loads(candidate[object_start : object_end + 1])
+                return parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                pass
+
+        for line in reversed(candidate.splitlines()):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                parsed = json.loads(line)
+                return parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                continue
+
+        return None
+
+    def _terminate_process(self, proc: subprocess.Popen) -> None:
+        if proc.poll() is None:
+            with contextlib.suppress(Exception):
+                proc.kill()
+
+    async def _collect_process_output(
+        self,
+        proc: subprocess.Popen,
+        cmd: str,
+        event_queue: queue.Queue,
+        reader_threads: list[threading.Thread],
+        live: Optional[LiveRenderState],
+    ) -> dict:
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        parsed_result: Optional[dict] = None
+        reveal_task: Optional[asyncio.Task] = None
+        stdout_closed = False
+        stderr_closed = False
+        timed_out = False
+        deadline = time.monotonic() + self.PROCESS_TIMEOUT_SECONDS
+
+        def drain_events() -> bool:
+            nonlocal parsed_result
+            nonlocal reveal_task
+            nonlocal stdout_closed
+            nonlocal stderr_closed
+
+            drained_any = False
+            while True:
+                try:
+                    channel, payload = event_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                drained_any = True
+                if channel == "stdout":
+                    stdout_lines.append(payload)
+                    if live is not None:
+                        live.stdout_lines.append(payload)
+                    if parsed_result is None:
+                        candidate = self._parse_backend_json("".join(stdout_lines))
+                        if candidate is not None:
+                            parsed_result = self._normalize_backend_result(candidate)
+                            if live is not None:
+                                live.final_output_ready = True
+                                final_text = self._final_output_text(parsed_result)
+                                if final_text:
+                                    reveal_task = asyncio.create_task(
+                                        self._progressively_reveal_output(live, final_text)
+                                    )
+                elif channel == "stderr":
+                    stderr_lines.append(payload)
+                    if live is not None:
+                        live.stderr_lines.append(payload)
+                        self._handle_stderr_line(payload.rstrip("\r\n"), live)
+                elif channel == "stdout_closed":
+                    stdout_closed = True
+                elif channel == "stderr_closed":
+                    stderr_closed = True
+
+            return drained_any
+
+        try:
+            while True:
+                drained = drain_events()
+                if proc.poll() is not None and stdout_closed and stderr_closed:
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    self._terminate_process(proc)
+                    break
+                if not drained:
+                    await asyncio.sleep(0.03)
+
+            await asyncio.to_thread(proc.wait)
+            await asyncio.sleep(0)
+            drain_events()
+        except asyncio.CancelledError:
+            self._terminate_process(proc)
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(proc.wait)
+            raise
+        finally:
+            for thread in reader_threads:
+                thread.join(timeout=0.2)
+
+        if reveal_task is not None:
+            await reveal_task
+
+        stdout_text = "".join(stdout_lines).strip()
+        stderr_text = "".join(stderr_lines).strip()
+
+        if parsed_result is None:
+            parsed = self._parse_backend_json(stdout_text)
+            if parsed is not None:
+                parsed_result = self._normalize_backend_result(parsed)
+
+        if parsed_result is not None:
+            if stderr_text:
+                parsed_result["_stderr"] = stderr_text
+            return parsed_result
+
+        if timed_out:
+            return self._error_backend_response(
+                f"ultra {cmd} timed out after {int(self.PROCESS_TIMEOUT_SECONDS)}s",
+                output=self._combine_process_output(stdout_text, stderr_text),
+            )
+
+        if proc.returncode != 0 and not stdout_text:
+            return self._error_backend_response(
+                stderr_text or f"ultra {cmd} exited {proc.returncode}"
+            )
+
+        return self._error_backend_response(
+            "ultra output was not valid JSON",
+            output=self._combine_process_output(stdout_text, stderr_text),
+        )
+
+    async def _invoke_ultra(
+        self,
+        cmd: str,
+        payload: dict,
+        live: Optional[LiveRenderState] = None,
+    ) -> dict:
         """
-        Invoke the Ultra C++ backend.
-        Primary fallback: subprocess call to `ultra <cmd> --file <payload_file>`.
+        Invoke the Ultra backend.
+
+        `cognitive_run` is streamed through a non-blocking subprocess so stdout
+        and stderr can be consumed independently without breaking the JSON
+        contract.
         """
         session_payload = payload.get("session", {}) if isinstance(payload, dict) else {}
         project_root = str(
@@ -474,10 +773,8 @@ class EngineStreamer:
         if not project_root:
             project_root = os.getcwd()
 
-        # cognitive_run is a CLI command — never route through daemon IPC.
-        # IPC is only for daemon-native commands (ai_status, ai_query, etc.)
-        _IPC_ONLY_CMDS = {"ai_status", "ai_query", "ai_source", "ai_context", "ai_impact"}
-        if cmd in _IPC_ONLY_CMDS:
+        ipc_only_cmds = {"ai_status", "ai_query", "ai_source", "ai_context", "ai_impact"}
+        if cmd in ipc_only_cmds:
             ipc_result = await self._invoke_ultra_via_ipc(cmd, payload, project_root)
             if ipc_result is not None:
                 return ipc_result
@@ -499,9 +796,7 @@ class EngineStreamer:
                 "ultra binary not found in PATH or build/. Run cmake --build build first."
             )
 
-        json_payload = json.dumps(payload)
         payload_file: Optional[str] = None
-
         try:
             with tempfile.NamedTemporaryFile(
                 mode="w",
@@ -509,135 +804,59 @@ class EngineStreamer:
                 delete=False,
                 suffix=".json",
             ) as temp_payload:
-                temp_payload.write(json_payload)
+                temp_payload.write(json.dumps(payload))
                 payload_file = temp_payload.name
 
-            proc = await asyncio.create_subprocess_exec(
-                ultra_bin,
-                cmd,
-                "--file",
-                payload_file,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            proc = subprocess.Popen(
+                [ultra_bin, cmd, "--file", payload_file],
                 cwd=project_root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
             )
 
-            try:
-                out, err = await asyncio.wait_for(proc.communicate(), timeout=300.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-                return self._error_backend_response(f"ultra {cmd} timed out after 300s")
-
-            stdout_text = out.decode("utf-8", errors="replace").strip()
-            stderr_text = err.decode("utf-8", errors="replace").strip()
-
-            if proc.returncode != 0 and not stdout_text:
+            if proc.stdout is None or proc.stderr is None:
                 return self._error_backend_response(
-                    stderr_text or f"ultra {cmd} exited {proc.returncode}"
+                    "ultra subprocess did not expose stdout/stderr pipes."
                 )
 
-            try:
-                parsed = json.loads(stdout_text)
-                if not isinstance(parsed, dict):
-                    raise ValueError("Expected JSON object")
-                return self._normalize_backend_result(parsed)
-            except (json.JSONDecodeError, ValueError):
-                object_start = stdout_text.find("{")
-                object_end = stdout_text.rfind("}")
-                if object_start != -1 and object_end > object_start:
-                    try:
-                        parsed = json.loads(stdout_text[object_start : object_end + 1])
-                        if isinstance(parsed, dict):
-                            return self._normalize_backend_result(parsed)
-                    except json.JSONDecodeError:
-                        pass
-                lines = stdout_text.splitlines()
-                for line in reversed(lines):
-                    line = line.strip()
-                    if not line.startswith("{"):
-                        continue
-                    try:
-                        parsed = json.loads(line)
-                        if isinstance(parsed, dict):
-                            return self._normalize_backend_result(parsed)
-                    except json.JSONDecodeError:
-                        continue
-                return self._error_backend_response(
-                    "ultra output was not valid JSON",
-                    output=stdout_text,
-                )
+            event_queue: queue.Queue = queue.Queue()
+            reader_threads = [
+                threading.Thread(
+                    target=self._pipe_reader,
+                    args=(proc.stdout, "stdout", event_queue),
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=self._pipe_reader,
+                    args=(proc.stderr, "stderr", event_queue),
+                    daemon=True,
+                ),
+            ]
+            for thread in reader_threads:
+                thread.start()
+
+            return await self._collect_process_output(
+                proc,
+                cmd,
+                event_queue,
+                reader_threads,
+                live,
+            )
         except FileNotFoundError:
-            return self._error_backend_response(
-                f"ultra binary not executable: {ultra_bin}"
-            )
+            return self._error_backend_response(f"ultra binary not executable: {ultra_bin}")
         except Exception as exc:  # noqa: BLE001
             return self._error_backend_response(str(exc))
         finally:
             if payload_file:
-                try:
+                with contextlib.suppress(OSError):
                     os.remove(payload_file)
-                except OSError:
-                    pass
 
-    async def _call_backend_user_driven(self, intent: IntentPayload, session) -> dict:
+    def _session_payload(self, session) -> dict:
         session_dict = session.to_dict()
-        # CLIEngine cognitive_run only accepts project_root, governance, policy
-        # Strip 'mode' and any other TUI-only fields
         session_dict.pop("mode", None)
-        intent_dict = intent.to_dict()
-        # Strip context_hint — not part of CLIEngine's intent schema
-        intent_dict.pop("context_hint", None)
-        payload = {
-            "intent": intent_dict,
-            "session": session_dict,
-        }
-        return await self._invoke_ultra("cognitive_run", payload)
-
-    async def _call_backend_architectural(self, prompt: str, session) -> dict:
-        payload = {
-            "intent": {
-                "raw_prompt": prompt,
-                "action": "add",
-                "targets": [],
-                "goal_summary": prompt[:80],
-                "constraints": [],
-                "risk_level": session.policy.risk_tolerance,
-                "requires_planning": True,
-            },
-            "session": session.to_dict(),
-        }
-        return await self._invoke_ultra("cognitive_run", payload)
-
-    # ── Helpers ──────────────────────────────────────────────────────────────
-
-    def _generate_micro_tasks(self, intent: IntentPayload) -> list:
-        base = intent.goal_summary
-        action = intent.action
-        tasks = {
-            "add":      [f"Create {base}", "Compile check", f"Integrate {base}", "Run tests"],
-            "fix":      [f"Locate defect in {base}", "Analyse root cause", "Apply patch", "Verify fix"],
-            "refactor": [f"Analyse {base}", "Extract components", "Rewrite structure", "Validate API"],
-            "remove":   [f"Check usages of {base}", "Remove symbol", "Update references", "Compile"],
-            "test":     [f"Analyse {base} interface", "Write unit tests", "Write edge cases", "Run suite"],
-            "analyse":  [f"Query graph for {base}", "Compress context", "Generate report"],
-            "optimise": [f"Profile {base}", "Identify bottleneck", "Apply optimisation", "Benchmark"],
-        }
-        return tasks.get(action, [f"Process {base}", "Verify", "Complete"])
-
-    def _simulate_governance(self, intent: IntentPayload, session) -> tuple:
-        if session.governance.forbidden_actions:
-            if intent.action in session.governance.forbidden_actions:
-                return "BLOCKED", f"action '{intent.action}' is forbidden by policy"
-        if session.governance.protected_paths and intent.targets:
-            for target in intent.targets:
-                for path in session.governance.protected_paths:
-                    if path.lower() in target.lower():
-                        return "BLOCKED", f"target '{target}' is in protected path '{path}'"
-        if intent.risk_level == "high" and session.policy.risk_tolerance == "low":
-            return "FLAGGED", "high-risk action flagged — proceeding with caution"
-        return "APPROVED", f"risk: {intent.risk_level} | tolerance: {session.policy.risk_tolerance}"
-
-    def _extract_modules_from_prompt(self, prompt: str) -> list:
-        import re
-        words = re.findall(r"\b[A-Z][a-zA-Z0-9]+\b", prompt)
-        return words[:6] if words else ["Core", "API", "Storage", "UI"]#MultiModelOrchestrator.cppMultiModelOrchestrator.cpp
+        return session_dict

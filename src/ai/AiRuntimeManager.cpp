@@ -23,6 +23,7 @@
 #include "../metrics/PerformanceMetrics.h"
 #include "../metacognition/MetaCognitiveOrchestrator.h"
 #include "../runtime/ContextExtractor.h"
+#include "../runtime/change_queue.h"
 #include "../runtime/precision_invalidation.h"
 
 #include <algorithm>
@@ -504,6 +505,7 @@ struct RuntimeDispatcher {
   std::filesystem::path aiDirectory;
   std::filesystem::path agentContextPath;
   std::filesystem::path contextDiffPath;
+  ultra::runtime::ChangeQueue changeQueue;
   ultra::core::StateManager stateManager;
   ultra::indexing::IndexingService indexingService;
   std::optional<ultra::ai::RuntimeState> previousState;
@@ -514,7 +516,9 @@ struct RuntimeDispatcher {
         agentContextPath(aiDirectory / "agent_context.json"),
         contextDiffPath(projectRoot / ".ultra.context-diff.json"),
         stateManager(projectRoot),
-        indexingService(projectRoot, stateManager) {}
+        indexingService(projectRoot, stateManager) {
+    stateManager.setStructuralEventBus(&changeQueue);
+  }
 
   nlohmann::json handle(const std::string& type, const nlohmann::json& payload) {
     if (type == "ai_status") {

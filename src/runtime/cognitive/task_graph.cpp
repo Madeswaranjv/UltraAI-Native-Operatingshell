@@ -166,6 +166,52 @@ bool TaskGraph::reset_failed(const std::string& task_id) {
   return true;
 }
 
+bool TaskGraph::reopen_task(const std::string& task_id) {
+  auto it = nodes_.find(task_id);
+  if (it == nodes_.end()) {
+    return false;
+  }
+
+  std::set<std::string> toReopen;
+  std::vector<std::string> frontier{task_id};
+  while (!frontier.empty()) {
+    const std::string current = frontier.back();
+    frontier.pop_back();
+
+    if (!toReopen.insert(current).second) {
+      continue;
+    }
+
+    const auto outboundIt = outbound_.find(current);
+    if (outboundIt == outbound_.end()) {
+      continue;
+    }
+
+    for (const std::string& dependent : outboundIt->second) {
+      frontier.push_back(dependent);
+    }
+  }
+
+  for (const std::string& reopenId : toReopen) {
+    auto nodeIt = nodes_.find(reopenId);
+    if (nodeIt == nodes_.end()) {
+      continue;
+    }
+
+    if (nodeIt->second.state != TaskState::COMPLETED &&
+        nodeIt->second.state != TaskState::FAILED &&
+        nodeIt->second.state != TaskState::READY &&
+        nodeIt->second.state != TaskState::RUNNING) {
+      continue;
+    }
+
+    nodeIt->second.state = TaskState::PENDING;
+  }
+
+  refresh_ready_states();
+  return true;
+}
+
 bool TaskGraph::has_pending_tasks() const {
   for (const auto& [taskId, node] : nodes_) {
     (void)taskId;
@@ -269,3 +315,4 @@ void TaskGraph::refresh_ready_states() {
 }
 
 }  // namespace ultra::runtime::cognitive
+

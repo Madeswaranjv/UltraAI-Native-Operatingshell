@@ -26,6 +26,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 #include<iostream>
@@ -143,6 +144,50 @@ std::string slurpTextFile(const std::filesystem::path& path) {
   return stream.str();
 }
 
+std::string lowerAscii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char ch) {
+                   return static_cast<char>(std::tolower(ch));
+                 });
+  return value;
+}
+
+std::string providerEndpointForProject(const std::filesystem::path& projectRoot,
+                                       const std::string& providerName) {
+  const std::string normalizedProvider = lowerAscii(providerName);
+  if (normalizedProvider.empty()) {
+    return {};
+  }
+
+  const std::filesystem::path configPath = projectRoot / ".ultra" / "models.json";
+  std::ifstream input(configPath);
+  if (input.is_open()) {
+    try {
+      nlohmann::ordered_json parsed;
+      input >> parsed;
+      const auto providersIt = parsed.find("providers");
+      if (providersIt != parsed.end() && providersIt->is_object()) {
+        const auto providerIt = providersIt->find(normalizedProvider);
+        if (providerIt != providersIt->end() && providerIt->is_object()) {
+          if (providerIt->contains("endpoint") &&
+              providerIt->at("endpoint").is_string()) {
+            return providerIt->at("endpoint").get<std::string>();
+          }
+          if (providerIt->contains("base_url") &&
+              providerIt->at("base_url").is_string()) {
+            return providerIt->at("base_url").get<std::string>();
+          }
+        }
+      }
+    } catch (...) {
+    }
+  }
+
+  if (normalizedProvider == "ollama") {
+    return "http://localhost:11434";
+  }
+  return {};
+}
 struct CommandProbe {
   int exitCode{1};
   std::string output;
@@ -747,11 +792,7 @@ ai::orchestration::TaskType taskTypeForStrategyAction(
 }
 
 std::string selectProviderForAction(const intent::Action& strategyAction) {
-  if (strategyAction.publicApiSurface ||
-      strategyAction.kind == intent::ActionKind::ChangeSignature ||
-      strategyAction.kind == intent::ActionKind::UpdatePublicAPI) {
-    return "deepseek";
-  }
+  (void)strategyAction;
   return "ollama";
 }
 
@@ -819,14 +860,7 @@ ai::orchestration::OrchestrationContext buildModelOrchestrationForStrategyAction
                          ? ai::orchestration::TaskPriority::Urgent
                          : ai::orchestration::TaskPriority::Standard;
   context.tokenBudget = request.maxTokens;
-  context.availableModels = {
-      selectProviderForAction(strategyAction),
-      "ollama",
-      "gemini",
-      "openai",
-      "anthropic",
-      "deepseek",
-  };
+  context.availableModels = {selectProviderForAction(strategyAction)};
   return context;
 }
 
@@ -1316,6 +1350,9 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
                 << (modelOrchestrator_ != nullptr ? "set" : "NULL")
                 << "\n";
 
+      lastModelTextOutput_.clear();
+      lastSelectedProvider_.clear();
+      lastProviderEndpoint_.clear();
       if (modelOrchestrator_ == nullptr) {
         ai::model::ModelResponse response;
         response.ok = false;
@@ -1333,6 +1370,25 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
 
       const ai::model::ModelResponse response =
           modelOrchestrator_->generate(*action.modelRequest, orchestrationContext);
+      std::string selectedProvider = action.modelProvider;
+      std::vector<std::string> attemptedProviders;
+      if (const auto* orchestrator =
+              dynamic_cast<const ai::orchestration::MultiModelOrchestrator*>(
+                  modelOrchestrator_.get());
+          orchestrator != nullptr) {
+        const ai::orchestration::OrchestrationDecision& decision =
+            orchestrator->lastDecision();
+        if (!decision.selectedProvider.empty()) {
+          selectedProvider = decision.selectedProvider;
+        }
+        attemptedProviders = decision.attemptedProviders;
+      }
+      const std::string providerEndpoint =
+          providerEndpointForProject(stateManager_.projectRoot(), selectedProvider);
+      lastSelectedProvider_ = selectedProvider;
+      lastProviderEndpoint_ = providerEndpoint;
+      lastModelTextOutput_ = response.textOutput;
+      result.text_output = lastModelTextOutput_;
 
       // DEBUG
       std::cerr << "[ULTRA-DEBUG] ModelGenerate response."
@@ -1340,27 +1396,29 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
                 << " error=" << response.errorMessage
                 << " output_len=" << response.textOutput.size()
                 << "\n";
-
-      // DUMP model response to file for inspection
-      {
-        std::ofstream debugFile("C:/Temp/ultra_model_response.txt",
-                                std::ios::binary | std::ios::trunc);
-        if (debugFile.is_open()) {
-          debugFile << "=== ModelGenerate Response ===\n";
-          debugFile << "ok: " << (response.ok ? "true" : "false") << "\n";
-          debugFile << "error: " << response.errorMessage << "\n";
-          debugFile << "output_len: " << response.textOutput.size() << "\n";
-          debugFile << "=== text_output ===\n";
-          debugFile << response.textOutput << "\n";
-          debugFile << "=== payload json ===\n";
-          // Also dump what toJson produces so we can see the key name
-          debugFile << ai::model::toJson(response).dump(2) << "\n";
+      if (!selectedProvider.empty()) {
+        std::cerr << "[ULTRA-RUNTIME] provider_used=" << selectedProvider;
+        if (!providerEndpoint.empty()) {
+          std::cerr << " endpoint=" << providerEndpoint;
         }
+        std::cerr << "\n";
       }
 
       result.payload = buildModelExecutionJson(orchestrationContext,
                                                action.modelProvider,
                                                *action.modelRequest, response);
+      if (!selectedProvider.empty()) {
+        result.payload["selected_provider"] = selectedProvider;
+      }
+      if (!attemptedProviders.empty()) {
+        result.payload["attempted_providers"] = attemptedProviders;
+      }
+      if (!providerEndpoint.empty()) {
+        result.payload["provider_endpoint"] = providerEndpoint;
+      }
+      if (!result.text_output.empty()) {
+        result.payload["text_output"] = result.text_output;
+      }
       result.normalizedPaths = collectNormalizedPaths(result.payload);
       result.risk = response.ok ? RiskLevel::Low : RiskLevel::Medium;
       result.ok = response.ok;
@@ -1473,6 +1531,7 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
             {"ok", childResult.ok},
             {"payload", childResult.payload},
             {"risk", toString(childResult.risk)},
+            {"text_output", childResult.text_output},
             {"type", toString(contextAction.type)},
         });
         result.impactedNodes.insert(result.impactedNodes.end(),
@@ -1481,6 +1540,9 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
         result.normalizedPaths.insert(result.normalizedPaths.end(),
                                       childResult.normalizedPaths.begin(),
                                       childResult.normalizedPaths.end());
+        if (!childResult.text_output.empty()) {
+          result.text_output = childResult.text_output;
+        }
       }
 
       bool intentLoopFailed = false;
@@ -1497,6 +1559,7 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
             {"payload", childResult.payload},
             {"risk", toString(childResult.risk)},
             {"target", childAction.target},
+            {"text_output", childResult.text_output},
             {"type", toString(childAction.type)},
         });
         result.impactedNodes.insert(result.impactedNodes.end(),
@@ -1505,6 +1568,9 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
         result.normalizedPaths.insert(result.normalizedPaths.end(),
                                       childResult.normalizedPaths.begin(),
                                       childResult.normalizedPaths.end());
+        if (!childResult.text_output.empty()) {
+          result.text_output = childResult.text_output;
+        }
 
         // If a generative action failed, stop — do NOT fall through to next
         // (analysis/SimulateChange) action in the list.
@@ -1516,6 +1582,9 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
       }
 
       result.payload["child_results"] = std::move(childResults);
+      if (!result.text_output.empty()) {
+        result.payload["text_output"] = result.text_output;
+      }
 
       if (intentLoopFailed) {
         result.risk = RiskLevel::Medium;
@@ -1548,21 +1617,30 @@ Result ExecutionKernel::execute(const Action& action,
   } catch (...) {
   }
 
-  const auto recordOutcome = [&]() {
-    try {
-      stateManager_.cognitiveMemory().recordIntentExecution(
-          actionId, state.snapshot, result.ok, result.rolledBack, result.message);
-      stateManager_.cognitiveMemory().recordRiskEvaluation(
-          "execution:" + actionId, state.snapshot, action.riskScore,
-          result.ok ? 0.20 : 0.90, action.confidenceScore,
-          result.message.empty() ? toString(action.type) : result.message);
-      if (result.rolledBack) {
-        stateManager_.cognitiveMemory().recordMergeOutcome(
-            "rollback:" + actionId, state.snapshot, false, result.message);
-      }
-    } catch (...) {
-    }
-  };
+  const auto recordOutcome =
+      [stateManager = &stateManager_,
+       snapshot = state.snapshot,
+       actionId,
+       riskScore = action.riskScore,
+       confidenceScore = action.confidenceScore,
+       actionType = toString(action.type)](const Result& completedResult) {
+        try {
+          stateManager->cognitiveMemory().recordIntentExecution(
+              actionId, snapshot, completedResult.ok, completedResult.rolledBack,
+              completedResult.message);
+          stateManager->cognitiveMemory().recordRiskEvaluation(
+              "execution:" + actionId, snapshot, riskScore,
+              completedResult.ok ? 0.20 : 0.90, confidenceScore,
+              completedResult.message.empty() ? actionType
+                                              : completedResult.message);
+          if (completedResult.rolledBack) {
+            stateManager->cognitiveMemory().recordMergeOutcome(
+                "rollback:" + actionId, snapshot, false,
+                completedResult.message);
+          }
+        } catch (...) {
+        }
+      };
 
   try {
     validateAction(action, state);
@@ -1592,11 +1670,28 @@ Result ExecutionKernel::execute(const Action& action,
   }
 
   sortOutputs(result);
-  recordOutcome();
-  // Cache last successful result so CognitiveRuntime can extract model output.
+  // Cache the completed result before any background bookkeeping starts so the
+  // cognitive runtime can return model output immediately.
   if (result.ok) {
     lastResult_ = result;
     hasLastResult_ = true;
+  }
+  if (!result.text_output.empty()) {
+    std::cerr << "[ULTRA-DEBUG] Execution result text_output bytes="
+              << result.text_output.size() << "\n";
+  }
+
+  const bool offloadOutcomeRecording =
+      result.ok &&
+      (action.type == ActionType::IntentEvaluation ||
+       action.type == ActionType::ModelGenerate);
+  if (offloadOutcomeRecording) {
+    const Result resultForRecording = result;
+    std::thread([recordOutcome, resultForRecording]() {
+      recordOutcome(resultForRecording);
+    }).detach();
+  } else {
+    recordOutcome(result);
   }
   return result;
 }
@@ -1673,3 +1768,5 @@ bool ExecutionKernel::hasToolRouterLayer() const noexcept {
 }
 
 }  // namespace ultra::runtime
+
+

@@ -1,9 +1,11 @@
 #include "EpisodicMemory.h"
 //E:\Projects\Ultra\src\memory\EpisodicMemory.cpp
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <vector>
 
 namespace ultra::memory {
@@ -39,6 +41,20 @@ std::int64_t deterministicTimestampMs(const std::uint64_t version,
   return static_cast<std::int64_t>(value);
 }
 
+void appendIndexTokens(std::map<std::string, std::vector<std::size_t>>& index,
+                       const std::vector<std::string>& tokens,
+                       const std::size_t offset) {
+  for (const std::string& token : tokens) {
+    if (token.empty()) {
+      continue;
+    }
+    std::vector<std::size_t>& bucket = index[token];
+    if (bucket.empty() || bucket.back() != offset) {
+      bucket.push_back(offset);
+    }
+  }
+}
+
 }  // namespace
 
 EpisodicMemory::EpisodicMemory(const std::size_t retentionLimit)
@@ -59,6 +75,7 @@ void EpisodicMemory::recordEvent(const EpisodicEvent& event) {
   while (events_.size() > retentionLimit_) {
     events_.pop_front();
   }
+  rebuildIndexesLocked();
 }
 
 std::vector<EpisodicEvent> EpisodicMemory::getEventsForVersion(
@@ -73,11 +90,30 @@ std::vector<EpisodicEvent> EpisodicMemory::getEventsForVersion(
   return out;
 }
 
+std::vector<EpisodicEvent> EpisodicMemory::querySubject(
+    const std::string& key,
+    const std::size_t limit) const {
+  return queryIndexed(subjectIndex_, key, limit);
+}
+
+std::vector<EpisodicEvent> EpisodicMemory::queryFailures(
+    const std::string& errorType,
+    const std::size_t limit) const {
+  return queryIndexed(failureIndex_, errorType, limit);
+}
+
+std::vector<EpisodicEvent> EpisodicMemory::querySuccessfulPatterns(
+    const std::string& taskType,
+    const std::size_t limit) const {
+  return queryIndexed(successIndex_, taskType, limit);
+}
+
 void EpisodicMemory::pruneOlderThan(const std::uint64_t minVersionInclusive) {
   std::unique_lock lock(mutex_);
   while (!events_.empty() && events_.front().version < minVersionInclusive) {
     events_.pop_front();
   }
+  rebuildIndexesLocked();
 }
 
 std::vector<EpisodicEvent> EpisodicMemory::snapshot() const {
@@ -179,7 +215,136 @@ bool EpisodicMemory::loadFromFile(const std::filesystem::path& path) {
   for (const EpisodicEvent& event : events_) {
     nextSequence_ = std::max(nextSequence_, event.sequence + 1U);
   }
+  rebuildIndexesLocked();
   return true;
+}
+
+std::vector<std::string> EpisodicMemory::tokenizeKey(
+    const std::string_view value) {
+  std::set<std::string> tokens;
+  std::string current;
+
+  for (const char ch : value) {
+    const unsigned char uch = static_cast<unsigned char>(ch);
+    if (std::isalnum(uch) != 0) {
+      current.push_back(
+          static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+      continue;
+    }
+    if (!current.empty()) {
+      tokens.insert(current);
+      current.clear();
+    }
+  }
+  if (!current.empty()) {
+    tokens.insert(current);
+  }
+
+  return std::vector<std::string>(tokens.begin(), tokens.end());
+}
+
+bool EpisodicMemory::isFailureEvent(const EpisodicEvent& event) {
+  return event.type == EpisodicEventType::ExecutionFailure ||
+         event.type == EpisodicEventType::Rollback ||
+         event.type == EpisodicEventType::MergeRejected ||
+         (!event.success && event.type != EpisodicEventType::SnapshotBound);
+}
+
+bool EpisodicMemory::isSuccessfulPattern(const EpisodicEvent& event) {
+  return event.success && !event.rolledBack &&
+         (event.type == EpisodicEventType::ExecutionSuccess ||
+          event.type == EpisodicEventType::IntentEvaluation ||
+          event.type == EpisodicEventType::MergeSuccess);
+}
+
+std::vector<EpisodicEvent> EpisodicMemory::queryIndexed(
+    const std::map<std::string, std::vector<std::size_t>>& index,
+    const std::string& key,
+    const std::size_t limit) const {
+  const std::vector<std::string> tokens = tokenizeKey(key);
+  if (tokens.empty()) {
+    return {};
+  }
+
+  std::shared_lock lock(mutex_);
+  const std::vector<std::size_t>* smallest = nullptr;
+  std::vector<const std::vector<std::size_t>*> buckets;
+  buckets.reserve(tokens.size());
+
+  for (const std::string& token : tokens) {
+    const auto it = index.find(token);
+    if (it == index.end() || it->second.empty()) {
+      return {};
+    }
+    buckets.push_back(&it->second);
+    if (smallest == nullptr || it->second.size() < smallest->size()) {
+      smallest = &it->second;
+    }
+  }
+
+  if (smallest == nullptr) {
+    return {};
+  }
+
+  std::vector<std::size_t> matches = *smallest;
+  for (const std::vector<std::size_t>* bucket : buckets) {
+    if (bucket == smallest) {
+      continue;
+    }
+    std::vector<std::size_t> intersection;
+    intersection.reserve(std::min(matches.size(), bucket->size()));
+    std::set_intersection(matches.begin(), matches.end(),
+                          bucket->begin(), bucket->end(),
+                          std::back_inserter(intersection));
+    matches.swap(intersection);
+    if (matches.empty()) {
+      return {};
+    }
+  }
+
+  const std::size_t boundedLimit = std::max<std::size_t>(1U, limit);
+  std::vector<EpisodicEvent> out;
+  out.reserve(std::min(boundedLimit, matches.size()));
+  for (auto it = matches.rbegin();
+       it != matches.rend() && out.size() < boundedLimit;
+       ++it) {
+    if (*it < events_.size()) {
+      out.push_back(events_[*it]);
+    }
+  }
+  return out;
+}
+
+void EpisodicMemory::rebuildIndexesLocked() {
+  subjectIndex_.clear();
+  failureIndex_.clear();
+  successIndex_.clear();
+
+  for (std::size_t offset = 0U; offset < events_.size(); ++offset) {
+    const EpisodicEvent& event = events_[offset];
+    std::vector<std::string> subjectTokens = tokenizeKey(event.subject);
+    const std::vector<std::string> typeTokens = tokenizeKey(toString(event.type));
+    subjectTokens.insert(subjectTokens.end(), typeTokens.begin(), typeTokens.end());
+    appendIndexTokens(subjectIndex_, subjectTokens, offset);
+
+    if (isFailureEvent(event)) {
+      std::vector<std::string> failureTokens = subjectTokens;
+      const std::vector<std::string> messageTokens = tokenizeKey(event.message);
+      failureTokens.insert(failureTokens.end(),
+                           messageTokens.begin(),
+                           messageTokens.end());
+      appendIndexTokens(failureIndex_, failureTokens, offset);
+    }
+
+    if (isSuccessfulPattern(event)) {
+      std::vector<std::string> successTokens = subjectTokens;
+      const std::vector<std::string> messageTokens = tokenizeKey(event.message);
+      successTokens.insert(successTokens.end(),
+                           messageTokens.begin(),
+                           messageTokens.end());
+      appendIndexTokens(successIndex_, successTokens, offset);
+    }
+  }
 }
 
 const char* EpisodicMemory::toString(const EpisodicEventType type) {

@@ -349,7 +349,7 @@ bool BranchLifecycle::resume(const std::string& branchId) {
     return false;
   const bool wasOverlayResident = b.isOverlayResident;
 
-  activeGraph_->restore(snap);
+  *activeGraph_ = ultra::memory::StateGraph::fromSnapshot(snap);
 
   b.status = BranchState::Active;
   b.isOverlayResident = true;
@@ -437,7 +437,7 @@ bool BranchLifecycle::rollback(const std::string& branchId) {
   if (!chain_->rollback(snapId))
     return false;
 
-  activeGraph_->restore(snap);
+  *activeGraph_ = ultra::memory::StateGraph::fromSnapshot(snap);
   metrics::PerformanceMetrics::recordSnapshotReuse();
 
   b.status = BranchState::RolledBack;

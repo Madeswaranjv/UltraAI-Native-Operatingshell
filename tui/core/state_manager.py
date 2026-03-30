@@ -4,13 +4,18 @@ from enum import Enum, auto
 class AppState(Enum):
     IDLE = auto()
     THINKING = auto()
+    INITIALIZING = auto()
     PARSING_INTENT = auto()
     PLANNING = auto()
+    ARBITRATING = auto()
     MICRO_PLANNING = auto()
     GOVERNANCE_CHECK = auto()
     EXECUTING = auto()
+    REPAIRING = auto()
     VERIFYING = auto()
     REFLECTING = auto()
+    REANCHORING = auto()
+    REPLANNING = auto()
     COMPLETE = auto()
     ERROR = auto()
 
@@ -24,13 +29,18 @@ class UltraMode(Enum):
 STATE_LABELS = {
     AppState.IDLE:             "idle",
     AppState.THINKING:         "thinking",
+    AppState.INITIALIZING:     "initializing",
     AppState.PARSING_INTENT:   "parsing intent",
     AppState.PLANNING:         "planning",
+    AppState.ARBITRATING:      "arbitrating",
     AppState.MICRO_PLANNING:   "micro-planning",
     AppState.GOVERNANCE_CHECK: "governance check",
     AppState.EXECUTING:        "executing",
+    AppState.REPAIRING:        "repairing",
     AppState.VERIFYING:        "verifying",
     AppState.REFLECTING:       "reflecting",
+    AppState.REANCHORING:      "re-anchoring",
+    AppState.REPLANNING:       "replanning",
     AppState.COMPLETE:         "complete",
     AppState.ERROR:            "error",
 }
@@ -43,6 +53,8 @@ class StateManager:
         self._listeners = []
 
     def set_state(self, state: AppState) -> None:
+        if self.current_state == state:
+            return
         self.current_state = state
         for cb in self._listeners:
             cb(state)

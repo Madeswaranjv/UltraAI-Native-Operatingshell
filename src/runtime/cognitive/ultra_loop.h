@@ -16,12 +16,15 @@ namespace ultra::runtime::cognitive {
 enum class UltraLoopState : std::uint8_t {
   INIT = 0U,
   PLAN = 1U,
-  MICRO_PLAN = 2U,
-  EXECUTE = 3U,
-  VERIFY = 4U,
-  REFLECT = 5U,
-  REPLAN = 6U,
-  TERMINATE = 7U
+  ARBITRATION = 2U,
+  MICRO_PLAN = 3U,
+  EXECUTE = 4U,
+  PARTIAL_REPAIR = 5U,
+  VERIFY = 6U,
+  REFLECT = 7U,
+  RE_ANCHOR = 8U,
+  REPLAN = 9U,
+  TERMINATE = 10U
 };
 
 [[nodiscard]] const char* toString(UltraLoopState state) noexcept;
@@ -36,12 +39,38 @@ enum class StageSignal : std::uint8_t {
 
 [[nodiscard]] const char* toString(StageSignal signal) noexcept;
 
+struct RepairRecord {
+  std::size_t iteration{0U};
+  std::size_t attempt{0U};
+  std::string site;
+  std::vector<std::string> taskIds;
+  std::string decision;
+  std::string reason;
+};
+
+struct ArbitrationDecisionRecord {
+  std::size_t iteration{0U};
+  std::size_t candidateCount{0U};
+  std::size_t selectedCount{0U};
+  std::size_t conflictCount{0U};
+  std::vector<std::string> selectedTaskIds;
+  std::string reason;
+};
+
+struct IntentConsistencyRecord {
+  std::size_t iteration{0U};
+  bool consistent{true};
+  std::string planId;
+  std::string reason;
+};
+
 struct UltraLoopFrame {
   std::size_t iteration{0U};
   std::size_t retryCount{0U};
   bool failureDetected{false};
   bool verificationPassed{false};
   bool replanRequested{false};
+  bool reanchorRequested{false};
   const ::ultra::runtime::CognitiveState* cognitiveState{nullptr};
 
   std::string intentGoal;
@@ -57,6 +86,8 @@ struct UltraLoopFrame {
 
   bool hasStructuredIntent{false};
   ::ultra::runtime::intent::Intent structuredIntent{};
+  bool hasOriginalStructuredIntent{false};
+  ::ultra::runtime::intent::Intent originalStructuredIntent{};
 
   std::vector<TaskPayload> microTaskPayloads;
   bool hasTaskGraph{false};
@@ -65,9 +96,19 @@ struct UltraLoopFrame {
   ::ultra::runtime::Result executionResult{};
 
   std::string intentId;
+  std::string originalIntentId;
   std::string strategyId;
   std::string planId;
   std::string executionId;
+  std::string repairSite;
+  std::vector<std::string> repairTaskIds;
+  std::string repairDecision;
+  std::string repairReason;
+  bool intentConsistent{true};
+  std::string intentConsistencyReason;
+  std::vector<RepairRecord> repairLog;
+  std::vector<ArbitrationDecisionRecord> arbitrationLog;
+  std::vector<IntentConsistencyRecord> intentConsistencyLog;
 };
 
 struct StageResult {
@@ -85,6 +126,12 @@ class IIntentStage {
 class IStrategyStage {
  public:
   virtual ~IStrategyStage() = default;
+  virtual StageResult run(UltraLoopFrame& frame) = 0;
+};
+
+class IArbitrationStage {
+ public:
+  virtual ~IArbitrationStage() = default;
   virtual StageResult run(UltraLoopFrame& frame) = 0;
 };
 
@@ -118,6 +165,12 @@ class IReflectionStage {
   virtual StageResult run(UltraLoopFrame& frame) = 0;
 };
 
+class IReanchorStage {
+ public:
+  virtual ~IReanchorStage() = default;
+  virtual StageResult run(UltraLoopFrame& frame) = 0;
+};
+
 class IReplanningStage {
  public:
   virtual ~IReplanningStage() = default;
@@ -130,9 +183,23 @@ class IMemoryStage {
   virtual StageResult run(UltraLoopFrame& frame) = 0;
 };
 
+[[nodiscard]] IntentConsistencyRecord evaluateIntentConsistency(
+    const UltraLoopFrame& frame);
+
+class DeterministicArbitrationStage final : public IArbitrationStage {
+ public:
+  StageResult run(UltraLoopFrame& frame) override;
+};
+
+class DeterministicReanchorStage final : public IReanchorStage {
+ public:
+  StageResult run(UltraLoopFrame& frame) override;
+};
+
 struct UltraLoopBindings {
   IIntentStage* intent{nullptr};
   IStrategyStage* strategy{nullptr};
+  IArbitrationStage* arbitration{nullptr};
   IMicroPlanningStage* microPlanning{nullptr};
   MicroPlanner* microPlanner{nullptr};
   ::ultra::runtime::ExecutionKernel* executionKernel{nullptr};
@@ -140,6 +207,7 @@ struct UltraLoopBindings {
   IRecoveryStage* recovery{nullptr};
   IVerificationStage* verification{nullptr};
   IReflectionStage* reflection{nullptr};
+  IReanchorStage* reanchor{nullptr};
   IReplanningStage* replanning{nullptr};
   IMemoryStage* memory{nullptr};
 };
@@ -167,6 +235,9 @@ struct UltraLoopReport {
   std::size_t retries{0U};
   std::vector<std::string> missingLayers;
   std::vector<TransitionRecord> transitions;
+  std::vector<RepairRecord> repairs;
+  std::vector<ArbitrationDecisionRecord> arbitration;
+  std::vector<IntentConsistencyRecord> intentConsistency;
   std::string message;
 };
 
@@ -184,3 +255,4 @@ class UltraLoop {
 };
 
 }  // namespace ultra::runtime::cognitive
+

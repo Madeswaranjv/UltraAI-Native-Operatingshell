@@ -12,6 +12,8 @@ enum class DaemonEventType : std::uint8_t {
   FileRemoved = 2U,
   RebuildRequest = 3U,
   ShutdownRequest = 4U,
+  StructuralRebuild = 5U,
+  OverlayMutation = 6U,
 };
 
 struct DaemonEvent {

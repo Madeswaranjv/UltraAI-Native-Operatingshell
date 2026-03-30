@@ -36,6 +36,8 @@ bool toChangeEvent(const DaemonEvent& event, ChangeEvent& outEvent) {
       return true;
     case DaemonEventType::RebuildRequest:
     case DaemonEventType::ShutdownRequest:
+    case DaemonEventType::StructuralRebuild:
+    case DaemonEventType::OverlayMutation:
       return false;
   }
   return false;
@@ -45,6 +47,10 @@ bool toChangeEvent(const DaemonEvent& event, ChangeEvent& outEvent) {
 
 void ChangeQueue::push(ChangeEvent event) {
   controller_.enqueue(toDaemonEventType(event.type), std::move(event.path));
+}
+
+void ChangeQueue::postStructuralEvent(DaemonEventType type, std::string detail) {
+  controller_.enqueue(type, std::move(detail));
 }
 
 bool ChangeQueue::popFor(ChangeEvent& eventOut,

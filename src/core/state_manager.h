@@ -21,6 +21,12 @@
 #include <string>
 #include <vector>
 
+namespace ultra::runtime {
+
+class ChangeQueue;
+
+}  // namespace ultra::runtime
+
 namespace ultra::core {
 
 struct RuntimeStatusSnapshot {
@@ -110,6 +116,7 @@ class StateManager {
       const runtime::GraphSnapshot& expectedSnapshot,
       const WriteMutation& mutation);
   void ensureSnapshotCurrent(const runtime::GraphSnapshot& snapshot) const;
+  void setStructuralEventBus(runtime::ChangeQueue* bus) noexcept;
 
   [[nodiscard]] const std::filesystem::path& projectRoot() const noexcept;
 
@@ -127,10 +134,12 @@ class StateManager {
 
   std::filesystem::path projectRoot_;
   mutable std::shared_mutex graphMutex_;
-  std::shared_ptr<memory::StateGraph> graph_{std::make_shared<memory::StateGraph>()};
+  std::shared_ptr<const memory::StateGraph> graph_{
+      std::make_shared<const memory::StateGraph>()};
   std::uint64_t globalVersion_{0};
   runtime::BranchId activeBranch_{runtime::BranchId::nil()};
   runtime::DiffResult pendingDiffResult_;
+  runtime::ChangeQueue* structuralEventBus_{nullptr};
   ai::RuntimeState state_;
   engine::WeightEngine weightEngine_;
   memory::LruManager lruManager_;

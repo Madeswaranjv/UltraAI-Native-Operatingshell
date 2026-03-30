@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <sstream>
+#include <iostream>
 #include <utility>
 
 #include "../http/HttpTransport.h"
@@ -321,6 +322,9 @@ ModelResponse GeminiAdapter::translateResponse(
     return makeError(ModelErrorCode::InvalidResponse,
                      "Gemini parts parsing failed.", response.latencyMs);
   }
+
+  std::cerr << "[DEBUG] Gemini text_output size = "
+            << response.textOutput.size() << std::endl;
 
   if (providerResponse.contains("usageMetadata") &&
       providerResponse.at("usageMetadata").is_object()) {

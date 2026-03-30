@@ -104,6 +104,63 @@ TEST(MultiModelOrchestrator, RoutesPlanningToConfiguredReasoningProvider) {
   fs::remove_all(root, ec);
 }
 
+TEST(MultiModelOrchestrator, DefaultsCodingToOllamaWhenRoutingFileIsMissing) {
+  const fs::path root = fs::temp_directory_path() / "ultra_test" /
+                        "multi_model_orchestrator_default_coding";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  fs::create_directories(root / ".ultra", ec);
+  ASSERT_FALSE(ec);
+
+  writeFile(
+      root / ".ultra" / "models.json",
+      R"({
+  "providers": {
+    "gemini": {
+      "api_key": "test-key",
+      "mock_response": {
+        "candidates": [
+          {
+            "content": {
+              "parts": [
+                {
+                  "text": "cloud coding response"
+                }
+              ]
+            },
+            "finishReason": "STOP"
+          }
+        ]
+      }
+    },
+    "ollama": {
+      "endpoint": "http://localhost:11434",
+      "mock_response": {
+        "response": "local coding response",
+        "latency_ms": 4
+      }
+    }
+  }
+})");
+
+  ultra::ai::orchestration::MultiModelOrchestrator orchestrator(root);
+  ultra::ai::model::ModelRequest request;
+  request.prompt = "Generate code.";
+
+  ultra::ai::orchestration::OrchestrationContext context;
+  context.taskType = ultra::ai::orchestration::TaskType::Coding;
+  context.availableModels = {"gemini", "ollama"};
+
+  const ultra::ai::model::ModelResponse response =
+      orchestrator.generate(request, context);
+  ASSERT_TRUE(response.ok);
+  EXPECT_EQ(response.textOutput, "local coding response");
+  EXPECT_EQ(orchestrator.lastDecision().selectedProvider, "ollama");
+  ASSERT_FALSE(orchestrator.lastDecision().attemptedProviders.empty());
+  EXPECT_EQ(orchestrator.lastDecision().attemptedProviders.front(), "ollama");
+
+  fs::remove_all(root, ec);
+}
 TEST(MultiModelOrchestrator, FallsBackToLocalProviderDeterministically) {
   const fs::path root = fs::temp_directory_path() / "ultra_test" /
                         "multi_model_orchestrator_fallback";

@@ -4,6 +4,7 @@
 #include "Logger.h"
 #include "../memory/epoch/EpochManager.h"
 #include "../metrics/PerformanceMetrics.h"
+#include "../runtime/change_queue.h"
 #include "../runtime/CPUGovernor.h"
 
 #include <algorithm>
@@ -134,6 +135,158 @@ std::shared_ptr<memory::HotSlice> aliasHotSlice(memory::HotSlice& hotSlice) {
   return std::shared_ptr<memory::HotSlice>(&hotSlice, [](memory::HotSlice*) {});
 }
 
+struct SymbolGraphProjection {
+  memory::StateNode node;
+  std::string definedIn;
+  std::vector<std::string> usedIn;
+};
+
+memory::StateNode buildFileGraphNode(
+    const ai::FileRecord& file,
+    const engine::WeightEngine& weightEngine,
+    const std::map<std::string, std::size_t>& hotRankByPath,
+    const std::uint32_t snapshotNodeVersion) {
+  memory::StateNode node;
+  node.nodeId = fileNodeId(file.path);
+  node.nodeType = memory::NodeType::File;
+  node.version = snapshotNodeVersion;
+
+  const auto hotRankIt = hotRankByPath.find(file.path);
+  const bool isKnownHot =
+      hotRankIt != hotRankByPath.end() && hotRankIt->second < kHotWindow;
+
+  node.data["kind"] = "file";
+  node.data["path"] = file.path;
+  node.data["file_id"] = file.fileId;
+  node.data["hash"] = ai::hashToHex(file.hash);
+  node.data["weight"] = weightEngine.weightForPath(file.path);
+  node.data["hot_rank"] =
+      hotRankIt == hotRankByPath.end()
+          ? static_cast<long long>(-1)
+          : static_cast<long long>(hotRankIt->second);
+  node.data["is_hot"] = isKnownHot;
+  return node;
+}
+
+memory::StateEdge buildDependencyEdge(const std::string& fromPath,
+                                      const std::string& toPath) {
+  memory::StateEdge edge;
+  edge.edgeId = "dep:" + fromPath + "->" + toPath;
+  edge.sourceId = fileNodeId(fromPath);
+  edge.targetId = fileNodeId(toPath);
+  edge.edgeType = memory::EdgeType::DependsOn;
+  return edge;
+}
+
+memory::StateEdge buildDefinitionEdge(const std::string& symbolNodeIdValue,
+                                      const std::string& definedIn) {
+  memory::StateEdge edge;
+  edge.edgeId = "def:" + symbolNodeIdValue + "->" + fileNodeId(definedIn);
+  edge.sourceId = symbolNodeIdValue;
+  edge.targetId = fileNodeId(definedIn);
+  edge.edgeType = memory::EdgeType::Contains;
+  return edge;
+}
+
+memory::StateEdge buildUseEdge(const std::string& usedInPath,
+                               const std::string& symbolNodeIdValue) {
+  memory::StateEdge edge;
+  edge.edgeId = "use:" + fileNodeId(usedInPath) + "->" + symbolNodeIdValue;
+  edge.sourceId = fileNodeId(usedInPath);
+  edge.targetId = symbolNodeIdValue;
+  edge.edgeType = memory::EdgeType::DependsOn;
+  return edge;
+}
+
+std::map<std::string, std::size_t> buildHotRankByPath(
+    const memory::LruManager& lruManager) {
+  std::map<std::string, std::size_t> hotRankByPath;
+  const std::vector<std::string> lruOrder = lruManager.snapshot();
+  for (std::size_t index = 0U; index < lruOrder.size(); ++index) {
+    hotRankByPath.emplace(lruOrder[index], index);
+  }
+  return hotRankByPath;
+}
+
+std::map<std::string, ai::FileRecord> buildFileByPath(
+    const ai::RuntimeState& state) {
+  std::map<std::string, ai::FileRecord> fileByPath;
+  for (const ai::FileRecord& file : state.files) {
+    fileByPath[file.path] = file;
+  }
+  return fileByPath;
+}
+
+std::set<std::string> collectKnownPaths(const ai::RuntimeState& state) {
+  std::set<std::string> knownPaths;
+  for (const ai::FileRecord& file : state.files) {
+    knownPaths.insert(file.path);
+  }
+  return knownPaths;
+}
+
+std::map<std::uint64_t, std::pair<std::string, ai::SymbolNode>> buildSymbolGraphIndex(
+    const ai::RuntimeState& state) {
+  std::map<std::string, std::uint64_t> symbolIdByName;
+  for (const ai::SymbolRecord& symbol : state.symbols) {
+    const auto symbolIt = symbolIdByName.find(symbol.name);
+    if (symbolIt == symbolIdByName.end() || symbol.symbolId < symbolIt->second) {
+      symbolIdByName[symbol.name] = symbol.symbolId;
+    }
+  }
+
+  std::vector<std::string> symbolNames;
+  symbolNames.reserve(state.symbolIndex.size());
+  for (const auto& [name, symbolNode] : state.symbolIndex) {
+    (void)symbolNode;
+    symbolNames.push_back(name);
+  }
+  std::sort(symbolNames.begin(), symbolNames.end());
+
+  std::map<std::uint64_t, std::pair<std::string, ai::SymbolNode>> symbolById;
+  for (const std::string& name : symbolNames) {
+    const ai::SymbolNode& symbolNode = state.symbolIndex.at(name);
+    const auto idIt = symbolIdByName.find(name);
+    const std::uint64_t symbolId =
+        idIt == symbolIdByName.end() ? deterministicFallbackSymbolId(name)
+                                     : idIt->second;
+    symbolById[symbolId] = {name, symbolNode};
+  }
+  return symbolById;
+}
+
+SymbolGraphProjection buildSymbolGraphNode(
+    const std::uint64_t symbolId,
+    const std::string& fallbackName,
+    const ai::SymbolNode& symbolNode,
+    const engine::WeightEngine& weightEngine,
+    const std::uint32_t snapshotNodeVersion) {
+  SymbolGraphProjection projection;
+  projection.node.nodeId = symbolNodeId(symbolId);
+  projection.node.nodeType = memory::NodeType::Symbol;
+  projection.node.version = snapshotNodeVersion;
+  projection.definedIn = symbolNode.definedIn;
+  projection.usedIn = sortedUsedIn(symbolNode.usedInFiles);
+
+  const double symbolWeight =
+      projection.definedIn.empty() ? symbolNode.weight
+                                   : weightEngine.weightForPath(projection.definedIn);
+
+  projection.node.data["kind"] = "symbol";
+  projection.node.data["symbol_id"] = symbolId;
+  projection.node.data["name"] =
+      symbolNode.name.empty() ? fallbackName : symbolNode.name;
+  projection.node.data["defined_in"] = projection.definedIn;
+  projection.node.data["used_in"] = projection.usedIn;
+  projection.node.data["usage_count"] = projection.usedIn.size();
+  projection.node.data["weight"] = symbolWeight;
+  projection.node.data["centrality"] = symbolNode.centrality;
+  projection.node.data["is_hot"] = false;
+  projection.node.data["hot_version"] = 0ULL;
+  projection.node.data["impact_frequency"] = 0U;
+  return projection;
+}
+
 }  // namespace
 
 StateManager::StateManager(const std::filesystem::path& projectRoot)
@@ -144,6 +297,10 @@ StateManager::StateManager(const std::filesystem::path& projectRoot)
 
 const std::filesystem::path& StateManager::projectRoot() const noexcept {
   return projectRoot_;
+}
+
+void StateManager::setStructuralEventBus(runtime::ChangeQueue* bus) noexcept {
+  structuralEventBus_ = bus;
 }
 
 std::size_t StateManager::clampTokenBudget(const std::size_t tokenBudget) {
@@ -167,6 +324,11 @@ void StateManager::runMemoryGovernanceLocked(const bool heavyMutation) {
 }
 
 void StateManager::replaceState(ai::RuntimeState state) {
+  if (structuralEventBus_ != nullptr) {
+    structuralEventBus_->postStructuralEvent(
+        runtime::DaemonEventType::StructuralRebuild,
+        "state_manager::replace_state");
+  }
   std::unique_lock lock(graphMutex_);
   state_ = std::move(state);
   weightEngine_.rebuildFromState(state_);
@@ -429,6 +591,11 @@ void StateManager::ensureSnapshotCurrent(
 KernelMutationOutcome StateManager::applyOverlayMutation(
     const runtime::GraphSnapshot& expectedSnapshot,
     const WriteMutation& mutation) {
+  if (structuralEventBus_ != nullptr) {
+    structuralEventBus_->postStructuralEvent(
+        runtime::DaemonEventType::OverlayMutation,
+        "state_manager::apply_overlay_mutation");
+  }
   if (!mutation) {
     return KernelMutationOutcome{
         false, false, 0U, 0U, {}, {}, "Overlay mutation callback is empty."};
@@ -484,11 +651,14 @@ KernelMutationOutcome StateManager::applyOverlayMutation(
   const HotSliceSnapshot previousHotSlice =
       snapshotHotSlice(cognitiveMemoryManager_.working);
   const memory::SnapshotChain previousSnapshotChain = snapshotChain_;
-  const std::shared_ptr<memory::StateGraph> previousGraph =
-      graph_ ? std::make_shared<memory::StateGraph>(*graph_) : nullptr;
+  const std::shared_ptr<const memory::StateGraph> previousGraph = graph_;
   const runtime::DiffResult previousDiffResult = pendingDiffResult_;
   const std::uint64_t previousVersion = globalVersion_;
   const runtime::BranchId previousBranch = activeBranch_;
+
+  ai::RuntimeState workingState = previousState;
+  engine::WeightEngine workingWeightEngine = previousWeightEngine;
+  memory::LruManager workingLru = previousLru;
 
   const auto rollback = [&]() {
     state_ = previousState;
@@ -507,16 +677,25 @@ KernelMutationOutcome StateManager::applyOverlayMutation(
     outcome.hashAfter = graph_ ? graph_->getDeterministicHash() : std::string{};
   };
 
-  const bool mutationApplied = mutation(state_, weightEngine_, lruManager_);
+  const bool mutationApplied =
+      mutation(workingState, workingWeightEngine, workingLru);
   if (!mutationApplied) {
-    rollback();
+    outcome.applied = false;
+    outcome.rolledBack = false;
+    outcome.hashAfter = outcome.hashBefore;
     outcome.message = "Overlay mutation was rejected.";
     return outcome;
   }
 
   const runtime::DiffResult diffResult = runtime::buildDiffResult(
-      previousState, state_, &cognitiveMemoryManager_.semantic, globalVersion_ + 1U);
-  const runtime::StructuralChangeType changeType = runtime::classifyChange(diffResult);
+      previousState, workingState, &cognitiveMemoryManager_.semantic,
+      globalVersion_ + 1U);
+  const runtime::StructuralChangeType changeType =
+      runtime::classifyChange(diffResult);
+
+  state_ = std::move(workingState);
+  weightEngine_ = std::move(workingWeightEngine);
+  lruManager_ = std::move(workingLru);
   pendingDiffResult_ = diffResult;
   ++globalVersion_;
   applyPrecisionInvalidation(changeType, diffResult.affectedSymbols);
@@ -554,7 +733,8 @@ KernelMutationOutcome StateManager::applyOverlayMutation(
         "diff_risk:overlay_mutation", failedSnapshot,
         diffResult.delta.riskScore.overallRisk, 1.00, 0.10,
         "hash_integrity_failure");
-    outcome.message = "Overlay hash integrity verification failed; mutation rolled back.";
+    outcome.message =
+        "Overlay hash integrity verification failed; mutation rolled back.";
     return outcome;
   }
 
@@ -609,8 +789,8 @@ KernelMutationOutcome StateManager::applyOverlayMutation(
         continue;
       }
       cognitiveMemoryManager_.updateSemanticEvolution(
-          symbolNodeId(symbolId), symbolIt->second.name, symbolIt->second.signature,
-          "signature_change", globalVersion_);
+          symbolNodeId(symbolId), symbolIt->second.name,
+          symbolIt->second.signature, "signature_change", globalVersion_);
     }
   }
 
@@ -666,313 +846,223 @@ void StateManager::applyPrecisionInvalidation(
     return;
   }
 
+  const auto parentSnapshot = graph_;
   const std::uint32_t snapshotNodeVersion =
       static_cast<std::uint32_t>(globalVersion_ & 0xFFFFFFFFULL);
+  const auto symbolById = buildSymbolGraphIndex(state_);
+  const std::set<std::string> knownPaths = collectKnownPaths(state_);
+  const std::map<std::string, ai::FileRecord> fileByPath = buildFileByPath(state_);
+  const std::map<std::string, std::size_t> hotRankByPath =
+      buildHotRankByPath(lruManager_);
 
-  std::map<std::string, std::uint64_t> symbolIdByName;
-  for (const ai::SymbolRecord& symbol : state_.symbols) {
-    const auto symbolIt = symbolIdByName.find(symbol.name);
-    if (symbolIt == symbolIdByName.end() || symbol.symbolId < symbolIt->second) {
-      symbolIdByName[symbol.name] = symbol.symbolId;
+  memory::GraphOverlay overlay;
+  overlay.parentSnapshot = parentSnapshot;
+
+  const auto upsertNode = [&](const memory::StateNode& node) {
+    const memory::StateNode previous = parentSnapshot->getNode(node.nodeId);
+    if (previous.nodeId.empty()) {
+      overlay.addedNodes[node.nodeId] = node;
+      overlay.modifiedNodes.erase(node.nodeId);
+      overlay.removedNodes.erase(node.nodeId);
+      return;
     }
-  }
+    if (!(previous == node)) {
+      overlay.modifiedNodes[node.nodeId] = node;
+      overlay.addedNodes.erase(node.nodeId);
+      overlay.removedNodes.erase(node.nodeId);
+    }
+  };
 
-  std::map<std::uint64_t, std::pair<std::string, ai::SymbolNode>> symbolById;
-  std::vector<std::string> symbolNames;
-  symbolNames.reserve(state_.symbolIndex.size());
-  for (const auto& [name, symbolNode] : state_.symbolIndex) {
-    (void)symbolNode;
-    symbolNames.push_back(name);
-  }
-  std::sort(symbolNames.begin(), symbolNames.end());
-  for (const std::string& name : symbolNames) {
-    const ai::SymbolNode& symbolNode = state_.symbolIndex.at(name);
-    const auto idIt = symbolIdByName.find(name);
-    const std::uint64_t symbolId =
-        idIt == symbolIdByName.end() ? deterministicFallbackSymbolId(name)
-                                     : idIt->second;
-    symbolById[symbolId] = {name, symbolNode};
-  }
+  const auto removeNode = [&](const std::string& nodeId) {
+    const memory::StateNode previous = parentSnapshot->getNode(nodeId);
+    overlay.addedNodes.erase(nodeId);
+    overlay.modifiedNodes.erase(nodeId);
+    if (!previous.nodeId.empty()) {
+      overlay.removedNodes.insert(nodeId);
+    }
+  };
 
-  std::set<std::string> knownPaths;
-  for (const ai::FileRecord& file : state_.files) {
-    knownPaths.insert(file.path);
-  }
+  const auto upsertEdge = [&](const memory::StateEdge& edge) {
+    const memory::StateEdge previous = parentSnapshot->getEdge(edge.edgeId);
+    if (previous.edgeId.empty()) {
+      overlay.addedEdges[edge.edgeId] = edge;
+      overlay.modifiedEdges.erase(edge.edgeId);
+      overlay.removedEdges.erase(edge.edgeId);
+      return;
+    }
+    if (!(previous == edge)) {
+      overlay.modifiedEdges[edge.edgeId] = edge;
+      overlay.addedEdges.erase(edge.edgeId);
+      overlay.removedEdges.erase(edge.edgeId);
+    }
+  };
 
-  std::map<std::string, ai::FileRecord> fileByPath;
-  for (const ai::FileRecord& file : state_.files) {
-    fileByPath[file.path] = file;
-  }
+  const auto removeEdge = [&](const std::string& edgeId) {
+    const memory::StateEdge previous = parentSnapshot->getEdge(edgeId);
+    overlay.addedEdges.erase(edgeId);
+    overlay.modifiedEdges.erase(edgeId);
+    if (!previous.edgeId.empty()) {
+      overlay.removedEdges.insert(edgeId);
+    }
+  };
 
-  const std::vector<std::string> lruOrder = lruManager_.snapshot();
-  std::map<std::string, std::size_t> hotRankByPath;
-  for (std::size_t index = 0U; index < lruOrder.size(); ++index) {
-    hotRankByPath.emplace(lruOrder[index], index);
-  }
-
-  const auto refreshChangedFiles = [&](memory::StateGraph& targetGraph) {
-    for (const std::string& changedPath : pendingDiffResult_.changedFiles) {
-      const auto fileIt = fileByPath.find(changedPath);
-      if (fileIt == fileByPath.end()) {
-        targetGraph.removeNode(fileNodeId(changedPath));
+  const auto removeEdgesTouchingNode = [&](const std::string& nodeId) {
+    for (auto it = overlay.addedEdges.begin(); it != overlay.addedEdges.end();) {
+      if (it->second.sourceId == nodeId || it->second.targetId == nodeId) {
+        it = overlay.addedEdges.erase(it);
         continue;
       }
-
-      const ai::FileRecord& file = fileIt->second;
-      const std::string nodeId = fileNodeId(file.path);
-      memory::StateNode node = targetGraph.getNode(nodeId);
-      if (node.nodeId.empty()) {
-        node.nodeId = nodeId;
-        node.nodeType = memory::NodeType::File;
-      }
-      node.version = snapshotNodeVersion;
-
-      const auto hotRankIt = hotRankByPath.find(file.path);
-      const bool isKnownHot =
-          hotRankIt != hotRankByPath.end() && hotRankIt->second < kHotWindow;
-
-      node.data["kind"] = "file";
-      node.data["path"] = file.path;
-      node.data["file_id"] = file.fileId;
-      node.data["hash"] = ai::hashToHex(file.hash);
-      node.data["weight"] = weightEngine_.weightForPath(file.path);
-      node.data["hot_rank"] =
-          hotRankIt == hotRankByPath.end()
-              ? static_cast<long long>(-1)
-              : static_cast<long long>(hotRankIt->second);
-      node.data["is_hot"] = isKnownHot;
-      targetGraph.addNode(node);
+      ++it;
     }
-  };
-
-  const auto removeUseEdgesToSymbol = [](memory::StateGraph& targetGraph,
-                                         const std::string& symbolNodeIdValue) {
-    for (const memory::StateNode& fileNode :
-         targetGraph.queryByType(memory::NodeType::File)) {
-      const std::vector<memory::StateEdge> outbound =
-          targetGraph.getOutboundEdges(fileNode.nodeId);
-      for (const memory::StateEdge& edge : outbound) {
-        if (edge.targetId != symbolNodeIdValue) {
-          continue;
-        }
-        if (edge.edgeId.rfind("use:", 0U) != 0U) {
-          continue;
-        }
-        targetGraph.removeEdge(edge.edgeId);
+    for (auto it = overlay.modifiedEdges.begin();
+         it != overlay.modifiedEdges.end();) {
+      if (it->second.sourceId == nodeId || it->second.targetId == nodeId) {
+        it = overlay.modifiedEdges.erase(it);
+        continue;
       }
-    }
-  };
-
-  switch (changeType) {
-    case runtime::StructuralChangeType::BODY_CHANGE: {
-      std::set<runtime::SymbolID> staleIds(sortedAffected.begin(),
-                                           sortedAffected.end());
-      invalidateSymbols(staleIds);
-      if (!pendingDiffResult_.changedFiles.empty()) {
-        auto workingGraph = std::make_shared<memory::StateGraph>(*graph_);
-        refreshChangedFiles(*workingGraph);
-        replaceSharedPtr(graph_, std::move(workingGraph));
-      }
-      return;
+      ++it;
     }
 
-    case runtime::StructuralChangeType::API_REMOVAL: {
-      std::set<runtime::SymbolID> staleIds(sortedAffected.begin(),
-                                           sortedAffected.end());
-      invalidateSymbols(staleIds);
-      for (const runtime::SymbolID symbolId : staleIds) {
-        graph_->removeNode(symbolNodeId(symbolId));
-      }
-      rebuildGraphLocked();
-      return;
-    }
-
-    case runtime::StructuralChangeType::SYMBOL_RENAME: {
-      auto workingGraph = std::make_shared<memory::StateGraph>(*graph_);
-      for (const auto& [symbolId, renamedTo] : pendingDiffResult_.renamedSymbols) {
-        if (symbolId == 0ULL || renamedTo.empty()) {
-          continue;
-        }
-        const std::string nodeId = symbolNodeId(symbolId);
-        memory::StateNode node = workingGraph->getNode(nodeId);
-        if (node.nodeId.empty()) {
-          continue;
-        }
-        node.version = snapshotNodeVersion;
-        node.data["name"] = renamedTo;
-        workingGraph->addNode(node);
-        cognitiveMemoryManager_.working.storeNode(node, globalVersion_);
-      }
-      refreshChangedFiles(*workingGraph);
-      replaceSharedPtr(graph_, std::move(workingGraph));
-      return;
-    }
-
-    case runtime::StructuralChangeType::SIGNATURE_CHANGE: {
-      auto workingGraph = std::make_shared<memory::StateGraph>(*graph_);
-      std::set<runtime::SymbolID> staleIds(sortedAffected.begin(),
-                                           sortedAffected.end());
-
-      for (const runtime::SymbolID symbolId : sortedAffected) {
-        const auto symbolIt = symbolById.find(symbolId);
-        const std::string nodeId = symbolNodeId(symbolId);
-        if (symbolIt == symbolById.end()) {
-          workingGraph->removeNode(nodeId);
-          continue;
-        }
-
-        const std::string& symbolName = symbolIt->second.first;
-        const ai::SymbolNode& symbolNode = symbolIt->second.second;
-        const std::string definedIn = symbolNode.definedIn;
-        const std::vector<std::string> usedIn =
-            sortedUsedIn(symbolNode.usedInFiles);
-        const double weight = definedIn.empty() ? symbolNode.weight
-                                                : weightEngine_.weightForPath(definedIn);
-
-        memory::StateNode graphNode = workingGraph->getNode(nodeId);
-        if (graphNode.nodeId.empty()) {
-          graphNode.nodeId = nodeId;
-          graphNode.nodeType = memory::NodeType::Symbol;
-        }
-        graphNode.version = snapshotNodeVersion;
-        graphNode.data["kind"] = "symbol";
-        graphNode.data["symbol_id"] = symbolId;
-        graphNode.data["name"] = symbolName;
-        graphNode.data["defined_in"] = definedIn;
-        graphNode.data["used_in"] = usedIn;
-        graphNode.data["usage_count"] = usedIn.size();
-        graphNode.data["weight"] = weight;
-        graphNode.data["centrality"] = symbolNode.centrality;
-        graphNode.data["is_hot"] = false;
-        graphNode.data["hot_version"] = 0ULL;
-        workingGraph->addNode(graphNode);
-        cognitiveMemoryManager_.working.storeNode(graphNode, globalVersion_);
-
-        const std::vector<memory::StateEdge> outbound =
-            workingGraph->getOutboundEdges(nodeId);
-        for (const memory::StateEdge& edge : outbound) {
-          workingGraph->removeEdge(edge.edgeId);
-        }
-        if (!definedIn.empty() && knownPaths.find(definedIn) != knownPaths.end()) {
-          memory::StateEdge defEdge;
-          defEdge.edgeId = "def:" + nodeId + "->" + fileNodeId(definedIn);
-          defEdge.sourceId = nodeId;
-          defEdge.targetId = fileNodeId(definedIn);
-          defEdge.edgeType = memory::EdgeType::Contains;
-          workingGraph->addEdge(defEdge);
-        }
-
-        removeUseEdgesToSymbol(*workingGraph, nodeId);
-        for (const std::string& usedInPath : usedIn) {
-          if (knownPaths.find(usedInPath) == knownPaths.end()) {
-            continue;
-          }
-          memory::StateEdge useEdge;
-          useEdge.edgeId = "use:" + fileNodeId(usedInPath) + "->" + nodeId;
-          useEdge.sourceId = fileNodeId(usedInPath);
-          useEdge.targetId = nodeId;
-          useEdge.edgeType = memory::EdgeType::DependsOn;
-          workingGraph->addEdge(useEdge);
-        }
-
-        runtime::GraphSnapshot snapshot;
-        snapshot.graph = workingGraph;
-        snapshot.version = globalVersion_;
-        snapshot.branch = activeBranch_;
-        const std::vector<runtime::SymbolID> impacted =
-            runtime::computeImpactDepthLimited(snapshot, symbolId, 2U);
-        staleIds.insert(impacted.begin(), impacted.end());
-      }
-
-      invalidateSymbols(staleIds);
-      refreshChangedFiles(*workingGraph);
-      replaceSharedPtr(graph_, std::move(workingGraph));
-      return;
-    }
-
-    case runtime::StructuralChangeType::DEPENDENCY_CHANGE: {
-      auto workingGraph = std::make_shared<memory::StateGraph>(*graph_);
-      std::set<std::string> impactedFiles;
-      for (const auto& [fromPath, toPath] : pendingDiffResult_.removedDependencyEdges) {
-        impactedFiles.insert(fromPath);
-        impactedFiles.insert(toPath);
-        workingGraph->removeEdge("dep:" + fromPath + "->" + toPath);
-      }
-      for (const auto& [fromPath, toPath] : pendingDiffResult_.addedDependencyEdges) {
-        impactedFiles.insert(fromPath);
-        impactedFiles.insert(toPath);
-        memory::StateEdge edge;
-        edge.edgeId = "dep:" + fromPath + "->" + toPath;
-        edge.sourceId = fileNodeId(fromPath);
-        edge.targetId = fileNodeId(toPath);
-        edge.edgeType = memory::EdgeType::DependsOn;
-        workingGraph->addEdge(edge);
-      }
-
-      std::set<std::string> centralityRegion = impactedFiles;
-      std::map<std::uint32_t, std::string> pathByFileId;
-      for (const ai::FileRecord& file : state_.files) {
-        pathByFileId[file.fileId] = file.path;
-      }
-      for (const ai::FileDependencyEdge& edge : state_.deps.fileEdges) {
-        const auto fromIt = pathByFileId.find(edge.fromFileId);
-        const auto toIt = pathByFileId.find(edge.toFileId);
-        if (fromIt == pathByFileId.end() || toIt == pathByFileId.end()) {
-          continue;
-        }
-        if (impactedFiles.find(fromIt->second) == impactedFiles.end() &&
-            impactedFiles.find(toIt->second) == impactedFiles.end()) {
-          continue;
-        }
-        centralityRegion.insert(fromIt->second);
-        centralityRegion.insert(toIt->second);
-      }
-
-      std::set<runtime::SymbolID> staleIds;
-      for (const auto& [symbolId, symbolPair] : symbolById) {
-        const ai::SymbolNode& symbolNode = symbolPair.second;
-        bool inRegion =
-            !symbolNode.definedIn.empty() &&
-            centralityRegion.find(symbolNode.definedIn) != centralityRegion.end();
-        if (!inRegion) {
-          for (const std::string& path : symbolNode.usedInFiles) {
-            if (centralityRegion.find(path) != centralityRegion.end()) {
-              inRegion = true;
-              break;
+    const auto removeOutboundFromNodes =
+        [&](const std::vector<memory::StateNode>& nodes) {
+          for (const memory::StateNode& sourceNode : nodes) {
+            for (const memory::StateEdge& edge :
+                 parentSnapshot->getOutboundEdges(sourceNode.nodeId)) {
+              if (edge.sourceId == nodeId || edge.targetId == nodeId) {
+                removeEdge(edge.edgeId);
+              }
             }
           }
-        }
-        if (!inRegion) {
-          continue;
-        }
+        };
 
-        const std::string nodeId = symbolNodeId(symbolId);
-        memory::StateNode graphNode = workingGraph->getNode(nodeId);
-        if (graphNode.nodeId.empty()) {
-          continue;
-        }
-        graphNode.version = snapshotNodeVersion;
-        graphNode.data["centrality"] = symbolNode.centrality;
-        graphNode.data["weight"] = symbolNode.definedIn.empty()
-                                       ? symbolNode.weight
-                                       : weightEngine_.weightForPath(symbolNode.definedIn);
-        graphNode.data["usage_count"] = symbolNode.usedInFiles.size();
-        graphNode.data["used_in"] = sortedUsedIn(symbolNode.usedInFiles);
-        workingGraph->addNode(graphNode);
-        cognitiveMemoryManager_.working.storeNode(graphNode, globalVersion_);
-        staleIds.insert(symbolId);
-      }
+    removeOutboundFromNodes(parentSnapshot->queryByType(memory::NodeType::File));
+    removeOutboundFromNodes(parentSnapshot->queryByType(memory::NodeType::Symbol));
+  };
 
-      invalidateSymbols(staleIds);
-      refreshChangedFiles(*workingGraph);
-      replaceSharedPtr(graph_, std::move(workingGraph));
+  const auto syncFileNode = [&](const std::string& filePath) {
+    const auto fileIt = fileByPath.find(filePath);
+    if (fileIt == fileByPath.end()) {
+      removeEdgesTouchingNode(fileNodeId(filePath));
+      removeNode(fileNodeId(filePath));
       return;
     }
+
+    upsertNode(buildFileGraphNode(fileIt->second, weightEngine_, hotRankByPath,
+                                  snapshotNodeVersion));
+  };
+
+  const auto syncSymbolNode = [&](const runtime::SymbolID symbolId) {
+    const auto symbolIt = symbolById.find(symbolId);
+    const std::string nodeId = symbolNodeId(symbolId);
+    if (symbolIt == symbolById.end()) {
+      removeEdgesTouchingNode(nodeId);
+      removeNode(nodeId);
+      return;
+    }
+
+    const SymbolGraphProjection projection = buildSymbolGraphNode(
+        symbolId, symbolIt->second.first, symbolIt->second.second, weightEngine_,
+        snapshotNodeVersion);
+    upsertNode(projection.node);
+    cognitiveMemoryManager_.working.storeNode(projection.node, globalVersion_);
+
+    removeEdgesTouchingNode(nodeId);
+    if (!projection.definedIn.empty() &&
+        knownPaths.find(projection.definedIn) != knownPaths.end()) {
+      upsertEdge(buildDefinitionEdge(nodeId, projection.definedIn));
+    }
+    for (const std::string& usedInPath : projection.usedIn) {
+      if (knownPaths.find(usedInPath) == knownPaths.end()) {
+        continue;
+      }
+      upsertEdge(buildUseEdge(usedInPath, nodeId));
+    }
+  };
+
+  for (const auto& [fromPath, toPath] : pendingDiffResult_.removedDependencyEdges) {
+    removeEdge(buildDependencyEdge(fromPath, toPath).edgeId);
   }
+  for (const auto& [fromPath, toPath] : pendingDiffResult_.addedDependencyEdges) {
+    upsertEdge(buildDependencyEdge(fromPath, toPath));
+  }
+
+  std::set<runtime::SymbolID> staleIds(sortedAffected.begin(),
+                                       sortedAffected.end());
+  std::set<runtime::SymbolID> symbolsToSync;
+  if (changeType != runtime::StructuralChangeType::BODY_CHANGE) {
+    symbolsToSync.insert(sortedAffected.begin(), sortedAffected.end());
+  }
+
+  if (!pendingDiffResult_.addedDependencyEdges.empty() ||
+      !pendingDiffResult_.removedDependencyEdges.empty()) {
+    std::set<std::string> impactedFiles;
+    for (const auto& [fromPath, toPath] : pendingDiffResult_.addedDependencyEdges) {
+      impactedFiles.insert(fromPath);
+      impactedFiles.insert(toPath);
+    }
+    for (const auto& [fromPath, toPath] :
+         pendingDiffResult_.removedDependencyEdges) {
+      impactedFiles.insert(fromPath);
+      impactedFiles.insert(toPath);
+    }
+
+    std::map<std::uint32_t, std::string> pathByFileId;
+    for (const ai::FileRecord& file : state_.files) {
+      pathByFileId[file.fileId] = file.path;
+    }
+
+    std::set<std::string> centralityRegion = impactedFiles;
+    for (const ai::FileDependencyEdge& edge : state_.deps.fileEdges) {
+      const auto fromIt = pathByFileId.find(edge.fromFileId);
+      const auto toIt = pathByFileId.find(edge.toFileId);
+      if (fromIt == pathByFileId.end() || toIt == pathByFileId.end()) {
+        continue;
+      }
+      if (impactedFiles.find(fromIt->second) == impactedFiles.end() &&
+          impactedFiles.find(toIt->second) == impactedFiles.end()) {
+        continue;
+      }
+      centralityRegion.insert(fromIt->second);
+      centralityRegion.insert(toIt->second);
+    }
+
+    for (const auto& [symbolId, symbolPair] : symbolById) {
+      const ai::SymbolNode& symbolNode = symbolPair.second;
+      bool inRegion =
+          !symbolNode.definedIn.empty() &&
+          centralityRegion.find(symbolNode.definedIn) != centralityRegion.end();
+      if (!inRegion) {
+        for (const std::string& path : symbolNode.usedInFiles) {
+          if (centralityRegion.find(path) != centralityRegion.end()) {
+            inRegion = true;
+            break;
+          }
+        }
+      }
+      if (!inRegion) {
+        continue;
+      }
+      staleIds.insert(symbolId);
+      symbolsToSync.insert(symbolId);
+    }
+  }
+
+  invalidateSymbols(staleIds);
+
+  for (const std::string& changedPath : pendingDiffResult_.changedFiles) {
+    syncFileNode(changedPath);
+  }
+  for (const runtime::SymbolID symbolId : symbolsToSync) {
+    syncSymbolNode(symbolId);
+  }
+
+  replaceSharedPtr(
+      graph_,
+      memory::StateGraph::createOverlaySnapshot(parentSnapshot, std::move(overlay)));
 }
 
 void StateManager::rebuildGraphLocked() {
-  auto newGraph = std::make_shared<memory::StateGraph>();
+  memory::StateGraphBuilder builder;
   const std::uint32_t snapshotNodeVersion =
       static_cast<std::uint32_t>(globalVersion_ & 0xFFFFFFFFULL);
 
@@ -986,59 +1076,21 @@ void StateManager::rebuildGraphLocked() {
             });
 
   std::map<std::uint32_t, std::string> pathByFileId;
-  std::set<std::string> knownPaths;
-  pathByFileId.clear();
+  const std::set<std::string> knownPaths = collectKnownPaths(state_);
   for (const ai::FileRecord& file : files) {
     pathByFileId[file.fileId] = file.path;
-    knownPaths.insert(file.path);
   }
 
   const std::vector<std::string> lruOrder = lruManager_.snapshot();
-  std::map<std::string, std::size_t> hotRankByPath;
-  for (std::size_t index = 0U; index < lruOrder.size(); ++index) {
-    hotRankByPath.emplace(lruOrder[index], index);
-  }
+  const std::map<std::string, std::size_t> hotRankByPath =
+      buildHotRankByPath(lruManager_);
 
   for (const ai::FileRecord& file : files) {
-    memory::StateNode node;
-    node.nodeId = fileNodeId(file.path);
-    node.nodeType = memory::NodeType::File;
-    node.version = snapshotNodeVersion;
-
-    const auto hotRankIt = hotRankByPath.find(file.path);
-    const bool isKnownHot =
-        hotRankIt != hotRankByPath.end() && hotRankIt->second < kHotWindow;
-
-    node.data["kind"] = "file";
-    node.data["path"] = file.path;
-    node.data["file_id"] = file.fileId;
-    node.data["hash"] = ai::hashToHex(file.hash);
-    node.data["weight"] = weightEngine_.weightForPath(file.path);
-    node.data["hot_rank"] =
-        hotRankIt == hotRankByPath.end()
-            ? static_cast<long long>(-1)
-            : static_cast<long long>(hotRankIt->second);
-    node.data["is_hot"] = isKnownHot;
-    newGraph->addNode(node);
+    builder.putNode(buildFileGraphNode(file, weightEngine_, hotRankByPath,
+                                       snapshotNodeVersion));
   }
 
-  std::map<std::string, std::uint64_t> symbolIdByName;
-  for (const ai::SymbolRecord& symbol : state_.symbols) {
-    const auto symbolIt = symbolIdByName.find(symbol.name);
-    if (symbolIt == symbolIdByName.end() || symbol.symbolId < symbolIt->second) {
-      symbolIdByName[symbol.name] = symbol.symbolId;
-    }
-  }
-
-  std::vector<std::pair<std::string, ai::SymbolNode>> symbolsByName;
-  symbolsByName.reserve(state_.symbolIndex.size());
-  for (const auto& [name, node] : state_.symbolIndex) {
-    symbolsByName.push_back({name, node});
-  }
-  std::sort(symbolsByName.begin(), symbolsByName.end(),
-            [](const auto& left, const auto& right) {
-              return left.first < right.first;
-            });
+  const auto symbolById = buildSymbolGraphIndex(state_);
 
   // Pass real graph dimensions into the cognitive memory layer BEFORE
   // computing the hot slice size. Without this, graphNodeCount_ stays 0
@@ -1048,7 +1100,7 @@ void StateManager::rebuildGraphLocked() {
   cognitiveMemoryManager_.setGraphScale(
       state_.files.size() + state_.symbols.size(), 0U);
   const std::size_t hotSliceSize = cognitiveMemoryManager_.governedHotSliceCapacity(
-      std::max<std::size_t>(kHotSliceFloor, symbolsByName.size()));
+      std::max<std::size_t>(kHotSliceFloor, symbolById.size()));
   resetHotSlice(cognitiveMemoryManager_.working, hotSliceSize);
 
   std::set<std::string> recentFiles;
@@ -1058,55 +1110,29 @@ void StateManager::rebuildGraphLocked() {
     recentFiles.insert(lruOrder[index]);
   }
 
-  struct SymbolGraphNode {
-    memory::StateNode node;
-    std::string definedIn;
-    std::vector<std::string> usedIn;
-  };
+  std::vector<SymbolGraphProjection> symbolNodes;
+  symbolNodes.reserve(symbolById.size());
+  for (const auto& [symbolId, symbolPair] : symbolById) {
+    SymbolGraphProjection projection = buildSymbolGraphNode(
+        symbolId, symbolPair.first, symbolPair.second, weightEngine_,
+        snapshotNodeVersion);
 
-  std::vector<SymbolGraphNode> symbolNodes;
-  symbolNodes.reserve(symbolsByName.size());
-  for (const auto& [name, symbolNode] : symbolsByName) {
-    SymbolGraphNode entry;
-    entry.node.nodeType = memory::NodeType::Symbol;
-    entry.node.version = snapshotNodeVersion;
-
-    const auto idIt = symbolIdByName.find(name);
-    const std::uint64_t symbolId =
-        idIt == symbolIdByName.end() ? deterministicFallbackSymbolId(name)
-                                     : idIt->second;
-    entry.node.nodeId = symbolNodeId(symbolId);
-    entry.definedIn = symbolNode.definedIn;
-    entry.usedIn = sortedUsedIn(symbolNode.usedInFiles);
-
-    const double symbolWeight = entry.definedIn.empty()
-                                    ? symbolNode.weight
-                                    : weightEngine_.weightForPath(entry.definedIn);
-
-    entry.node.data["kind"] = "symbol";
-    entry.node.data["symbol_id"] = symbolId;
-    entry.node.data["name"] = symbolNode.name.empty() ? name : symbolNode.name;
-    entry.node.data["defined_in"] = entry.definedIn;
-    entry.node.data["used_in"] = entry.usedIn;
-    entry.node.data["usage_count"] = entry.usedIn.size();
-    entry.node.data["weight"] = symbolWeight;
-    entry.node.data["centrality"] = symbolNode.centrality;
-    entry.node.data["is_hot"] = false;
-    entry.node.data["hot_version"] = 0ULL;
-    entry.node.data["impact_frequency"] = 0U;
-
-    cognitiveMemoryManager_.working.storeNode(entry.node, globalVersion_);
-    if (!entry.definedIn.empty() && recentFiles.find(entry.definedIn) != recentFiles.end()) {
-      cognitiveMemoryManager_.working.recordAccess(entry.node.nodeId, globalVersion_);
-      cognitiveMemoryManager_.working.promote(entry.node.nodeId, 2.0, globalVersion_);
+    cognitiveMemoryManager_.working.storeNode(projection.node, globalVersion_);
+    if (!projection.definedIn.empty() &&
+        recentFiles.find(projection.definedIn) != recentFiles.end()) {
+      cognitiveMemoryManager_.working.recordAccess(projection.node.nodeId,
+                                                   globalVersion_);
+      cognitiveMemoryManager_.working.promote(projection.node.nodeId, 2.0,
+                                             globalVersion_);
     }
-    for (const std::string& usedFile : entry.usedIn) {
+    for (const std::string& usedFile : projection.usedIn) {
       if (recentFiles.find(usedFile) != recentFiles.end()) {
-        cognitiveMemoryManager_.working.recordAccess(entry.node.nodeId, globalVersion_);
+        cognitiveMemoryManager_.working.recordAccess(projection.node.nodeId,
+                                                     globalVersion_);
       }
     }
 
-    symbolNodes.push_back(std::move(entry));
+    symbolNodes.push_back(std::move(projection));
   }
 
   const std::vector<memory::StateNode> hotSymbols =
@@ -1118,11 +1144,11 @@ void StateManager::rebuildGraphLocked() {
     hotSymbolIds.insert(hotSymbol.nodeId);
   }
 
-  for (SymbolGraphNode& symbol : symbolNodes) {
+  for (SymbolGraphProjection& symbol : symbolNodes) {
     const bool isHot = hotSymbolIds.find(symbol.node.nodeId) != hotSymbolIds.end();
     symbol.node.data["is_hot"] = isHot;
     symbol.node.data["hot_version"] = isHot ? globalVersion_ : 0ULL;
-    newGraph->addNode(symbol.node);
+    builder.putNode(symbol.node);
   }
 
   std::vector<std::pair<std::string, std::string>> fileDependencies;
@@ -1141,38 +1167,23 @@ void StateManager::rebuildGraphLocked() {
       fileDependencies.end());
 
   for (const auto& [fromPath, toPath] : fileDependencies) {
-    memory::StateEdge edge;
-    edge.edgeId = "dep:" + fromPath + "->" + toPath;
-    edge.sourceId = fileNodeId(fromPath);
-    edge.targetId = fileNodeId(toPath);
-    edge.edgeType = memory::EdgeType::DependsOn;
-    newGraph->addEdge(edge);
+    builder.putEdge(buildDependencyEdge(fromPath, toPath));
   }
 
-  for (const SymbolGraphNode& symbol : symbolNodes) {
+  for (const SymbolGraphProjection& symbol : symbolNodes) {
     if (!symbol.definedIn.empty() && knownPaths.find(symbol.definedIn) != knownPaths.end()) {
-      memory::StateEdge edge;
-      edge.edgeId = "def:" + symbol.node.nodeId + "->" + fileNodeId(symbol.definedIn);
-      edge.sourceId = symbol.node.nodeId;
-      edge.targetId = fileNodeId(symbol.definedIn);
-      edge.edgeType = memory::EdgeType::Contains;
-      newGraph->addEdge(edge);
+      builder.putEdge(buildDefinitionEdge(symbol.node.nodeId, symbol.definedIn));
     }
 
     for (const std::string& usedInPath : symbol.usedIn) {
       if (knownPaths.find(usedInPath) == knownPaths.end()) {
         continue;
       }
-      memory::StateEdge edge;
-      edge.edgeId = "use:" + fileNodeId(usedInPath) + "->" + symbol.node.nodeId;
-      edge.sourceId = fileNodeId(usedInPath);
-      edge.targetId = symbol.node.nodeId;
-      edge.edgeType = memory::EdgeType::DependsOn;
-      newGraph->addEdge(edge);
+      builder.putEdge(buildUseEdge(usedInPath, symbol.node.nodeId));
     }
   }
 
-  replaceSharedPtr(graph_, std::move(newGraph));
+  replaceSharedPtr(graph_, builder.buildShared());
 }
 
 }  // namespace ultra::core

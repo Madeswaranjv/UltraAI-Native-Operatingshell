@@ -16,6 +16,53 @@
 
 namespace ultra::memory {
 
+class CognitiveMemoryManager;
+
+struct EpisodicMemoryMatch {
+  std::uint64_t version{0U};
+  std::string branchId;
+  std::string type;
+  std::string subject;
+  bool success{false};
+  bool rolledBack{false};
+  double riskScore{0.0};
+  double confidenceScore{0.0};
+  std::string message;
+};
+
+struct StrategicMemoryMatch {
+  std::uint64_t version{0U};
+  std::string category;
+  std::string subject;
+  bool success{false};
+  bool rolledBack{false};
+  double predictedRisk{0.0};
+  double observedRisk{0.0};
+  double predictedConfidence{0.0};
+  double observedConfidence{0.0};
+  std::size_t estimatedTokens{0U};
+  std::size_t compressedTokens{0U};
+};
+
+class MemoryQuery {
+ public:
+  explicit MemoryQuery(const CognitiveMemoryManager& manager,
+                       std::size_t limit = 4U) noexcept;
+
+  [[nodiscard]] std::vector<EpisodicMemoryMatch> getEpisodic(
+      const std::string& intentSignature) const;
+  [[nodiscard]] std::vector<StrategicMemoryMatch> getStrategic(
+      const std::string& goalType) const;
+  [[nodiscard]] std::vector<EpisodicMemoryMatch> getFailures(
+      const std::string& errorType) const;
+  [[nodiscard]] std::vector<EpisodicMemoryMatch> getSuccessfulPatterns(
+      const std::string& taskType) const;
+
+ private:
+  const CognitiveMemoryManager* manager_{nullptr};
+  std::size_t limit_{4U};
+};
+
 class CognitiveMemoryManager {
  public:
   struct MemoryGovernanceState {
@@ -106,6 +153,7 @@ class CognitiveMemoryManager {
   [[nodiscard]] const IdentityState& identity() const noexcept {
     return identity_;
   }
+  [[nodiscard]] MemoryQuery query(std::size_t limit = 4U) const noexcept;
 
   HotSlice working;
   EpisodicMemory episodic;

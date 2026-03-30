@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <iostream>
 #include <string>
 #include <string_view>
 
@@ -67,10 +68,6 @@ const char* toString(const RecoveryAction action) noexcept {
 FailureClass FailureRecoveryEngine::classify(const FailureContext& ctx) const {
   const std::string message = normalizeMessage(ctx.execution_result.message);
 
-  if (ctx.execution_result.ok && !ctx.execution_result.rolledBack) {
-    return FailureClass::TRANSIENT_ERROR;
-  }
-
   if (containsAny(message,
                   {"fatal", "critical", "assert", "corrupt", "invariant",
                    "out of memory", "unknown error"})) {
@@ -100,33 +97,37 @@ FailureClass FailureRecoveryEngine::classify(const FailureContext& ctx) const {
 }
 
 RecoveryAction FailureRecoveryEngine::decide(const FailureContext& ctx) const {
+  if (ctx.execution_result.ok && !ctx.execution_result.rolledBack) {
+    std::cerr << "[FailureRecovery] Successful execution result reached recovery path."
+              << " task=" << ctx.task_id
+              << " retry=" << ctx.retry_count << "/" << ctx.retry_limit
+              << " -> REPLAN_REQUIRED\n";
+    return RecoveryAction::REPLAN_REQUIRED;
+  }
+
   const FailureClass failureClass = classify(ctx);
+  RecoveryAction action = RecoveryAction::REPLAN_REQUIRED;
 
   if (failureClass == FailureClass::CRITICAL_ERROR) {
-    return RecoveryAction::ABORT_LOOP;
+    action = RecoveryAction::ABORT_LOOP;
+  } else if (failureClass == FailureClass::DEPENDENCY_ERROR) {
+    action = RecoveryAction::REPLAN_REQUIRED;
+  } else if (failureClass == FailureClass::VALIDATION_ERROR) {
+    action = ctx.execution_result.rolledBack ? RecoveryAction::REPLAN_REQUIRED
+                                             : RecoveryAction::SKIP_TASK;
+  } else if (ctx.retry_count < ctx.retry_limit) {
+    action = RecoveryAction::RETRY_TASK;
+  } else if (ctx.dependency_state.has_value() &&
+             ctx.dependency_state->failedTaskCount > 1U) {
+    action = RecoveryAction::REPLAN_REQUIRED;
   }
 
-  if (failureClass == FailureClass::DEPENDENCY_ERROR) {
-    return RecoveryAction::REPLAN_REQUIRED;
-  }
-
-  if (failureClass == FailureClass::VALIDATION_ERROR) {
-    if (ctx.execution_result.rolledBack) {
-      return RecoveryAction::REPLAN_REQUIRED;
-    }
-    return RecoveryAction::SKIP_TASK;
-  }
-
-  if (ctx.retry_count < ctx.retry_limit) {
-    return RecoveryAction::RETRY_TASK;
-  }
-
-  if (ctx.dependency_state.has_value() &&
-      ctx.dependency_state->failedTaskCount > 1U) {
-    return RecoveryAction::REPLAN_REQUIRED;
-  }
-
-  return RecoveryAction::REPLAN_REQUIRED;
+  std::cerr << "[FailureRecovery] task=" << ctx.task_id
+            << " class=" << toString(failureClass)
+            << " retry=" << ctx.retry_count << "/" << ctx.retry_limit
+            << " action=" << toString(action)
+            << " message=" << ctx.execution_result.message << "\n";
+  return action;
 }
 
 }  // namespace ultra::runtime::cognitive

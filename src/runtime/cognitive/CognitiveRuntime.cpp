@@ -100,6 +100,8 @@ namespace {
   strategy.risk.tolerance = frame.intentTolerance;
   strategy.risk.value = riskValueForTolerance(frame.intentTolerance);
 
+  std::size_t totalEstimatedFiles = 0U;
+  std::size_t maxEstimatedDepth = 1U;
   for (const ::ultra::runtime::cognitive::TaskPayload& payload :
        frame.microTaskPayloads) {
     if (payload.kind != ::ultra::runtime::cognitive::TaskPayloadKind::Action) {
@@ -107,21 +109,30 @@ namespace {
     }
 
     ::ultra::runtime::intent::Action action;
-    action.kind = actionKindFromActionType(payload.action.type);
-    action.target = payload.action.target;
-    if (action.target.empty()) {
-      action.target = frame.intentTarget;
+    if (payload.plannedAction.has_value()) {
+      action = *payload.plannedAction;
+    } else {
+      action.kind = actionKindFromActionType(payload.action.type);
+      action.target = payload.action.target;
+      if (action.target.empty()) {
+        action.target = frame.intentTarget;
+      }
+      if (action.target.empty()) {
+        action.target = frame.intentGoal;
+      }
+      if (action.target.empty()) {
+        action.target = "workspace_root";
+      }
+      action.details = "Generated from deterministic runtime micro-task payload.";
+      action.estimatedFilesChanged = 1U;
+      action.estimatedDependencyDepth = 1U;
+      action.publicApiSurface = frame.intentAllowPublicApiChange;
     }
-    if (action.target.empty()) {
-      action.target = frame.intentGoal;
-    }
-    if (action.target.empty()) {
-      action.target = "workspace_root";
-    }
-    action.details = "Generated from deterministic runtime micro-task payload.";
-    action.estimatedFilesChanged = 1U;
-    action.estimatedDependencyDepth = 1U;
-    action.publicApiSurface = frame.intentAllowPublicApiChange;
+
+    totalEstimatedFiles += std::max<std::size_t>(1U, action.estimatedFilesChanged);
+    maxEstimatedDepth = std::max<std::size_t>(
+        maxEstimatedDepth,
+        std::max<std::size_t>(1U, action.estimatedDependencyDepth));
     strategy.proposedActions.push_back(std::move(action));
   }
 
@@ -140,8 +151,10 @@ namespace {
   }
 
   strategy.impact.radius = strategy.risk.value;
-  strategy.impact.estimatedFiles = strategy.proposedActions.size();
-  strategy.impact.dependencyDepth = 1U;
+  strategy.impact.estimatedFiles = std::max<std::size_t>(
+      strategy.proposedActions.empty() ? 1U : totalEstimatedFiles,
+      strategy.proposedActions.size());
+  strategy.impact.dependencyDepth = maxEstimatedDepth;
   strategy.impact.centrality = 0.0;
   strategy.impact.maxFilesConstraint = std::max<std::size_t>(
       1U, frame.intentMaxFilesChanged);
@@ -170,9 +183,11 @@ class IntentSeedStage final : public ::ultra::runtime::cognitive::IIntentStage {
   ::ultra::runtime::cognitive::StageResult run(
       ::ultra::runtime::cognitive::UltraLoopFrame& frame) override {
     frame.cognitiveState = &state_;
-    frame.intentGoal = prompt_.empty() ? intent_.goal.target : prompt_;
+    frame.structuredIntent = intent_;
+    frame.hasStructuredIntent = true;
+    frame.intentGoal = intent_.goal.target.empty() ? prompt_ : intent_.goal.target;
     frame.intentTarget = intent_.goal.target.empty() ? frame.intentGoal
-                                                      : intent_.goal.target;
+                                                     : intent_.goal.target;
     frame.intentBranchId = intent_.constraints.branchScope;
     frame.intentTokenBudget =
         std::max<std::size_t>(1U, intent_.constraints.tokenBudget);
@@ -184,16 +199,19 @@ class IntentSeedStage final : public ::ultra::runtime::cognitive::IIntentStage {
     frame.intentAllowPublicApiChange = intent_.options.allowPublicAPIChange;
     frame.intentRiskThreshold = riskThresholdForTolerance(intent_.risk);
 
-    frame.intentId = prompt_;
-    if (frame.intentId.empty()) {
-      frame.intentId = frame.intentGoal;
-    }
-    if (frame.intentId.empty()) {
-      frame.intentId = frame.intentTarget;
+    frame.intentId = ::ultra::runtime::intent::toString(intent_.goal.type);
+    if (!frame.intentTarget.empty()) {
+      frame.intentId += ":" + frame.intentTarget;
+    } else if (!frame.intentGoal.empty()) {
+      frame.intentId += ":" + frame.intentGoal;
     }
     if (frame.intentId.empty()) {
       frame.intentId = "intent:seed";
     }
+
+    frame.originalStructuredIntent = intent_;
+    frame.hasOriginalStructuredIntent = true;
+    frame.originalIntentId = frame.intentId;
 
     return {
         true,
@@ -430,10 +448,20 @@ class ReflectionStageAdapter final
       };
     }
 
+    const ::ultra::runtime::cognitive::IntentConsistencyRecord consistency =
+        ::ultra::runtime::cognitive::evaluateIntentConsistency(frame);
+    frame.intentConsistencyLog.push_back(consistency);
+    frame.intentConsistent = consistency.consistent;
+    frame.intentConsistencyReason = consistency.reason;
+    frame.reanchorRequested = !consistency.consistent;
+
     std::string message = frame.hasExecutionResult ? frame.executionResult.message
                                                    : std::string{};
     if (message.empty()) {
       message = "Reflection completed deterministic loop summary.";
+    }
+    if (!consistency.consistent) {
+      message = consistency.reason;
     }
 
     return {
@@ -570,12 +598,15 @@ CognitiveLoopResult CognitiveRuntime::run(
     RecoveryStageAdapter recoveryStage(2U);
     VerificationStageAdapter verificationStage(2U);
     ReflectionStageAdapter reflectionStage;
+    cognitive::DeterministicArbitrationStage arbitrationStage;
+    cognitive::DeterministicReanchorStage reanchorStage;
     ReplanningStageAdapter replanningStage;
     MemoryStageAdapter memoryStage;
 
     cognitive::UltraLoopBindings bindings;
     bindings.intent = &intentStage;
     bindings.strategy = &strategyStage;
+    bindings.arbitration = &arbitrationStage;
     bindings.microPlanning = &microPlanningStage;
     bindings.microPlanner = &microPlanner;
     bindings.executionKernel = &executionKernel;
@@ -583,6 +614,7 @@ CognitiveLoopResult CognitiveRuntime::run(
     bindings.recovery = &recoveryStage;
     bindings.verification = &verificationStage;
     bindings.reflection = &reflectionStage;
+    bindings.reanchor = &reanchorStage;
     bindings.replanning = &replanningStage;
     bindings.memory = &memoryStage;
 
@@ -597,13 +629,72 @@ CognitiveLoopResult CognitiveRuntime::run(
     result.ok = report.success;
     result.verifyStatus = report.success ? "PASS" : "FAIL";
     result.confidence = confidenceFromReport(report);
+    result.transitions = report.transitions;
+    result.repairs = report.repairs;
+    result.arbitration = report.arbitration;
+    result.intentConsistency = report.intentConsistency;
 
     // Extract model text output from the last successful execution result.
     // ExecutionKernel caches its last ok result — we read it here so we
     // never make a second LLM call.
-    std::string modelTextOutput;
+    std::string modelTextOutput = executionKernel.lastModelTextOutput();
+    std::string providerUsed = executionKernel.lastSelectedProvider();
+    std::string providerEndpoint = executionKernel.lastProviderEndpoint();
+    const auto assignModelTextOutput = [&modelTextOutput](
+                                       const nlohmann::ordered_json& responsePayload) {
+      if (!responsePayload.is_object() || !modelTextOutput.empty()) {
+        return;
+      }
+      if (responsePayload.contains("text_output") &&
+          responsePayload.at("text_output").is_string()) {
+        modelTextOutput = responsePayload.at("text_output").get<std::string>();
+        return;
+      }
+      if (responsePayload.contains("textOutput") &&
+          responsePayload.at("textOutput").is_string()) {
+        modelTextOutput = responsePayload.at("textOutput").get<std::string>();
+        return;
+      }
+      if (responsePayload.contains("output") &&
+          responsePayload.at("output").is_string()) {
+        modelTextOutput = responsePayload.at("output").get<std::string>();
+      }
+    };
+    const auto assignProviderMetadata =
+        [&providerUsed, &providerEndpoint](const nlohmann::ordered_json& payload) {
+          if (!payload.is_object()) {
+            return;
+          }
+          if (providerUsed.empty() &&
+              payload.contains("selected_provider") &&
+              payload.at("selected_provider").is_string()) {
+            providerUsed = payload.at("selected_provider").get<std::string>();
+          }
+          if (providerEndpoint.empty() &&
+              payload.contains("provider_endpoint") &&
+              payload.at("provider_endpoint").is_string()) {
+            providerEndpoint = payload.at("provider_endpoint").get<std::string>();
+          }
+          if (providerUsed.empty() &&
+              payload.contains("provider_hint") &&
+              payload.at("provider_hint").is_string()) {
+            providerUsed = payload.at("provider_hint").get<std::string>();
+          }
+        };
     if (executionKernel.hasLastResult()) {
-      const nlohmann::ordered_json& payload = executionKernel.lastResult().payload;
+      const auto& lastExecutionResult = executionKernel.lastResult();
+      if (!lastExecutionResult.text_output.empty()) {
+        modelTextOutput = lastExecutionResult.text_output;
+      }
+
+      const nlohmann::ordered_json& payload = lastExecutionResult.payload;
+      assignProviderMetadata(payload);
+      if (modelTextOutput.empty() &&
+          payload.contains("text_output") &&
+          payload.at("text_output").is_string()) {
+        modelTextOutput = payload.at("text_output").get<std::string>();
+      }
+
       // Walk child_results looking for a ModelGenerate entry
       if (payload.contains("child_results") &&
           payload.at("child_results").is_array()) {
@@ -617,48 +708,54 @@ CognitiveLoopResult CognitiveRuntime::run(
           if (!child.contains("payload") ||
               !child.at("payload").is_object()) { continue; }
           const auto& childPayload = child.at("payload");
+          assignProviderMetadata(childPayload);
           if (!childPayload.contains("response") ||
               !childPayload.at("response").is_object()) { continue; }
-          const auto& resp = childPayload.at("response");
-          if (resp.contains("text_output") &&
-              resp.at("text_output").is_string()) {
-            modelTextOutput = resp.at("text_output").get<std::string>();
-            if (!modelTextOutput.empty()) { break; }
-          }
+          assignModelTextOutput(childPayload.at("response"));
+          if (!modelTextOutput.empty()) { break; }
         }
       }
       // Also handle direct ModelGenerate (not wrapped in IntentEvaluation)
       if (modelTextOutput.empty() &&
           payload.contains("response") &&
           payload.at("response").is_object()) {
-        const auto& resp = payload.at("response");
-        if (resp.contains("text_output") && resp.at("text_output").is_string()) {
-          modelTextOutput = resp.at("text_output").get<std::string>();
-        }
+        assignModelTextOutput(payload.at("response"));
       }
     }
 
-    result.output = modelTextOutput.empty() ? report.message : modelTextOutput;
+    result.llm_output = modelTextOutput;
+    result.providerUsed = providerUsed;
+    result.providerEndpoint = providerEndpoint;
+    result.executionSummary = report.message;
 
     if (!report.missingLayers.empty()) {
-      if (!result.output.empty()) { result.output += "\n"; }
-      result.output += "Missing layers: ";
-      result.output += joinViolations(report.missingLayers);
+      if (!result.executionSummary.empty()) { result.executionSummary += "\n"; }
+      result.executionSummary += "Missing layers: ";
+      result.executionSummary += joinViolations(report.missingLayers);
     }
+    const bool preferLlmOutput = report.success && !modelTextOutput.empty();
+    result.output = preferLlmOutput ? modelTextOutput : result.executionSummary;
+    result.outputSource = preferLlmOutput ? "llm_output" : "loop_report";
     if (!report.success) {
-      result.errorMessage = report.message.empty()
+      result.errorMessage = result.executionSummary.empty()
                                 ? "UltraLoop execution failed."
-                                : report.message;
+                                : result.executionSummary;
     }
   } catch (const std::exception& ex) {
     result.ok = false;
     result.verifyStatus = "FAIL";
     result.confidence = "low";
+    result.executionSummary = ex.what();
+    result.output = result.executionSummary;
+    result.outputSource = "runtime_error";
     result.errorMessage = ex.what();
   } catch (...) {
     result.ok = false;
     result.verifyStatus = "FAIL";
     result.confidence = "low";
+    result.executionSummary = "Cognitive runtime failed with an unknown error.";
+    result.output = result.executionSummary;
+    result.outputSource = "runtime_error";
     result.errorMessage = "Cognitive runtime failed with an unknown error.";
   }
 
@@ -666,3 +763,6 @@ CognitiveLoopResult CognitiveRuntime::run(
 }
 
 }  // namespace ultra::runtime
+
+
+

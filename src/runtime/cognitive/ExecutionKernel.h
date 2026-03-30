@@ -99,6 +99,7 @@ struct Result {
   std::string previousHash;
   std::string resultingHash;
   std::string message;
+  std::string text_output;
 };
 
 class ExecutionKernel {
@@ -121,6 +122,15 @@ class ExecutionKernel {
   [[nodiscard]] bool hasToolRouterLayer() const noexcept;
   [[nodiscard]] bool hasLastResult() const noexcept { return hasLastResult_; }
   [[nodiscard]] const Result& lastResult() const noexcept { return lastResult_; }
+  [[nodiscard]] const std::string& lastModelTextOutput() const noexcept {
+    return lastModelTextOutput_;
+  }
+  [[nodiscard]] const std::string& lastSelectedProvider() const noexcept {
+    return lastSelectedProvider_;
+  }
+  [[nodiscard]] const std::string& lastProviderEndpoint() const noexcept {
+    return lastProviderEndpoint_;
+  }
 
  private:
   [[nodiscard]] std::string stableActionId(const Action& action) const;
@@ -141,6 +151,12 @@ class ExecutionKernel {
   std::uint64_t queueCounter_{0U};
   Result lastResult_{};
   bool hasLastResult_{false};
+  std::string lastModelTextOutput_{};
+  std::string lastSelectedProvider_{};
+  std::string lastProviderEndpoint_{};
 };
 
 }  // namespace ultra::runtime
+
+
+

@@ -3,6 +3,7 @@
 #include <external/json.hpp>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <algorithm>
 #include <memory>
 #include <mutex>
@@ -12,7 +13,7 @@
 
 namespace {
 
-constexpr int kMaxWriteAttempts = 3;
+constexpr int kMaxWriteAttempts = 2;
 
 struct PersistenceState {
   std::mutex mutex;
@@ -62,6 +63,9 @@ bool writePayloadWithRetry(const std::filesystem::path& weightsFile,
   for (int attempt = 0; attempt < kMaxWriteAttempts; ++attempt) {
     std::error_code ec;
     std::filesystem::create_directories(weightsFile.parent_path(), ec);
+    if (ec) {
+      return false;
+    }
 
     std::ofstream out(weightsFile, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -230,3 +234,4 @@ std::unordered_map<std::string, float> WeightManager::getAllWeights() const {
 }
 
 }  // namespace ultra::calibration
+

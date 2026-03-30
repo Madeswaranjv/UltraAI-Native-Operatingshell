@@ -151,6 +151,8 @@ TEST(ModelExecutionKernel, RoutesRequestsThroughRegistry) {
             "analysis");
   EXPECT_EQ(result.payload["response"].value("text_output", std::string{}),
             "deterministic reply");
+  EXPECT_EQ(result.payload.value("selected_provider", std::string{}),
+            "openai");
   EXPECT_EQ(result.payload["response"]["usage_stats"].value("total_tokens", 0U),
             15U);
   ASSERT_EQ(result.payload["response"]["tool_calls"].size(), 1U);

@@ -22,6 +22,7 @@
 #include "../metrics/PerformanceMetrics.h"
 #include "../metacognition/MetaCognitiveOrchestrator.h"
 #include "../runtime/ContextExtractor.h"
+#include "../runtime/change_queue.h"
 #include "../runtime/cognitive/CognitiveRuntime.h"
 #include "../runtime/governance/Policy.h"
 #include "../runtime/intent/IntentRuntime.h"
@@ -462,6 +463,7 @@ struct DaemonRuntimeDispatcher {
   std::filesystem::path aiDirectory;
   std::filesystem::path agentContextPath;
   std::filesystem::path contextDiffPath;
+  ultra::runtime::ChangeQueue changeQueue;
   ultra::core::StateManager stateManager;
   std::optional<ultra::ai::RuntimeState> previousState;
 
@@ -470,7 +472,9 @@ struct DaemonRuntimeDispatcher {
         aiDirectory(projectRoot / ".ultra" / "ai"),
         agentContextPath(projectRoot / ".ultra.context.json"),
         contextDiffPath(projectRoot / ".ultra.context-diff.json"),
-        stateManager(projectRoot) {}
+        stateManager(projectRoot) {
+    stateManager.setStructuralEventBus(&changeQueue);
+  }
 
   nlohmann::json handle(const std::string& type, const nlohmann::json& payload) {
     if (type == "ai_status") {
@@ -3627,8 +3631,12 @@ void CLIEngine::registerHandlers() {
     auto printErrorJson = [this](const std::string& message) {
       nlohmann::json response = nlohmann::json::object();
       response["status"] = "error";
+      response["ok"] = false;
+      response["success"] = false;
       response["verify_status"] = "FAIL";
       response["confidence"] = "low";
+      response["text_output"] = "";
+      response["llm_output"] = "";
       response["output"] = "";
       response["error"] = message;
       std::cout << response.dump(2) << '\n';
@@ -3841,6 +3849,25 @@ void CLIEngine::registerHandlers() {
       ultra::runtime::intent::IntentRuntime intentRuntime;
       const ultra::runtime::intent::Intent resolvedIntent =
           intentRuntime.resolve_structured_intent(intentInput, contextFrame);
+      const auto buildResolvedIntentPayload = [](const ultra::runtime::intent::Intent& intentValue) {
+        return nlohmann::json{
+            {"goal",
+             {{"type", ultra::runtime::intent::toString(intentValue.goal.type)},
+              {"target", intentValue.goal.target}}},
+            {"constraints",
+             {{"branch_scope", intentValue.constraints.branchScope},
+              {"determinism_required", intentValue.constraints.determinismRequired},
+              {"max_files_changed", intentValue.constraints.maxFilesChanged},
+              {"max_impact_depth", intentValue.constraints.maxImpactDepth},
+              {"token_budget", intentValue.constraints.tokenBudget}}},
+            {"risk_tolerance", ultra::runtime::intent::toString(intentValue.risk)},
+            {"options",
+             {{"allow_cross_module_move", intentValue.options.allowCrossModuleMove},
+              {"allow_public_api_change", intentValue.options.allowPublicAPIChange},
+              {"allow_rename", intentValue.options.allowRename},
+              {"allow_signature_change", intentValue.options.allowSignatureChange}}},
+        };
+      };
 
       ultra::core::StateManager stateManager(projectRoot);
       std::string loadError;
@@ -3858,13 +3885,64 @@ void CLIEngine::registerHandlers() {
 
       nlohmann::json response = nlohmann::json::object();
       response["status"] = loopResult.ok ? "ok" : "error";
+      response["ok"] = loopResult.ok;
+      response["success"] = loopResult.ok;
       response["verify_status"] =
           loopResult.verifyStatus.empty()
               ? (loopResult.ok ? "PASS" : "FAIL")
               : loopResult.verifyStatus;
       response["confidence"] =
           loopResult.confidence.empty() ? std::string("low") : loopResult.confidence;
+      response["intent"] = buildResolvedIntentPayload(resolvedIntent);
+      response["text_output"] = loopResult.llm_output;
+      response["llm_output"] = loopResult.llm_output;
       response["output"] = loopResult.output;
+      response["execution_summary"] = loopResult.executionSummary;
+      response["output_source"] = loopResult.outputSource;
+      response["provider_used"] = loopResult.providerUsed;
+      if (!loopResult.providerEndpoint.empty()) {
+        response["provider_endpoint"] = loopResult.providerEndpoint;
+      }
+
+      response["transitions"] = nlohmann::json::array();
+      for (const auto& transition : loopResult.transitions) {
+        response["transitions"].push_back(
+            {{"from", ultra::runtime::cognitive::toString(transition.from)},
+             {"to", ultra::runtime::cognitive::toString(transition.to)},
+             {"reason", transition.reason}});
+      }
+
+      response["repair_log"] = nlohmann::json::array();
+      for (const auto& repair : loopResult.repairs) {
+        response["repair_log"].push_back(
+            {{"iteration", repair.iteration},
+             {"attempt", repair.attempt},
+             {"site", repair.site},
+             {"task_ids", repair.taskIds},
+             {"decision", repair.decision},
+             {"reason", repair.reason}});
+      }
+
+      response["arbitration_log"] = nlohmann::json::array();
+      for (const auto& decision : loopResult.arbitration) {
+        response["arbitration_log"].push_back(
+            {{"iteration", decision.iteration},
+             {"candidate_count", decision.candidateCount},
+             {"selected_count", decision.selectedCount},
+             {"conflict_count", decision.conflictCount},
+             {"selected_task_ids", decision.selectedTaskIds},
+             {"reason", decision.reason}});
+      }
+
+      response["intent_consistency"] = nlohmann::json::array();
+      for (const auto& consistency : loopResult.intentConsistency) {
+        response["intent_consistency"].push_back(
+            {{"iteration", consistency.iteration},
+             {"consistent", consistency.consistent},
+             {"plan_id", consistency.planId},
+             {"reason", consistency.reason}});
+      }
+
       if (!loopResult.ok) {
         response["error"] = loopResult.errorMessage;
       }
@@ -3989,3 +4067,4 @@ int CLIEngine::run(int argc, char* argv[]) {
 }
 
 }  // namespace ultra::cli
+

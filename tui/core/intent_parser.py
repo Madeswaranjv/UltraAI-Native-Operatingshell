@@ -8,7 +8,6 @@ call once the backend bridge is wired.
 """
 from __future__ import annotations
 import re
-import asyncio
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -58,8 +57,6 @@ class IntentParser:
     """Parse a freeform prompt into a structured IntentPayload."""
 
     async def parse(self, prompt: str, session=None) -> IntentPayload:
-        # Simulate async work — replace with real model call later
-        await asyncio.sleep(0.05)
         return self._heuristic_parse(prompt, session)
 
     # ── Internal ────────────────────────────────────────────────────────────

@@ -20,6 +20,7 @@ struct ChangeEvent {
 class ChangeQueue {
  public:
   void push(ChangeEvent event);
+  void postStructuralEvent(DaemonEventType type, std::string detail);
   bool popFor(ChangeEvent& eventOut, std::chrono::milliseconds timeout);
   bool popRuntimeEvent(DaemonEvent& eventOut,
                        std::stop_token stopToken,

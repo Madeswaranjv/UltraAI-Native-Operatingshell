@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cctype>
 #include <cstdio>
+#include <iostream>
 #include <map>
 #include <string>
 #include <string_view>
@@ -28,6 +29,16 @@ std::string trimCopy(const std::string_view value) {
   }
 
   return std::string(value.substr(start, end - start));
+}
+
+void logStrategyParserFailure(const std::string_view reason,
+                              const model::ModelResponse& response) {
+  std::cerr << "[StrategyParser] Failed to parse model output: " << reason
+            << " strategy_len=" << response.strategyText.size();
+  if (!response.errorMessage.empty()) {
+    std::cerr << " error=" << response.errorMessage;
+  }
+  std::cerr << "\n";
 }
 
 std::string normalizeToken(const std::string_view value) {
@@ -423,6 +434,7 @@ std::optional<intent::Strategy> parseModelStrategy(
     const model::ModelResponse& response,
     const intent::Intent& intentValue) {
   if (!response.ok) {
+    logStrategyParserFailure("model response not ok", response);
     return std::nullopt;
   }
 
@@ -444,6 +456,7 @@ std::optional<intent::Strategy> parseModelStrategy(
   const std::optional<intent::ActionKind> actionKind =
       parseActionKindToken(actionKindToken);
   if (!actionKind.has_value()) {
+    logStrategyParserFailure("missing or invalid action kind", response);
     return std::nullopt;
   }
 
@@ -453,6 +466,7 @@ std::optional<intent::Strategy> parseModelStrategy(
                         .value_or(defaultTarget(intentValue)));
 
   if (target.empty()) {
+    logStrategyParserFailure("missing target", response);
     return std::nullopt;
   }
 
@@ -611,6 +625,7 @@ std::vector<TaskPayload> payloadsFromStrategy(const intent::Strategy& strategy,
     payload.action.riskScore = strategy.risk.value;
     payload.action.confidenceScore = strategy.determinism.value;
     payload.action.intentRequest = intentValue;
+    payload.plannedAction = strategyAction;
 
     payloads.push_back(std::move(payload));
   }
@@ -690,9 +705,21 @@ std::optional<intent::Strategy> StrategyPlanner::tryGenerateWithModel(
   try {
     const model::ModelRequest request = buildModelRequest(intentValue);
     const model::ModelResponse response = model_->generate(request);
-    return parseModelStrategy(response, intentValue);
+    if (std::optional<intent::Strategy> strategy =
+            parseModelStrategy(response, intentValue);
+        strategy.has_value()) {
+      return strategy;
+    }
+
+    intent::Strategy fallback = generateDeterministic(intentValue);
+    fallback.name = response.ok ? "fallback_due_to_parse_failure"
+                                : "fallback_due_to_model_failure";
+    return fallback;
   } catch (...) {
-    return std::nullopt;
+    std::cerr << "[StrategyParser] Model-assisted strategy generation threw; using deterministic fallback.\n";
+    intent::Strategy fallback = generateDeterministic(intentValue);
+    fallback.name = "fallback_due_to_model_exception";
+    return fallback;
   }
 }
 
@@ -728,3 +755,4 @@ StageResult StrategyPlanningStage::run(UltraLoopFrame& frame) {
 }
 
 }  // namespace ultra::runtime::cognitive
+

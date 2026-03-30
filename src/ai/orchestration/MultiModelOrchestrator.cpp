@@ -76,7 +76,6 @@ nlohmann::ordered_json defaultRoutingConfiguration() {
   nlohmann::ordered_json routing = nlohmann::ordered_json::object();
   routing["analysis"]  = "anthropic";
   routing["coding"]    = "ollama";
-  routing["coding"]    = "gemini";
   routing["planning"]  = "deepseek";
   routing["reasoning"] = "deepseek";
 

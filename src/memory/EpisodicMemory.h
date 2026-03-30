@@ -7,8 +7,10 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <map>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ultra::memory {
@@ -47,6 +49,15 @@ class EpisodicMemory {
   void recordEvent(const EpisodicEvent& event);
   [[nodiscard]] std::vector<EpisodicEvent> getEventsForVersion(
       std::uint64_t version) const;
+  [[nodiscard]] std::vector<EpisodicEvent> querySubject(
+      const std::string& key,
+      std::size_t limit = 4U) const;
+  [[nodiscard]] std::vector<EpisodicEvent> queryFailures(
+      const std::string& errorType,
+      std::size_t limit = 4U) const;
+  [[nodiscard]] std::vector<EpisodicEvent> querySuccessfulPatterns(
+      const std::string& taskType,
+      std::size_t limit = 4U) const;
   void pruneOlderThan(std::uint64_t minVersionInclusive);
 
   [[nodiscard]] std::vector<EpisodicEvent> snapshot() const;
@@ -58,9 +69,21 @@ class EpisodicMemory {
 
   static const char* toString(EpisodicEventType type);
   static EpisodicEventType fromString(const std::string& value);
+  static std::vector<std::string> tokenizeKey(std::string_view value);
+  static bool isFailureEvent(const EpisodicEvent& event);
+  static bool isSuccessfulPattern(const EpisodicEvent& event);
+
+  [[nodiscard]] std::vector<EpisodicEvent> queryIndexed(
+      const std::map<std::string, std::vector<std::size_t>>& index,
+      const std::string& key,
+      std::size_t limit) const;
+  void rebuildIndexesLocked();
 
   mutable std::shared_mutex mutex_;
   std::deque<EpisodicEvent> events_;
+  std::map<std::string, std::vector<std::size_t>> subjectIndex_;
+  std::map<std::string, std::vector<std::size_t>> failureIndex_;
+  std::map<std::string, std::vector<std::size_t>> successIndex_;
   std::size_t retentionLimit_{0U};
   std::uint64_t nextSequence_{1U};
 };

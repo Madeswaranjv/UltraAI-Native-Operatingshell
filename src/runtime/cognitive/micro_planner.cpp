@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <iostream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -109,6 +110,11 @@ TaskPayload normalizePayload(TaskPayload payload,
                              const std::string& taskId) {
   if (payload.kind == TaskPayloadKind::Action) {
     ::ultra::runtime::Action& action = payload.action;
+    const auto logContextFallback = [&](const std::string_view reason) {
+      std::cerr << "[MicroPlanner] Invalid payload -> fallback to ContextExtraction."
+                << " task=" << taskId
+                << " reason=" << reason << "\n";
+    };
 
     if (action.id.empty()) {
       action.id = taskId;
@@ -116,18 +122,21 @@ TaskPayload normalizePayload(TaskPayload payload,
 
     if (action.type == ::ultra::runtime::ActionType::Mutation &&
         !action.mutation) {
+      logContextFallback("mutation action missing mutation callback");
       action.type = ::ultra::runtime::ActionType::ContextExtraction;
       action.target = target;
     }
 
     if (action.type == ::ultra::runtime::ActionType::BranchDiff &&
         !action.comparisonSnapshot.has_value()) {
+      logContextFallback("branch diff action missing comparison snapshot");
       action.type = ::ultra::runtime::ActionType::ContextExtraction;
       action.target = target;
     }
 
     if (action.type == ::ultra::runtime::ActionType::IntentEvaluation &&
         !action.intentRequest.has_value()) {
+      logContextFallback("intent evaluation action missing intent payload");
       action.type = ::ultra::runtime::ActionType::ContextExtraction;
       action.target = target;
     }
@@ -137,6 +146,7 @@ TaskPayload normalizePayload(TaskPayload payload,
          action.modelRequest->prompt.empty() ||
          (!action.orchestrationContext.has_value() &&
           action.modelProvider.empty()))) {
+      logContextFallback("model generate action missing prompt/provider context");
       action.type = ::ultra::runtime::ActionType::ContextExtraction;
       action.target = target;
     }

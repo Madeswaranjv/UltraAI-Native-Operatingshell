@@ -4,10 +4,12 @@
 
 #include <external/json.hpp>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <set>
 
 namespace ultra::memory {
 
@@ -25,6 +27,20 @@ bool lessOutcome(const StrategicOutcome& a,
   if (a.version != b.version) return a.version < b.version;
   if (a.category != b.category) return a.category < b.category;
   return a.subject < b.subject;
+}
+
+void appendIndexTokens(std::map<std::string, std::vector<std::size_t>>& index,
+                       const std::vector<std::string>& tokens,
+                       const std::size_t offset) {
+  for (const std::string& token : tokens) {
+    if (token.empty()) {
+      continue;
+    }
+    std::vector<std::size_t>& bucket = index[token];
+    if (bucket.empty() || bucket.back() != offset) {
+      bucket.push_back(offset);
+    }
+  }
 }
 
 }  // namespace
@@ -84,6 +100,7 @@ void StrategicMemory::recordOutcome(
       std::abs(outcome.predictedConfidence -
                outcome.observedConfidence);
   ++confidenceSamples_;
+  rebuildIndexesLocked();
 }
 
 
@@ -274,6 +291,18 @@ StrategicMemory::getPolicyAdjustments(
   return adjustments;
 }
 
+std::vector<StrategicOutcome> StrategicMemory::queryOutcomes(
+    const std::string& key,
+    const std::size_t limit) const {
+  return queryIndexed(tokenIndex_, key, limit);
+}
+
+std::vector<StrategicOutcome> StrategicMemory::querySuccessfulOutcomes(
+    const std::string& key,
+    const std::size_t limit) const {
+  return queryIndexed(successIndex_, key, limit);
+}
+
 
 // =====================================================
 // PERSIST
@@ -383,6 +412,7 @@ bool StrategicMemory::loadTuningState(
       payload.value("cumulative_confidence_error", 0.0);
   confidenceSamples_ =
       payload.value("confidence_samples", 0U);
+  rebuildIndexesLocked();
 
   return true;
 }
@@ -403,6 +433,104 @@ std::vector<StrategicOutcome>
 StrategicMemory::snapshot() const {
   std::shared_lock lock(mutex_);
   return outcomes_;
+}
+
+std::vector<std::string> StrategicMemory::tokenizeKey(
+    const std::string_view value) {
+  std::set<std::string> tokens;
+  std::string current;
+
+  for (const char ch : value) {
+    const unsigned char uch = static_cast<unsigned char>(ch);
+    if (std::isalnum(uch) != 0) {
+      current.push_back(
+          static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+      continue;
+    }
+    if (!current.empty()) {
+      tokens.insert(current);
+      current.clear();
+    }
+  }
+  if (!current.empty()) {
+    tokens.insert(current);
+  }
+
+  return std::vector<std::string>(tokens.begin(), tokens.end());
+}
+
+std::vector<StrategicOutcome> StrategicMemory::queryIndexed(
+    const std::map<std::string, std::vector<std::size_t>>& index,
+    const std::string& key,
+    const std::size_t limit) const {
+  const std::vector<std::string> tokens = tokenizeKey(key);
+  if (tokens.empty()) {
+    return {};
+  }
+
+  std::shared_lock lock(mutex_);
+  const std::vector<std::size_t>* smallest = nullptr;
+  std::vector<const std::vector<std::size_t>*> buckets;
+  buckets.reserve(tokens.size());
+
+  for (const std::string& token : tokens) {
+    const auto it = index.find(token);
+    if (it == index.end() || it->second.empty()) {
+      return {};
+    }
+    buckets.push_back(&it->second);
+    if (smallest == nullptr || it->second.size() < smallest->size()) {
+      smallest = &it->second;
+    }
+  }
+
+  if (smallest == nullptr) {
+    return {};
+  }
+
+  std::vector<std::size_t> matches = *smallest;
+  for (const std::vector<std::size_t>* bucket : buckets) {
+    if (bucket == smallest) {
+      continue;
+    }
+    std::vector<std::size_t> intersection;
+    intersection.reserve(std::min(matches.size(), bucket->size()));
+    std::set_intersection(matches.begin(), matches.end(),
+                          bucket->begin(), bucket->end(),
+                          std::back_inserter(intersection));
+    matches.swap(intersection);
+    if (matches.empty()) {
+      return {};
+    }
+  }
+
+  const std::size_t boundedLimit = std::max<std::size_t>(1U, limit);
+  std::vector<StrategicOutcome> out;
+  out.reserve(std::min(boundedLimit, matches.size()));
+  for (auto it = matches.rbegin();
+       it != matches.rend() && out.size() < boundedLimit;
+       ++it) {
+    if (*it < outcomes_.size()) {
+      out.push_back(outcomes_[*it]);
+    }
+  }
+  return out;
+}
+
+void StrategicMemory::rebuildIndexesLocked() {
+  tokenIndex_.clear();
+  successIndex_.clear();
+
+  for (std::size_t offset = 0U; offset < outcomes_.size(); ++offset) {
+    const StrategicOutcome& outcome = outcomes_[offset];
+    std::vector<std::string> tokens = tokenizeKey(outcome.category);
+    const std::vector<std::string> subjectTokens = tokenizeKey(outcome.subject);
+    tokens.insert(tokens.end(), subjectTokens.begin(), subjectTokens.end());
+    appendIndexTokens(tokenIndex_, tokens, offset);
+    if (outcome.success && !outcome.rolledBack) {
+      appendIndexTokens(successIndex_, tokens, offset);
+    }
+  }
 }
 
 }  // namespace ultra::memory

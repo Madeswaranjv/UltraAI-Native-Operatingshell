@@ -1,10 +1,12 @@
 #pragma once
 
 #include "ExecutionKernel.h"
+#include "../intent/Strategy.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -31,6 +33,7 @@ struct TaskPayload {
   ::ultra::runtime::Action action{};
   ::ultra::runtime::intent::Intent intent{};
   ::ultra::runtime::governance::Policy policy{};
+  std::optional<::ultra::runtime::intent::Action> plannedAction{};
 };
 
 struct TaskNode {
@@ -51,6 +54,7 @@ class TaskGraph {
   bool mark_completed(const std::string& task_id);
   bool mark_failed(const std::string& task_id);
   bool reset_failed(const std::string& task_id);
+  bool reopen_task(const std::string& task_id);
 
   [[nodiscard]] bool has_pending_tasks() const;
   [[nodiscard]] std::vector<std::string> failed_tasks() const;
