@@ -105,6 +105,22 @@ RecoveryAction FailureRecoveryEngine::decide(const FailureContext& ctx) const {
     return RecoveryAction::REPLAN_REQUIRED;
   }
 
+  if (ctx.memory_action.has_value()) {
+    RecoveryAction action = *ctx.memory_action;
+    if (action == RecoveryAction::RETRY_TASK &&
+        ctx.retry_count >= ctx.retry_limit) {
+      action = RecoveryAction::REPLAN_REQUIRED;
+    }
+
+    std::cerr << "[FailureRecovery] task=" << ctx.task_id
+              << " memory_action=" << toString(action)
+              << " retry=" << ctx.retry_count << "/" << ctx.retry_limit
+              << " pattern="
+              << (ctx.recovery_patterns.empty() ? std::string{} : ctx.recovery_patterns.front())
+              << "\n";
+    return action;
+  }
+
   const FailureClass failureClass = classify(ctx);
   RecoveryAction action = RecoveryAction::REPLAN_REQUIRED;
 
@@ -115,6 +131,9 @@ RecoveryAction FailureRecoveryEngine::decide(const FailureContext& ctx) const {
   } else if (failureClass == FailureClass::VALIDATION_ERROR) {
     action = ctx.execution_result.rolledBack ? RecoveryAction::REPLAN_REQUIRED
                                              : RecoveryAction::SKIP_TASK;
+  } else if (ctx.repeated_failure_detected &&
+             failureClass != FailureClass::TRANSIENT_ERROR) {
+    action = RecoveryAction::REPLAN_REQUIRED;
   } else if (ctx.retry_count < ctx.retry_limit) {
     action = RecoveryAction::RETRY_TASK;
   } else if (ctx.dependency_state.has_value() &&
@@ -126,9 +145,12 @@ RecoveryAction FailureRecoveryEngine::decide(const FailureContext& ctx) const {
             << " class=" << toString(failureClass)
             << " retry=" << ctx.retry_count << "/" << ctx.retry_limit
             << " action=" << toString(action)
-            << " message=" << ctx.execution_result.message << "\n";
+            << " message=" << ctx.execution_result.message;
+  if (!ctx.recovery_patterns.empty()) {
+    std::cerr << " pattern=" << ctx.recovery_patterns.front();
+  }
+  std::cerr << "\n";
   return action;
 }
 
 }  // namespace ultra::runtime::cognitive
-

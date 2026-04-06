@@ -221,9 +221,7 @@ void OpenAIAdapter::shutdown() {
 
 nlohmann::ordered_json OpenAIAdapter::buildProviderRequest(
     const ModelRequest& request) const {
-  std::vector<std::string> tools = request.toolsAvailable;
-  std::sort(tools.begin(), tools.end());
-  tools.erase(std::unique(tools.begin(), tools.end()), tools.end());
+  std::vector<std::string> tools = providerSchemaToolNames(request);
 
   nlohmann::ordered_json messages = nlohmann::ordered_json::array();
   if (!request.systemPrompt.empty()) {

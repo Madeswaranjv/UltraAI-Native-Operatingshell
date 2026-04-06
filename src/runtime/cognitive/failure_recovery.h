@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace ultra::runtime::cognitive {
 
@@ -38,6 +39,9 @@ struct FailureContext {
   std::size_t retry_count{0U};
   std::size_t retry_limit{0U};
   std::optional<DependencyState> dependency_state{};
+  std::vector<std::string> recovery_patterns;
+  std::optional<RecoveryAction> memory_action{};
+  bool repeated_failure_detected{false};
 };
 
 class FailureRecoveryEngine {

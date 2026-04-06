@@ -1,3 +1,4 @@
+import time
 from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Static
 
@@ -27,14 +28,16 @@ class ActiveResponseView(Vertical):
         self.update_status("", "")
 
     def set_body(self, text: str) -> None:
+        if text == self._body_text:
+            return
         self._body_text = text
         self.body_label.update(text)
 
     def append_body(self, text: str) -> None:
         if not text:
             return
-        self.set_body(self._body_text + text)
-
+        self._body_text += text
+        self.body_label.update(self._body_text)
 
 class OutputPanel(VerticalScroll):
     """Scrollable output area for user messages and live AI responses."""
@@ -42,42 +45,54 @@ class OutputPanel(VerticalScroll):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.active_view: ActiveResponseView | None = None
+        self._last_scroll_time = 0.0
+        self._scroll_interval_seconds = 0.05
+
+    def _maybe_scroll_end(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if force or now - self._last_scroll_time >= self._scroll_interval_seconds:
+            self.scroll_end(animate=False)
+            self._last_scroll_time = now
+
+    def _prefix_block(self, prefix: str, text: str) -> str:
+        lines = text.splitlines() or [text]
+        return "\n".join(f"{prefix}{line}" for line in lines)
 
     def add_user_message(self, text: str) -> None:
-        self.mount(Static(f"> {text}", classes="user-msg"))
-        self.scroll_end(animate=False)
+        self.mount(Static(self._prefix_block("> ", text), classes="user-msg"))
+        self._maybe_scroll_end(force=True)
 
     def add_system_message(self, text: str) -> None:
-        self.mount(Static(f"  {text}", classes="system-msg"))
-        self.scroll_end(animate=False)
+        self.mount(Static(self._prefix_block("  ", text), classes="system-msg"))
+        self._maybe_scroll_end(force=True)
 
     def mount_new_response(self) -> None:
         self.active_view = ActiveResponseView()
         self.mount(self.active_view)
-        self.scroll_end(animate=False)
+        self._maybe_scroll_end(force=True)
 
     def update_active_status(self, banner: str = "", detail: str = "") -> None:
         if self.active_view:
             self.active_view.update_status(banner, detail)
-            self.scroll_end(animate=False)
+            self._maybe_scroll_end()
 
     def clear_active_status(self) -> None:
         if self.active_view:
             self.active_view.clear_status()
-            self.scroll_end(animate=False)
+            self._maybe_scroll_end()
 
     def update_active(self, text: str) -> None:
         if self.active_view:
             self.active_view.set_body(text)
-            self.scroll_end(animate=False)
+            self._maybe_scroll_end()
 
     def append_active(self, text: str) -> None:
         if self.active_view:
             self.active_view.append_body(text)
-            self.scroll_end(animate=False)
+            self._maybe_scroll_end()
 
     def finalize_active(self, clear_status: bool = True) -> None:
         if self.active_view and clear_status:
             self.active_view.clear_status()
         self.active_view = None
-        self.scroll_end(animate=False)
+        self._maybe_scroll_end(force=True)

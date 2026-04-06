@@ -7,7 +7,7 @@ from textual.worker import get_current_worker
 
 from components.header import UltraHeader
 from components.output import OutputPanel
-from components.input_bar import UltraInput
+from components.input_bar import UltraInput, UltraPromptSubmitted
 from components.mode_bar import ModeBar
 from components.session_setup import SessionSetup
 from core.streamer import EngineStreamer
@@ -83,17 +83,17 @@ class UltraInfinityApp(App):
 
     # ── Input Handling ───────────────────────────────────────────────────────
 
-    async def on_input_submitted(self, message) -> None:
-        input_widget = message.input
-        prompt = input_widget.value.strip()
-        if not prompt:
+    async def on_ultra_prompt_submitted(self, message: UltraPromptSubmitted) -> None:
+        input_widget = message.text_area
+        prompt = message.prompt
+        if not prompt.strip():
             return
         if self.state_manager.current_state != AppState.IDLE:
             return
 
-        input_widget.value = ""
+        input_widget.clear_prompt()
         self.state_manager.set_state(AppState.THINKING)
-        self.output_panel.add_user_message(prompt)
+        self.output_panel.add_user_message(prompt.rstrip("\n"))
         self._active_worker = self._dispatch(prompt)
 
     @work(exclusive=True)

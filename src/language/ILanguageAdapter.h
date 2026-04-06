@@ -35,9 +35,13 @@ class ILanguageAdapter {
       const std::filesystem::path& root) = 0;
 
   virtual bool applyPatch(const std::filesystem::path& root,
-                         const std::filesystem::path& diffFile) = 0;
+                          const std::filesystem::path& diffFile) = 0;
 
   virtual int getLastBuildExitCode() const { return 0; }
+
+  virtual nlohmann::json lastPatchOutcome() const {
+    return nlohmann::json::object();
+  }
 };
 
 }  // namespace ultra::language

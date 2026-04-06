@@ -9,6 +9,7 @@ out/
 *.dll
 *.log
 .vs/
+.tmp/
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake

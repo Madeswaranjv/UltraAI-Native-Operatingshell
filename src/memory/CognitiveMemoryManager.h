@@ -153,7 +153,7 @@ class CognitiveMemoryManager {
   [[nodiscard]] const IdentityState& identity() const noexcept {
     return identity_;
   }
-  [[nodiscard]] MemoryQuery query(std::size_t limit = 4U) const noexcept;
+  [[nodiscard]] MemoryQuery query(std::size_t limit = 4U) const;
 
   HotSlice working;
   EpisodicMemory episodic;

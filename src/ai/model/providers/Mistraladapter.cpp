@@ -217,9 +217,7 @@ void MistralAdapter::shutdown() {
 
 nlohmann::ordered_json MistralAdapter::buildProviderRequest(
     const ModelRequest& request) const {
-  std::vector<std::string> tools = request.toolsAvailable;
-  std::sort(tools.begin(), tools.end());
-  tools.erase(std::unique(tools.begin(), tools.end()), tools.end());
+  std::vector<std::string> tools = providerSchemaToolNames(request);
 
   // Mistral API is OpenAI-compatible with minor differences:
   // - safe_prompt field available (default false)

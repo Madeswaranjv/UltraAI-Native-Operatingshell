@@ -3,6 +3,7 @@
 #include "ai/SymbolTable.h"
 #include "core/state_manager.h"
 #include "runtime/cognitive/ExecutionKernel.h"
+#include "runtime/cognitive/contract_enforcement.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -123,10 +124,13 @@ TEST(ExecutionKernel, ExecutionKernelRejectsInvalidSnapshot) {
 
   ultra::runtime::ExecutionKernel kernel(manager);
   ultra::runtime::Action action;
+  action.id = "task.invalid_snapshot";
   action.type = ultra::runtime::ActionType::ContextExtraction;
   action.target = "coreFn";
   action.snapshotVersion = state.snapshot.version + 1U;
 
+  const ultra::runtime::contracts::ScopedTaskGraphAuthorization authorization(
+      action.id);
   const ultra::runtime::Result result = kernel.execute(action, state);
   EXPECT_FALSE(result.ok);
   EXPECT_NE(result.message.find("snapshot version"), std::string::npos);
@@ -145,6 +149,7 @@ TEST(ExecutionKernel, ExecutionKernelProducesDeterministicResults) {
   ultra::runtime::ExecutionKernel kernelB(managerB);
 
   ultra::runtime::Action actionA;
+  actionA.id = "task.simulate";
   actionA.type = ultra::runtime::ActionType::SimulateChange;
   actionA.target = "coreFn";
   actionA.snapshotVersion = stateA.snapshot.version;
@@ -152,13 +157,73 @@ TEST(ExecutionKernel, ExecutionKernelProducesDeterministicResults) {
   ultra::runtime::Action actionB = actionA;
   actionB.snapshotVersion = stateB.snapshot.version;
 
-  const ultra::runtime::Result resultA = kernelA.execute(actionA, stateA);
-  const ultra::runtime::Result resultB = kernelB.execute(actionB, stateB);
+  ultra::runtime::Result resultA;
+  {
+    const ultra::runtime::contracts::ScopedTaskGraphAuthorization authorization(
+        actionA.id);
+    resultA = kernelA.execute(actionA, stateA);
+  }
+  ultra::runtime::Result resultB;
+  {
+    const ultra::runtime::contracts::ScopedTaskGraphAuthorization authorization(
+        actionB.id);
+    resultB = kernelB.execute(actionB, stateB);
+  }
 
-  ASSERT_TRUE(resultA.ok);
-  ASSERT_TRUE(resultB.ok);
+  ASSERT_FALSE(resultA.ok);
+  ASSERT_FALSE(resultB.ok);
   EXPECT_EQ(resultA.payload.dump(), resultB.payload.dump());
   EXPECT_EQ(resultA.impactedNodes, resultB.impactedNodes);
   EXPECT_EQ(resultA.normalizedPaths, resultB.normalizedPaths);
   EXPECT_EQ(resultA.risk, resultB.risk);
+  EXPECT_EQ(resultA.message, resultB.message);
+  EXPECT_NE(resultA.message.find("SimulateChange is disabled"), std::string::npos);
+}
+
+
+TEST(ExecutionKernel, RejectsExecutionOutsideTaskGraphAuthorization) {
+  ultra::core::StateManager manager;
+  manager.replaceState(makeExecutionState(false));
+  const ultra::runtime::CognitiveState state = manager.createCognitiveState(256U);
+
+  ultra::runtime::ExecutionKernel kernel(manager);
+  ultra::runtime::Action action;
+  action.id = "task.unauthorized";
+  action.type = ultra::runtime::ActionType::ContextExtraction;
+  action.target = "coreFn";
+  action.snapshotVersion = state.snapshot.version;
+
+  const ultra::runtime::Result result = kernel.execute(action, state);
+  EXPECT_FALSE(result.ok);
+  EXPECT_NE(result.message.find("task-graph authorization"), std::string::npos);
+}
+
+TEST(ExecutionKernel, ExecuteIntentEvaluatesButDoesNotExecuteChildActions) {
+  ultra::core::StateManager manager;
+  manager.replaceState(makeExecutionState(false));
+  const ultra::runtime::CognitiveState state = manager.createCognitiveState(512U);
+
+  ultra::runtime::ExecutionKernel kernel(manager);
+  ultra::runtime::intent::Intent intentValue;
+  intentValue.goal.type = ultra::runtime::intent::GoalType::ModifySymbol;
+  intentValue.goal.target = "coreFn";
+  intentValue.constraints.tokenBudget = 512U;
+  intentValue.constraints.maxImpactDepth = 2U;
+  intentValue.constraints.maxFilesChanged = 2U;
+
+  const ultra::runtime::contracts::ScopedTaskGraphAuthorization authorization(
+      "task.intent.evaluate");
+  const ultra::runtime::Result result = kernel.executeIntent(intentValue, state);
+
+  EXPECT_EQ(result.type, ultra::runtime::ActionType::IntentEvaluation);
+  ASSERT_TRUE(result.payload.contains("ordered_tasks"));
+  ASSERT_TRUE(result.payload.contains("ranked_plans"));
+  ASSERT_TRUE(result.payload.contains("child_results"));
+  EXPECT_TRUE(result.payload.at("child_results").is_array());
+  EXPECT_TRUE(result.payload.at("child_results").empty());
+  EXPECT_FALSE(result.payload.value("tool_router_executed", false));
+  EXPECT_TRUE(result.impactedNodes.empty());
+  EXPECT_TRUE(result.normalizedPaths.empty());
+  EXPECT_TRUE(
+      result.payload.value("execution_deferred_to_task_graph", false) || !result.ok);
 }

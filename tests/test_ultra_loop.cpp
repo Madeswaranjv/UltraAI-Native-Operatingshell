@@ -4,7 +4,9 @@
 #include "core/state_manager.h"
 #include "runtime/cognitive/ExecutionKernel.h"
 #include "runtime/cognitive/micro_planner.h"
+#include "runtime/cognitive/strategy_planner.h"
 #include "runtime/cognitive/task_graph.h"
+#include "runtime/cognitive/contract_enforcement.h"
 #include "runtime/cognitive/ultra_loop.h"
 
 #include <algorithm>
@@ -89,7 +91,7 @@ ultra::ai::RuntimeState makeExecutionState() {
   return state;
 }
 
-std::vector<std::string> readyTaskIds(ultra::runtime::cognitive::TaskGraph& graph) {
+std::vector<std::string> readyTaskIds(ultra::runtime::cognitive::TaskGraph graph) {
   std::vector<std::string> ids;
   for (const auto& node : graph.get_ready_tasks()) {
     ids.push_back(node.id);
@@ -183,6 +185,19 @@ class PassThroughMicroPlanningStage final
   }
 };
 
+class RecordingMicroPlanningStage final
+    : public ultra::runtime::cognitive::IMicroPlanningStage {
+ public:
+  ultra::runtime::cognitive::StageResult run(
+      ultra::runtime::cognitive::UltraLoopFrame& frame) override {
+    strategyIds.push_back(frame.strategyId);
+    return {true, ultra::runtime::cognitive::StageSignal::Continue,
+            "recorded micro planning"};
+  }
+
+  std::vector<std::string> strategyIds;
+};
+
 class ApproveGovernanceStage final
     : public ultra::runtime::cognitive::IGovernanceStage {
  public:
@@ -219,6 +234,23 @@ class RetryVerificationStage final
   std::size_t calls_{0U};
 };
 
+class ReplanThenPassVerificationStage final
+    : public ultra::runtime::cognitive::IVerificationStage {
+ public:
+  ultra::runtime::cognitive::StageResult run(
+      ultra::runtime::cognitive::UltraLoopFrame&) override {
+    if (calls_++ == 0U) {
+      return {false, ultra::runtime::cognitive::StageSignal::Replan,
+              "verification forced feedback-driven replanning"};
+    }
+    return {true, ultra::runtime::cognitive::StageSignal::Continue,
+            "verification passed"};
+  }
+
+ private:
+  std::size_t calls_{0U};
+};
+
 class ReanchorOnceReflectionStage final
     : public ultra::runtime::cognitive::IReflectionStage {
  public:
@@ -243,6 +275,25 @@ class ReanchorOnceReflectionStage final
   std::size_t calls_{0U};
 };
 
+class StableReflectionStage final
+    : public ultra::runtime::cognitive::IReflectionStage {
+ public:
+  ultra::runtime::cognitive::StageResult run(
+      ultra::runtime::cognitive::UltraLoopFrame& frame) override {
+    ultra::runtime::cognitive::IntentConsistencyRecord record;
+    record.iteration = frame.iteration;
+    record.planId = frame.planId;
+    record.consistent = true;
+    record.reason = "intent remains aligned";
+    frame.intentConsistencyLog.push_back(record);
+    frame.intentConsistent = true;
+    frame.intentConsistencyReason = record.reason;
+    frame.reanchorRequested = false;
+    return {true, ultra::runtime::cognitive::StageSignal::Continue,
+            record.reason};
+  }
+};
+
 class PassReplanningStage final
     : public ultra::runtime::cognitive::IReplanningStage {
  public:
@@ -260,6 +311,40 @@ class PassMemoryStage final : public ultra::runtime::cognitive::IMemoryStage {
     return {true, ultra::runtime::cognitive::StageSignal::Continue,
             "memory ok"};
   }
+};
+
+class ContractViolatingGovernanceStage final
+    : public ultra::runtime::cognitive::IGovernanceStage {
+ public:
+  explicit ContractViolatingGovernanceStage(ultra::core::StateManager& manager)
+      : manager_(manager) {}
+
+  ultra::runtime::cognitive::StageResult run(
+      ultra::runtime::cognitive::UltraLoopFrame& frame) override {
+    const ultra::runtime::GraphSnapshot snapshot =
+        frame.cognitiveState != nullptr ? frame.cognitiveState->snapshot
+                                        : manager_.getSnapshot();
+    manager_.cognitiveMemory().recordIntentStart(
+        "illegal_execute_phase_write", snapshot, 0.5, 0.5,
+        "forbidden_execute_write");
+    return {true, ultra::runtime::cognitive::StageSignal::Continue,
+            "should not reach"};
+  }
+
+ private:
+  ultra::core::StateManager& manager_;
+};
+
+class RecoveryReplanStage final : public ultra::runtime::cognitive::IRecoveryStage {
+ public:
+  ultra::runtime::cognitive::StageResult run(
+      ultra::runtime::cognitive::UltraLoopFrame&) override {
+    ++calls;
+    return {true, ultra::runtime::cognitive::StageSignal::Continue,
+            "contract violation routed to replanning"};
+  }
+
+  std::size_t calls{0U};
 };
 
 bool containsTransition(const ultra::runtime::cognitive::UltraLoopReport& report,
@@ -307,6 +392,150 @@ TEST(TaskGraphRepair, ReopenTaskPreservesCompletedDependencies) {
   EXPECT_TRUE(graph.mark_running("b"));
   EXPECT_TRUE(graph.mark_completed("b"));
   EXPECT_EQ(readyTaskIds(graph), std::vector<std::string>({"c"}));
+}
+
+TEST(TaskGraphRepair, OverlayKeepsBaseUntouchedUntilVerifiedMerge) {
+  ultra::runtime::cognitive::TaskGraph graph;
+
+  ultra::runtime::cognitive::TaskNode a;
+  a.id = "a";
+  ASSERT_TRUE(graph.add_task(std::move(a)));
+
+  ultra::runtime::cognitive::TaskNode b;
+  b.id = "b";
+  b.dependencies = {"a"};
+  ASSERT_TRUE(graph.add_task(std::move(b)));
+
+  ultra::runtime::cognitive::TaskNode c;
+  c.id = "c";
+  c.dependencies = {"b"};
+  ASSERT_TRUE(graph.add_task(std::move(c)));
+
+  ultra::runtime::cognitive::TaskNode x;
+  x.id = "x";
+  ASSERT_TRUE(graph.add_task(std::move(x)));
+
+  ultra::runtime::cognitive::TaskNode y;
+  y.id = "y";
+  y.dependencies = {"x"};
+  ASSERT_TRUE(graph.add_task(std::move(y)));
+
+  ASSERT_EQ(readyTaskIds(graph), std::vector<std::string>({"a", "x"}));
+  ASSERT_TRUE(graph.mark_running("a"));
+  ASSERT_TRUE(graph.mark_completed("a"));
+  ASSERT_TRUE(graph.mark_running("x"));
+  ASSERT_TRUE(graph.mark_completed("x"));
+  ASSERT_EQ(readyTaskIds(graph), std::vector<std::string>({"b", "y"}));
+  ASSERT_TRUE(graph.mark_running("b"));
+  ASSERT_TRUE(graph.mark_failed("b"));
+  ASSERT_TRUE(graph.mark_running("y"));
+  ASSERT_TRUE(graph.mark_completed("y"));
+
+  auto overlay = graph.create_repair_overlay({"b"}, 1U);
+  ASSERT_FALSE(overlay.empty());
+  EXPECT_EQ(overlay.metadata().affectedNodes,
+            std::vector<std::string>({"b", "c"}));
+
+  ASSERT_TRUE(overlay.reopen_task("b"));
+  ASSERT_TRUE(overlay.verify());
+  EXPECT_EQ(graph.failed_tasks(), std::vector<std::string>({"b"}));
+  EXPECT_TRUE(readyTaskIds(graph).empty());
+
+  const auto merged = graph.merge_repair_overlay(overlay);
+  ASSERT_TRUE(merged.has_value());
+  EXPECT_TRUE(merged->failed_tasks().empty());
+  EXPECT_EQ(readyTaskIds(*merged), std::vector<std::string>({"b"}));
+  EXPECT_EQ(graph.failed_tasks(), std::vector<std::string>({"b"}));
+}
+
+TEST(TaskGraphRepair, BaseMutationDuringRepairPhaseThrowsOverlayBypass) {
+  ultra::runtime::cognitive::TaskGraph graph;
+
+  ultra::runtime::cognitive::TaskNode a;
+  a.id = "a";
+  ASSERT_TRUE(graph.add_task(std::move(a)));
+
+  ultra::runtime::cognitive::TaskNode b;
+  b.id = "b";
+  b.dependencies = {"a"};
+  ASSERT_TRUE(graph.add_task(std::move(b)));
+
+  ASSERT_EQ(readyTaskIds(graph), std::vector<std::string>({"a"}));
+  ASSERT_TRUE(graph.mark_running("a"));
+  ASSERT_TRUE(graph.mark_completed("a"));
+  ASSERT_EQ(readyTaskIds(graph), std::vector<std::string>({"b"}));
+  ASSERT_TRUE(graph.mark_running("b"));
+  ASSERT_TRUE(graph.mark_failed("b"));
+
+  const ultra::runtime::contracts::ScopedLoopPhase phase(
+      ultra::runtime::contracts::LoopPhase::PARTIAL_REPAIR);
+  EXPECT_THROW(graph.reopen_task("b"),
+               ultra::runtime::contracts::ContractViolationException);
+  EXPECT_THROW(graph.reset_failed("b"),
+               ultra::runtime::contracts::ContractViolationException);
+}
+
+TEST(TaskGraphRepair, RejectsMergingRepairOverlayAgainstStaleBaseSnapshot) {
+  ultra::runtime::cognitive::TaskGraph graph;
+
+  ultra::runtime::cognitive::TaskNode a;
+  a.id = "a";
+  ASSERT_TRUE(graph.add_task(std::move(a)));
+
+  ultra::runtime::cognitive::TaskNode b;
+  b.id = "b";
+  b.dependencies = {"a"};
+  ASSERT_TRUE(graph.add_task(std::move(b)));
+
+  ASSERT_EQ(readyTaskIds(graph), std::vector<std::string>({"a"}));
+  ASSERT_TRUE(graph.mark_running("a"));
+  ASSERT_TRUE(graph.mark_completed("a"));
+  ASSERT_EQ(readyTaskIds(graph), std::vector<std::string>({"b"}));
+  ASSERT_TRUE(graph.mark_running("b"));
+  ASSERT_TRUE(graph.mark_failed("b"));
+
+  auto overlay = graph.create_repair_overlay({"b"}, 1U);
+  ASSERT_TRUE(overlay.reopen_task("b"));
+  ASSERT_TRUE(overlay.verify());
+  ASSERT_TRUE(graph.reset_failed("b"));
+
+  EXPECT_THROW((void)graph.merge_repair_overlay(overlay),
+               ultra::runtime::contracts::ContractViolationException);
+}
+
+TEST(UltraLoopHelpers, TaskGraphStructuralHashIsDeterministic) {
+  ultra::runtime::cognitive::TaskGraph left;
+  ultra::runtime::cognitive::TaskNode a;
+  a.id = "a";
+  ASSERT_TRUE(left.add_task(std::move(a)));
+
+  ultra::runtime::cognitive::TaskNode b;
+  b.id = "b";
+  b.dependencies = {"a"};
+  ASSERT_TRUE(left.add_task(std::move(b)));
+
+  ultra::runtime::cognitive::TaskGraph right;
+  ultra::runtime::cognitive::TaskNode a2;
+  a2.id = "a";
+  ASSERT_TRUE(right.add_task(std::move(a2)));
+
+  ultra::runtime::cognitive::TaskNode b2;
+  b2.id = "b";
+  ASSERT_TRUE(right.add_task(std::move(b2)));
+  ASSERT_TRUE(right.add_dependency("a", "b"));
+
+  EXPECT_EQ(left.structural_hash(), right.structural_hash());
+
+  ultra::runtime::cognitive::TaskGraph different;
+  ultra::runtime::cognitive::TaskNode x;
+  x.id = "x";
+  ASSERT_TRUE(different.add_task(std::move(x)));
+  ultra::runtime::cognitive::TaskNode y;
+  y.id = "y";
+  y.dependencies = {"x"};
+  ASSERT_TRUE(different.add_task(std::move(y)));
+
+  EXPECT_NE(left.structural_hash(), different.structural_hash());
 }
 
 TEST(UltraLoopHelpers, ArbitrationSelectsBestConflictCandidate) {
@@ -411,11 +640,16 @@ TEST(UltraLoop, TransitionsThroughNewArchitecturalStates) {
   ultra::runtime::cognitive::UltraLoopConfig config;
   config.maxIterations = 4U;
   config.maxRetriesPerIteration = 2U;
+  config.maxStagnationIterations = 2U;
+  config.minImprovementDelta = 0.05;
+  config.maxPlanRepetitions = 2U;
 
   ultra::runtime::cognitive::UltraLoop loop(config);
   const auto report = loop.run(bindings);
 
   ASSERT_TRUE(report.success);
+  EXPECT_EQ(report.terminalSignal,
+            ultra::runtime::cognitive::StageSignal::SIG_CONVERGENCE_REACHED);
   EXPECT_TRUE(containsTransition(report,
                                  ultra::runtime::cognitive::UltraLoopState::PLAN,
                                  ultra::runtime::cognitive::UltraLoopState::ARBITRATION));
@@ -431,11 +665,17 @@ TEST(UltraLoop, TransitionsThroughNewArchitecturalStates) {
   EXPECT_TRUE(containsTransition(report,
                                  ultra::runtime::cognitive::UltraLoopState::RE_ANCHOR,
                                  ultra::runtime::cognitive::UltraLoopState::PLAN));
+  EXPECT_TRUE(containsTransition(report,
+                                 ultra::runtime::cognitive::UltraLoopState::REFLECT,
+                                 ultra::runtime::cognitive::UltraLoopState::PLAN));
 
   ASSERT_FALSE(report.repairs.empty());
   EXPECT_TRUE(std::any_of(report.repairs.begin(), report.repairs.end(),
                           [](const auto& repair) {
-                            return repair.site == "VERIFY";
+                            return repair.site == "VERIFY" &&
+                                   repair.verified &&
+                                   !repair.overlayId.empty() &&
+                                   !repair.affectedNodes.empty();
                           }));
   ASSERT_FALSE(report.arbitration.empty());
   EXPECT_EQ(report.arbitration.front().conflictCount, 1U);
@@ -444,4 +684,198 @@ TEST(UltraLoop, TransitionsThroughNewArchitecturalStates) {
 }
 
 
+
+
+
+TEST(UltraLoop, ContractViolationTriggersRecoveryPath) {
+  ultra::core::StateManager manager;
+  manager.replaceState(makeExecutionState());
+  const ultra::runtime::CognitiveState state = manager.createCognitiveState(512U);
+
+  ultra::runtime::intent::Intent intentValue;
+  intentValue.goal.type = ultra::runtime::intent::GoalType::ReduceImpactRadius;
+  intentValue.goal.target = "coreFn";
+  intentValue.constraints.maxImpactDepth = 2U;
+  intentValue.constraints.maxFilesChanged = 2U;
+  intentValue.constraints.tokenBudget = 512U;
+  intentValue.constraints.determinismRequired = true;
+  intentValue.risk = ultra::runtime::intent::RiskTolerance::HIGH;
+
+  ultra::runtime::ExecutionKernel kernel(manager);
+  ultra::runtime::cognitive::MicroPlanner microPlanner;
+  SeedIntentStage intentStage(intentValue, state);
+  ConflictStrategyStage strategyStage;
+  ultra::runtime::cognitive::DeterministicArbitrationStage arbitrationStage;
+  PassThroughMicroPlanningStage microPlanningStage;
+  ContractViolatingGovernanceStage governanceStage(manager);
+  RecoveryReplanStage recoveryStage;
+  RetryVerificationStage verificationStage;
+  ReanchorOnceReflectionStage reflectionStage;
+  ultra::runtime::cognitive::DeterministicReanchorStage reanchorStage;
+  PassReplanningStage replanningStage;
+  PassMemoryStage memoryStage;
+
+  ultra::runtime::cognitive::UltraLoopBindings bindings;
+  bindings.intent = &intentStage;
+  bindings.strategy = &strategyStage;
+  bindings.arbitration = &arbitrationStage;
+  bindings.microPlanning = &microPlanningStage;
+  bindings.microPlanner = &microPlanner;
+  bindings.executionKernel = &kernel;
+  bindings.governance = &governanceStage;
+  bindings.recovery = &recoveryStage;
+  bindings.verification = &verificationStage;
+  bindings.reflection = &reflectionStage;
+  bindings.reanchor = &reanchorStage;
+  bindings.replanning = &replanningStage;
+  bindings.memory = &memoryStage;
+  bindings.cognitiveMemory = &manager.cognitiveMemory();
+
+  ultra::runtime::cognitive::UltraLoopConfig config;
+  config.maxIterations = 1U;
+  config.maxRetriesPerIteration = 1U;
+  config.maxStagnationIterations = 2U;
+  config.minImprovementDelta = 0.05;
+  config.maxPlanRepetitions = 2U;
+
+  ultra::runtime::cognitive::UltraLoop loop(config);
+  const auto report = loop.run(bindings);
+
+  EXPECT_FALSE(report.success);
+  EXPECT_EQ(recoveryStage.calls, 1U);
+  EXPECT_TRUE(containsTransition(report,
+                                 ultra::runtime::cognitive::UltraLoopState::EXECUTE,
+                                 ultra::runtime::cognitive::UltraLoopState::REPLAN));
+  EXPECT_TRUE(report.terminatedByIterationCap);
+}
+TEST(StrategyPlannerFeedback, LowScoreRepeatedPlanForcesVariation) {
+  ultra::runtime::cognitive::UltraLoopFrame frame;
+  frame.iteration = 2U;
+  frame.hasStructuredIntent = true;
+  frame.structuredIntent.goal.type = ultra::runtime::intent::GoalType::ModifySymbol;
+  frame.structuredIntent.goal.target = "coreFn";
+  frame.structuredIntent.constraints.maxFilesChanged = 4U;
+  frame.structuredIntent.constraints.maxImpactDepth = 3U;
+  frame.structuredIntent.constraints.tokenBudget = 256U;
+  frame.structuredIntent.constraints.determinismRequired = true;
+  frame.structuredIntent.memory.strategyFeedback.strategyType =
+      "deterministic_modify_symbol";
+  frame.structuredIntent.memory.strategyFeedback.forceVariation = true;
+  frame.structuredIntent.memory.strategyFeedback.avoidRepeatedPlan = true;
+  frame.structuredIntent.memory.strategyFeedback.simplifyPlan = true;
+  frame.structuredIntent.memory.strategyFeedback.avoidedStrategyType =
+      "deterministic_modify_symbol";
+  frame.structuredIntent.memory.strategyFeedback.latestScore.failureCount = 2U;
+  frame.structuredIntent.memory.strategyFeedback.latestScore.recoveryCost = 0.7;
+
+  ultra::runtime::cognitive::StrategyPlanningStage stage;
+  const auto result = stage.run(frame);
+
+  ASSERT_TRUE(result.success);
+  EXPECT_NE(frame.strategyId.find("feedback_varied"), std::string::npos);
+  ASSERT_FALSE(frame.microTaskPayloads.empty());
+  ASSERT_TRUE(frame.microTaskPayloads.front().plannedAction.has_value());
+  EXPECT_EQ(frame.microTaskPayloads.front().plannedAction->estimatedFilesChanged,
+            1U);
+  EXPECT_EQ(
+      frame.microTaskPayloads.front().plannedAction->estimatedDependencyDepth,
+      1U);
+}
+
+TEST(MicroPlannerFeedback, RepeatedFailureIncreasesGranularity) {
+  ultra::runtime::cognitive::MicroPlanner planner;
+  ultra::runtime::cognitive::TaskPayload payload;
+  payload.kind = ultra::runtime::cognitive::TaskPayloadKind::Action;
+  payload.action.type = ultra::runtime::ActionType::SimulateChange;
+  payload.action.target = "coreFn";
+
+  ultra::runtime::cognitive::MicroPlanInput input;
+  input.intentId = "intent";
+  input.strategyId = "feedback_varied_modify_symbol";
+  input.planId = "plan_2";
+  input.taskPayloads = {payload};
+  input.memory.strategyFeedback.increaseTaskGranularity = true;
+  input.memory.strategyFeedback.forceVariation = true;
+
+  ultra::runtime::cognitive::TaskGraph graph = planner.generate_plan(input);
+  ASSERT_EQ(graph.size(), 3U);
+
+  auto ready = graph.get_ready_tasks();
+  ASSERT_EQ(ready.size(), 1U);
+  EXPECT_EQ(ready.front().payload.action.type,
+            ultra::runtime::ActionType::ContextExtraction);
+  ASSERT_TRUE(graph.mark_completed(ready.front().id));
+
+  ready = graph.get_ready_tasks();
+  ASSERT_EQ(ready.size(), 1U);
+  EXPECT_EQ(ready.front().payload.action.type,
+            ultra::runtime::ActionType::ImpactPrediction);
+}
+
+TEST(UltraLoopFeedback, ReplanningFeedsBackIntoNextStrategy) {
+  ultra::core::StateManager manager;
+  manager.replaceState(makeExecutionState());
+  const ultra::runtime::CognitiveState state = manager.createCognitiveState(512U);
+
+  ultra::runtime::intent::Intent intentValue;
+  intentValue.goal.type = ultra::runtime::intent::GoalType::ReduceImpactRadius;
+  intentValue.goal.target = "coreFn";
+  intentValue.constraints.maxImpactDepth = 2U;
+  intentValue.constraints.maxFilesChanged = 2U;
+  intentValue.constraints.tokenBudget = 512U;
+  intentValue.constraints.determinismRequired = true;
+  intentValue.risk = ultra::runtime::intent::RiskTolerance::MEDIUM;
+
+  ultra::runtime::ExecutionKernel kernel(manager);
+  ultra::runtime::cognitive::MicroPlanner microPlanner;
+  ultra::runtime::cognitive::StrategyPlanningStage strategyStage;
+  SeedIntentStage intentStage(intentValue, state);
+  ultra::runtime::cognitive::DeterministicArbitrationStage arbitrationStage;
+  RecordingMicroPlanningStage microPlanningStage;
+  ApproveGovernanceStage governanceStage;
+  RecoveryPassStage recoveryStage;
+  ReplanThenPassVerificationStage verificationStage;
+  StableReflectionStage reflectionStage;
+  ultra::runtime::cognitive::DeterministicReanchorStage reanchorStage;
+  PassReplanningStage replanningStage;
+  PassMemoryStage memoryStage;
+
+  ultra::runtime::cognitive::UltraLoopBindings bindings;
+  bindings.intent = &intentStage;
+  bindings.strategy = &strategyStage;
+  bindings.arbitration = &arbitrationStage;
+  bindings.microPlanning = &microPlanningStage;
+  bindings.microPlanner = &microPlanner;
+  bindings.executionKernel = &kernel;
+  bindings.governance = &governanceStage;
+  bindings.recovery = &recoveryStage;
+  bindings.verification = &verificationStage;
+  bindings.reflection = &reflectionStage;
+  bindings.reanchor = &reanchorStage;
+  bindings.replanning = &replanningStage;
+  bindings.memory = &memoryStage;
+  bindings.cognitiveMemory = &manager.cognitiveMemory();
+
+  ultra::runtime::cognitive::UltraLoopConfig config;
+  config.maxIterations = 2U;
+  config.maxRetriesPerIteration = 1U;
+  config.maxStagnationIterations = 2U;
+  config.minImprovementDelta = 0.05;
+  config.maxPlanRepetitions = 2U;
+
+  ultra::runtime::cognitive::UltraLoop loop(config);
+  const auto report = loop.run(bindings);
+
+  EXPECT_TRUE(report.terminatedByIterationCap || report.success);
+  ASSERT_GE(microPlanningStage.strategyIds.size(), 2U);
+  EXPECT_NE(microPlanningStage.strategyIds.front(),
+            microPlanningStage.strategyIds[1]);
+  EXPECT_NE(microPlanningStage.strategyIds[1].find("feedback"),
+            std::string::npos);
+  ASSERT_FALSE(report.strategyFeedback.empty());
+  ASSERT_FALSE(report.planPerformance.empty());
+  EXPECT_LE(report.planPerformance.size(), 4U);
+  EXPECT_EQ(report.strategyFeedback.back().recentPlans.size(),
+            report.planPerformance.size());
+}
 

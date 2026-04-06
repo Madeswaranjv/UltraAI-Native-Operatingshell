@@ -2143,7 +2143,7 @@ void printHelp() {
   std::cout << "  ultra graph-export <path>          Export dependency graph to .dot\n";
   std::cout << "  ultra build-fast <path>            Experimental incremental compile\n";
   std::cout << "  ultra clean-metadata <path>        Remove .ultra.* and ultra_graph.dot\n";
-  std::cout << "  ultra apply-patch <path> <diff>    Apply unified diff to project\n";
+  std::cout << "  ultra apply_patch <path> <diff>    Apply unified diff to project\n";
   std::cout << "  ultra diff <branchA> <branchB>     Deterministic cross-branch semantic diff\n\n";
 
   std::cout << "Authority API Commands:\n";
@@ -2228,6 +2228,9 @@ CLIEngine::ParsedCommand CLIEngine::parse(int argc, char* argv[]) const {
     return cmd;
   }
   cmd.name = argv[1];
+  if (cmd.name == "apply-patch") {
+    cmd.name = "apply_patch";
+  }
   for (int i = 2; i < argc; ++i) {
     cmd.args.emplace_back(argv[i]);
   }
@@ -2284,10 +2287,10 @@ bool CLIEngine::validate(const ParsedCommand& cmd) const {
       return false;
     }
   }
-  if (cmd.name == "apply-patch") {
+  if (cmd.name == "apply_patch") {
     if (cmd.args.size() != 2) {
       ultra::core::Logger::error(
-          "Command 'apply-patch' requires project path and diff file.");
+          "Command 'apply_patch' requires project path and diff file.");
       return false;
     }
   }
@@ -2886,11 +2889,11 @@ void CLIEngine::registerHandlers() {
                              adapter->buildFast(root);
                              m_lastExitCode = adapter->getLastBuildExitCode();
                            });
-  m_router.registerCommand("apply-patch",
+  m_router.registerCommand("apply_patch",
                            [this](const std::vector<std::string>& args) {
-                             try {
-                               const std::string& projectPathStr = args.at(0);
-                               const std::string& diffPathStr = args.at(1);
+                              try {
+                                const std::string& projectPathStr = args.at(0);
+                                const std::string& diffPathStr = args.at(1);
                                std::filesystem::path projectPath =
                                    ultra::utils::resolvePath(projectPathStr);
                                std::filesystem::path diffPath =
@@ -2917,17 +2920,20 @@ void CLIEngine::registerHandlers() {
                                  m_lastExitCode = 1;
                                  return;
                                }
-                               std::unique_ptr<
-                                   ultra::language::ILanguageAdapter>
-                                   adapter =
-                                       ultra::language::AdapterFactory::create(
-                                           projectPath);
-                               bool ok =
-                                   adapter->applyPatch(projectPath, diffPath);
-                               m_lastExitCode = ok ? 0 : 1;
-                             } catch (const std::exception& e) {
-                               ultra::core::Logger::error(std::string(
-                                   "Apply patch failed: ") + e.what());
+                                std::unique_ptr<
+                                    ultra::language::ILanguageAdapter>
+                                    adapter =
+                                        ultra::language::AdapterFactory::create(
+                                            projectPath);
+                                bool ok =
+                                    adapter->applyPatch(projectPath, diffPath);
+                                std::cout << adapter->lastPatchOutcome().dump() << '\n';
+                                const int patchExitCode = adapter->getLastBuildExitCode();
+                                m_lastExitCode =
+                                    ok ? 0 : (patchExitCode == 0 ? 1 : patchExitCode);
+                              } catch (const std::exception& e) {
+                                ultra::core::Logger::error(std::string(
+                                    "Apply patch failed: ") + e.what());
                                m_lastExitCode = 1;
                              } catch (...) {
                                ultra::core::Logger::error(
@@ -3899,9 +3905,28 @@ void CLIEngine::registerHandlers() {
       response["output"] = loopResult.output;
       response["execution_summary"] = loopResult.executionSummary;
       response["output_source"] = loopResult.outputSource;
+      response["tool_call_detected"] = loopResult.toolCallDetected;
+      response["tool_router_executed"] = loopResult.toolRouterExecuted;
+      response["execution_payload"] = loopResult.executionPayload;
+      response["tool_execution"] = loopResult.toolExecution;
       response["provider_used"] = loopResult.providerUsed;
       if (!loopResult.providerEndpoint.empty()) {
         response["provider_endpoint"] = loopResult.providerEndpoint;
+      }
+      response["execution_timer"] = {
+          {"start_time", loopResult.executionStartTime},
+          {"end_time", loopResult.executionEndTime},
+          {"duration_seconds", loopResult.executionDurationSeconds},
+      };
+      response["failure_traces"] = nlohmann::json::array();
+      for (const auto& trace : loopResult.failureTraces) {
+        response["failure_traces"].push_back(
+            {{"iteration", trace.iteration},
+             {"phase", trace.phase},
+             {"module", trace.module},
+             {"error_type", trace.errorType},
+             {"root_cause", trace.rootCause},
+             {"task_id", trace.taskId}});
       }
 
       response["transitions"] = nlohmann::json::array();
@@ -3920,7 +3945,11 @@ void CLIEngine::registerHandlers() {
              {"site", repair.site},
              {"task_ids", repair.taskIds},
              {"decision", repair.decision},
-             {"reason", repair.reason}});
+             {"reason", repair.reason},
+             {"overlay_id", repair.overlayId},
+             {"affected_nodes", repair.affectedNodes},
+             {"verified", repair.verified},
+             {"success_rate", repair.successRate}});
       }
 
       response["arbitration_log"] = nlohmann::json::array();
@@ -4042,7 +4071,7 @@ int CLIEngine::run(int argc, char* argv[]) {
   }
   printMetricsIfRequested(start, filesProcessed);
   if (cmd.name == "build" || cmd.name == "build-incremental" ||
-      cmd.name == "build-fast" || cmd.name == "apply-patch") {
+      cmd.name == "build-fast" || cmd.name == "apply_patch") {
     std::cout << "[BUILD] Exit code: " << m_lastExitCode << '\n';
     return m_lastExitCode;
   }

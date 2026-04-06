@@ -237,9 +237,7 @@ void AnthropicAdapter::shutdown() {
 
 nlohmann::ordered_json AnthropicAdapter::buildProviderRequest(
     const ModelRequest& request) const {
-  std::vector<std::string> tools = request.toolsAvailable;
-  std::sort(tools.begin(), tools.end());
-  tools.erase(std::unique(tools.begin(), tools.end()), tools.end());
+  std::vector<std::string> tools = providerSchemaToolNames(request);
 
   // Anthropic uses a top-level "system" field, not a system message in the
   // messages array.

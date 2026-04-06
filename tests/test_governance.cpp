@@ -4,6 +4,7 @@
 #include "core/state_manager.h"
 #include "runtime/CPUGovernor.h"
 #include "runtime/cognitive/ExecutionKernel.h"
+#include "runtime/cognitive/contract_enforcement.h"
 
 #include <algorithm>
 #include <string>
@@ -112,12 +113,15 @@ TEST(GovernanceEngine, ExecutionKernelGatesBlockedToolExecution) {
   ultra::runtime::ExecutionKernel kernel(manager);
 
   ultra::runtime::Action action;
+  action.id = "task.blocked_tool";
   action.type = ultra::runtime::ActionType::ToolExecution;
   action.toolName = "query_symbol";
   action.toolArgs = {{"target", "__ultra_nonexistent_symbol__"}};
   action.branch = state.snapshot.branch.toString();
   action.snapshotVersion = state.snapshot.version;
 
+  const ultra::runtime::contracts::ScopedTaskGraphAuthorization authorization(
+      action.id);
   const ultra::runtime::Result result = kernel.execute(action, state);
 
   EXPECT_FALSE(result.ok);

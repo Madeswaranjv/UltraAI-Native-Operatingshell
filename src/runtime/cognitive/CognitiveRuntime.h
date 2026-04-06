@@ -7,6 +7,8 @@
 #include "../governance/Policy.h"
 #include "../intent/Intent.h"
 
+#include <external/json.hpp>
+
 #include <cstddef>
 #include <string>
 
@@ -38,14 +40,22 @@ struct GovernanceSignal {
 
 struct CognitiveLoopResult {
   bool ok{false};
+  bool toolCallDetected{false};
+  bool toolRouterExecuted{false};
   std::string verifyStatus;
   std::string confidence;
   std::string llm_output;
   std::string output;
   std::string executionSummary;
   std::string outputSource;
+  nlohmann::ordered_json executionPayload = nlohmann::ordered_json::object();
+  nlohmann::ordered_json toolExecution = nlohmann::ordered_json::object();
   std::string providerUsed;
   std::string providerEndpoint;
+  std::string executionStartTime;
+  std::string executionEndTime;
+  double executionDurationSeconds{0.0};
+  std::vector<cognitive::FailureTrace> failureTraces;
   std::vector<cognitive::TransitionRecord> transitions;
   std::vector<cognitive::RepairRecord> repairs;
   std::vector<cognitive::ArbitrationDecisionRecord> arbitration;

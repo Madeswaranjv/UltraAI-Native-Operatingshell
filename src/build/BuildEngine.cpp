@@ -1,5 +1,4 @@
 #include "BuildEngine.h"
-#include "../platform/IProcessExecutor.h"
 #if defined(_WIN32)
 #include "../platform/WindowsProcessExecutor.h"
 #else
@@ -32,42 +31,14 @@ int BuildEngine::fullBuild(const std::filesystem::path& projectPath) {
   if (!executor_) {
     ultra::core::Logger::error(ultra::core::LogCategory::Build,
                                "No process executor configured.");
+    lastBuildResult_ = BuildExecutionResult{};
+    lastBuildResult_.exitCode = 1;
     return 1;
   }
 
-  std::filesystem::path cmakeLists = projectPath / "CMakeLists.txt";
-  if (!std::filesystem::exists(cmakeLists) ||
-      !std::filesystem::is_regular_file(cmakeLists)) {
-    ultra::core::Logger::error(ultra::core::LogCategory::Build,
-                               "CMakeLists.txt not found: " +
-                              projectPath.string());
-    return 1;
-  }
-  std::filesystem::path buildDir = projectPath / "build";
-  std::cout << "Build Started\n";
-  if (!std::filesystem::exists(buildDir) ||
-      !std::filesystem::is_directory(buildDir)) {
-    std::cout << "Configuring project...\n";
-    std::ostringstream cmd;
-    cmd << "cmake -S \"" << projectPath.string() << "\" -B \""
-        << buildDir.string() << "\"";
-    int code = executor_->run(cmd.str());
-    if (code != 0) {
-      std::cout << "Build failed with exit code: " << code << '\n';
-      return code;
-    }
-  }
-  std::cout << "Building project...\n";
-  std::ostringstream buildCmd;
-  buildCmd << "cmake --build \"" << buildDir.string()
-           << "\" --config Release";
-  int code = executor_->run(buildCmd.str());
-  if (code != 0) {
-    std::cout << "Build failed with exit code: " << code << '\n';
-    return code;
-  }
-  std::cout << "Build completed successfully.\n";
-  return 0;
+  BuildExecutor buildExecutor(*executor_);
+  lastBuildResult_ = buildExecutor.runReleaseBuild(projectPath);
+  return lastBuildResult_.exitCode;
 }
 
 int BuildEngine::incrementalBuild(
@@ -83,7 +54,7 @@ int BuildEngine::fastIncrementalBuild(
     std::size_t allCppCount) {
   auto delegateToFull = [this, &projectPath]() {
     ultra::core::Logger::info(ultra::core::LogCategory::Build,
-                              "Fast mode delegated to CMake. True per-file "
+                              "Fast mode delegated to Ultra CLI release build. True per-file "
                               "compilation not implemented yet.");
     return fullBuild(projectPath);
   };
@@ -104,8 +75,9 @@ int BuildEngine::fastIncrementalBuild(
   std::filesystem::path cmakeLists = projectPath / "CMakeLists.txt";
   if (!std::filesystem::exists(cmakeLists) ||
       !std::filesystem::is_regular_file(cmakeLists)) {
-    ultra::core::Logger::error(ultra::core::LogCategory::Build,
-                               "CMakeLists.txt not found.");
+    ultra::core::Logger::info(ultra::core::LogCategory::Build,
+                              "C++ fast-build prerequisites not found. "
+                              "Delegating to Ultra CLI release build.");
     return delegateToFull();
   }
   if (!std::filesystem::exists(buildDir) ||

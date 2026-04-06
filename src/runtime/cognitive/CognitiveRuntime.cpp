@@ -10,6 +10,10 @@
 #include "../governance/GovernanceEngine.h"
 
 #include <algorithm>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -67,6 +71,153 @@ namespace {
     stream << violations[index];
   }
   return stream.str();
+}
+
+[[nodiscard]] std::string formatUtcTimestamp(
+    const std::chrono::system_clock::time_point timestamp) {
+  const std::time_t rawTime = std::chrono::system_clock::to_time_t(timestamp);
+  std::tm utcTime{};
+#if defined(_WIN32)
+  gmtime_s(&utcTime, &rawTime);
+#else
+  gmtime_r(&rawTime, &utcTime);
+#endif
+  std::ostringstream stream;
+  stream << std::put_time(&utcTime, "%Y-%m-%dT%H:%M:%SZ");
+  return stream.str();
+}
+
+[[nodiscard]] std::string collapseFailureText(std::string value,
+                                              const bool underscoreSpaces) {
+  std::string collapsed;
+  collapsed.reserve(value.size());
+  bool previousWhitespace = false;
+  for (const char ch : value) {
+    if (ch == '\r' || ch == '\n' || ch == '\t' || ch == ' ') {
+      if (underscoreSpaces) {
+        if (!collapsed.empty() && collapsed.back() != '_') {
+          collapsed.push_back('_');
+        }
+      } else if (!previousWhitespace) {
+        collapsed.push_back(' ');
+      }
+      previousWhitespace = true;
+      continue;
+    }
+    collapsed.push_back(ch);
+    previousWhitespace = false;
+  }
+
+  const char trimChar = underscoreSpaces ? '_' : ' ';
+  const auto trimPos = collapsed.find_first_not_of(trimChar);
+  if (trimPos == std::string::npos) {
+    return "unknown";
+  }
+  const auto trimEnd = collapsed.find_last_not_of(trimChar);
+  return collapsed.substr(trimPos, trimEnd - trimPos + 1U);
+}
+
+[[nodiscard]] std::string failureModuleForFrame(
+    const ::ultra::runtime::cognitive::UltraLoopFrame& frame) {
+  if (frame.hasExecutionResult && frame.executionResult.payload.is_object()) {
+    if (frame.executionResult.payload.contains("tool") &&
+        frame.executionResult.payload.at("tool").is_string()) {
+      return frame.executionResult.payload.at("tool").get<std::string>();
+    }
+  }
+  if (!frame.executionId.empty()) {
+    return frame.executionId;
+  }
+  if (!frame.repairSite.empty()) {
+    return frame.repairSite;
+  }
+  if (!frame.intentTarget.empty()) {
+    return frame.intentTarget;
+  }
+  return "runtime";
+}
+
+[[nodiscard]] std::string failureRootCauseForFrame(
+    const ::ultra::runtime::cognitive::StageResult& stageResult,
+    const ::ultra::runtime::cognitive::UltraLoopFrame& frame) {
+  if (frame.hasExecutionResult) {
+    const auto& payload = frame.executionResult.payload;
+    if (payload.is_object()) {
+      if (payload.contains("output_json") && payload.at("output_json").is_object() &&
+          payload.at("output_json").contains("error") &&
+          payload.at("output_json").at("error").is_string()) {
+        return payload.at("output_json").at("error").get<std::string>();
+      }
+      if (payload.contains("governance") && payload.at("governance").is_object() &&
+          payload.at("governance").contains("reason") &&
+          payload.at("governance").at("reason").is_string()) {
+        return payload.at("governance").at("reason").get<std::string>();
+      }
+      if (payload.contains("response") && payload.at("response").is_object() &&
+          payload.at("response").contains("error_message") &&
+          payload.at("response").at("error_message").is_string()) {
+        return payload.at("response").at("error_message").get<std::string>();
+      }
+      if (payload.contains("output") && payload.at("output").is_string()) {
+        return payload.at("output").get<std::string>();
+      }
+    }
+    if (!frame.executionResult.message.empty()) {
+      return frame.executionResult.message;
+    }
+  }
+  return stageResult.message;
+}
+
+[[nodiscard]] std::string failureErrorTypeForFrame(
+    const ::ultra::runtime::cognitive::UltraLoopState phase,
+    const ::ultra::runtime::cognitive::StageResult& stageResult,
+    const ::ultra::runtime::cognitive::UltraLoopFrame& frame) {
+  if (phase == ::ultra::runtime::cognitive::UltraLoopState::VERIFY) {
+    return "verification_failed";
+  }
+  if (phase == ::ultra::runtime::cognitive::UltraLoopState::PARTIAL_REPAIR) {
+    return "repair_failed";
+  }
+  if (phase == ::ultra::runtime::cognitive::UltraLoopState::EXECUTE &&
+      frame.hasExecutionResult) {
+    switch (frame.executionResult.type) {
+      case ::ultra::runtime::ActionType::ToolExecution:
+        return "tool_execution_failed";
+      case ::ultra::runtime::ActionType::ModelGenerate:
+        return "model_generation_failed";
+      case ::ultra::runtime::ActionType::SimulateChange:
+        return "simulation_path_blocked";
+      default:
+        return "execution_failed";
+    }
+  }
+  if (stageResult.signal == ::ultra::runtime::cognitive::StageSignal::Replan) {
+    return "replan_required";
+  }
+  if (stageResult.signal ==
+      ::ultra::runtime::cognitive::StageSignal::TerminateFailure) {
+    return "terminate_failure";
+  }
+  return "stage_failure";
+}
+
+[[nodiscard]] ::ultra::runtime::cognitive::FailureTrace buildFailureTrace(
+    const ::ultra::runtime::cognitive::UltraLoopState phase,
+    const ::ultra::runtime::cognitive::StageResult& stageResult,
+    const ::ultra::runtime::cognitive::UltraLoopFrame& frame) {
+  ::ultra::runtime::cognitive::FailureTrace trace;
+  trace.iteration = frame.iteration;
+  trace.phase = ::ultra::runtime::cognitive::toString(phase);
+  trace.module = collapseFailureText(failureModuleForFrame(frame), true);
+  trace.errorType = collapseFailureText(
+      failureErrorTypeForFrame(phase, stageResult, frame),
+      true);
+  trace.rootCause = collapseFailureText(
+      failureRootCauseForFrame(stageResult, frame),
+      false);
+  trace.taskId = frame.executionId;
+  return trace;
 }
 
 [[nodiscard]] ::ultra::runtime::intent::ActionKind actionKindFromActionType(
@@ -569,6 +720,23 @@ CognitiveLoopResult CognitiveRuntime::run(
     const intent::Intent& intentValue,
     const governance::Policy& policy) {
   CognitiveLoopResult result;
+  const auto executionStartWall = std::chrono::system_clock::now();
+  const auto executionStartMonotonic = std::chrono::steady_clock::now();
+  std::vector<cognitive::FailureTrace> failureTraces;
+
+  const auto finalizeResult = [&result,
+                               &failureTraces,
+                               executionStartWall,
+                               executionStartMonotonic]() {
+    result.executionStartTime = formatUtcTimestamp(executionStartWall);
+    result.executionEndTime =
+        formatUtcTimestamp(std::chrono::system_clock::now());
+    result.executionDurationSeconds = std::chrono::duration<double>(
+                                        std::chrono::steady_clock::now() -
+                                        executionStartMonotonic)
+                                        .count();
+    result.failureTraces = failureTraces;
+  };
 
   try {
     const std::size_t fallbackBudget =
@@ -617,11 +785,31 @@ CognitiveLoopResult CognitiveRuntime::run(
     bindings.reanchor = &reanchorStage;
     bindings.replanning = &replanningStage;
     bindings.memory = &memoryStage;
+    bindings.cognitiveMemory = &stateManager_.cognitiveMemory();
 
     cognitive::UltraLoopConfig config;
+    config.maxStagnationIterations = 2U;
+    config.minImprovementDelta = 0.05;
+    config.maxPlanRepetitions = 2U;
     config.maxIterations = std::max<std::size_t>(
-        1U, static_cast<std::size_t>(std::max(1, policy.maxImpactDepth)));
+        std::max<std::size_t>(config.maxStagnationIterations + 1U,
+                              config.maxPlanRepetitions + 1U),
+        static_cast<std::size_t>(std::max(2, policy.maxImpactDepth)));
     config.maxRetriesPerIteration = 2U;
+    config.failureHook = [&failureTraces](
+                             const cognitive::UltraLoopState phase,
+                             const cognitive::StageResult& stageResult,
+                             const cognitive::UltraLoopFrame& frame) {
+      const cognitive::FailureTrace trace =
+          buildFailureTrace(phase, stageResult, frame);
+      failureTraces.push_back(trace);
+      std::cerr << "[FAILURE TRACE] phase="
+                << collapseFailureText(trace.phase, true)
+                << " module=" << collapseFailureText(trace.module, true)
+                << " error_type=" << collapseFailureText(trace.errorType, true)
+                << " root_cause=" << collapseFailureText(trace.rootCause, false)
+                << "\n";
+    };
 
     cognitive::UltraLoop loop(config);
     const cognitive::UltraLoopReport report = loop.run(bindings);
@@ -634,9 +822,6 @@ CognitiveLoopResult CognitiveRuntime::run(
     result.arbitration = report.arbitration;
     result.intentConsistency = report.intentConsistency;
 
-    // Extract model text output from the last successful execution result.
-    // ExecutionKernel caches its last ok result — we read it here so we
-    // never make a second LLM call.
     std::string modelTextOutput = executionKernel.lastModelTextOutput();
     std::string providerUsed = executionKernel.lastSelectedProvider();
     std::string providerEndpoint = executionKernel.lastProviderEndpoint();
@@ -683,45 +868,83 @@ CognitiveLoopResult CognitiveRuntime::run(
         };
     if (executionKernel.hasLastResult()) {
       const auto& lastExecutionResult = executionKernel.lastResult();
-      if (!lastExecutionResult.text_output.empty()) {
+      const nlohmann::ordered_json& payload = lastExecutionResult.payload;
+      result.executionPayload = payload;
+      if (payload.contains("tool_call_detected") &&
+          payload.at("tool_call_detected").is_boolean()) {
+        result.toolCallDetected = payload.at("tool_call_detected").get<bool>();
+      }
+      if (payload.contains("tool_router_executed") &&
+          payload.at("tool_router_executed").is_boolean()) {
+        result.toolRouterExecuted = payload.at("tool_router_executed").get<bool>();
+      }
+      if (payload.contains("tool_execution") &&
+          payload.at("tool_execution").is_object()) {
+        result.toolExecution = payload.at("tool_execution");
+      } else if (payload.contains("output_json") &&
+                 payload.at("output_json").is_object()) {
+        result.toolExecution = payload.at("output_json");
+        if (!result.toolExecution.contains("tool") &&
+            payload.contains("tool") &&
+            payload.at("tool").is_string()) {
+          result.toolExecution["tool"] = payload.at("tool").get<std::string>();
+        }
+      }
+
+      const bool hasToolExecutionPayload =
+          result.toolCallDetected || result.toolRouterExecuted ||
+          (result.toolExecution.is_object() && !result.toolExecution.empty());
+
+      if (!hasToolExecutionPayload && !lastExecutionResult.text_output.empty()) {
         modelTextOutput = lastExecutionResult.text_output;
       }
 
-      const nlohmann::ordered_json& payload = lastExecutionResult.payload;
       assignProviderMetadata(payload);
-      if (modelTextOutput.empty() &&
+      if (!hasToolExecutionPayload &&
+          modelTextOutput.empty() &&
           payload.contains("text_output") &&
           payload.at("text_output").is_string()) {
         modelTextOutput = payload.at("text_output").get<std::string>();
       }
 
-      // Walk child_results looking for a ModelGenerate entry
-      if (payload.contains("child_results") &&
+      if (!hasToolExecutionPayload &&
+          payload.contains("child_results") &&
           payload.at("child_results").is_array()) {
         for (const auto& child : payload.at("child_results")) {
-          if (!child.is_object()) { continue; }
+          if (!child.is_object()) {
+            continue;
+          }
           const bool isModelGenerate =
               child.contains("type") &&
               child.at("type").is_string() &&
               child.at("type").get<std::string>() == "ModelGenerate";
-          if (!isModelGenerate) { continue; }
+          if (!isModelGenerate) {
+            continue;
+          }
           if (!child.contains("payload") ||
-              !child.at("payload").is_object()) { continue; }
+              !child.at("payload").is_object()) {
+            continue;
+          }
           const auto& childPayload = child.at("payload");
           assignProviderMetadata(childPayload);
           if (!childPayload.contains("response") ||
-              !childPayload.at("response").is_object()) { continue; }
+              !childPayload.at("response").is_object()) {
+            continue;
+          }
           assignModelTextOutput(childPayload.at("response"));
-          if (!modelTextOutput.empty()) { break; }
+          if (!modelTextOutput.empty()) {
+            break;
+          }
         }
       }
-      // Also handle direct ModelGenerate (not wrapped in IntentEvaluation)
-      if (modelTextOutput.empty() &&
+      if (!hasToolExecutionPayload &&
+          modelTextOutput.empty() &&
           payload.contains("response") &&
           payload.at("response").is_object()) {
         assignModelTextOutput(payload.at("response"));
       }
     }
+
 
     result.llm_output = modelTextOutput;
     result.providerUsed = providerUsed;
@@ -729,17 +952,41 @@ CognitiveLoopResult CognitiveRuntime::run(
     result.executionSummary = report.message;
 
     if (!report.missingLayers.empty()) {
-      if (!result.executionSummary.empty()) { result.executionSummary += "\n"; }
+      if (!result.executionSummary.empty()) {
+        result.executionSummary += "\n";
+      }
       result.executionSummary += "Missing layers: ";
       result.executionSummary += joinViolations(report.missingLayers);
     }
-    const bool preferLlmOutput = report.success && !modelTextOutput.empty();
-    result.output = preferLlmOutput ? modelTextOutput : result.executionSummary;
-    result.outputSource = preferLlmOutput ? "llm_output" : "loop_report";
+    const bool hasToolExecution =
+        result.toolCallDetected || result.toolRouterExecuted ||
+        (result.toolExecution.is_object() && !result.toolExecution.empty());
+    const bool preferLlmOutput =
+        report.success && !hasToolExecution && !modelTextOutput.empty();
+    const std::string executionOutput =
+        result.executionSummary.empty() && hasToolExecution
+            ? std::string("Tool execution completed.")
+            : result.executionSummary;
+    result.output = preferLlmOutput ? modelTextOutput : executionOutput;
+    result.outputSource = preferLlmOutput ? "llm_output"
+                                          : (hasToolExecution ? "tool_execution"
+                                                              : "loop_report");
     if (!report.success) {
       result.errorMessage = result.executionSummary.empty()
                                 ? "UltraLoop execution failed."
                                 : result.executionSummary;
+    }
+
+    if (!report.success && failureTraces.empty()) {
+      cognitive::FailureTrace trace;
+      trace.iteration = report.iterations;
+      trace.phase = cognitive::toString(report.terminalState);
+      trace.module = "UltraLoop";
+      trace.errorType = "terminal_failure";
+      trace.rootCause = collapseFailureText(
+          report.message.empty() ? "UltraLoop execution failed." : report.message,
+          false);
+      failureTraces.push_back(std::move(trace));
     }
   } catch (const std::exception& ex) {
     result.ok = false;
@@ -749,6 +996,14 @@ CognitiveLoopResult CognitiveRuntime::run(
     result.output = result.executionSummary;
     result.outputSource = "runtime_error";
     result.errorMessage = ex.what();
+    failureTraces.push_back({
+        0U,
+        "RUNTIME",
+        "CognitiveRuntime",
+        "exception",
+        collapseFailureText(ex.what(), false),
+        {},
+    });
   } catch (...) {
     result.ok = false;
     result.verifyStatus = "FAIL";
@@ -757,8 +1012,17 @@ CognitiveLoopResult CognitiveRuntime::run(
     result.output = result.executionSummary;
     result.outputSource = "runtime_error";
     result.errorMessage = "Cognitive runtime failed with an unknown error.";
+    failureTraces.push_back({
+        0U,
+        "RUNTIME",
+        "CognitiveRuntime",
+        "exception",
+        "Cognitive runtime failed with an unknown error.",
+        {},
+    });
   }
 
+  finalizeResult();
   return result;
 }
 

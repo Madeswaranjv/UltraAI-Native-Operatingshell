@@ -1,0 +1,30 @@
+{
+  "intent": {
+    "raw_prompt": "Modify tmp_end_to_end_apply_patch.txt by replacing alpha with beta and inspect the changes",
+    "action": "modify",
+    "targets": [
+      "tmp_end_to_end_apply_patch.txt"
+    ],
+    "goal_summary": "replace alpha with beta in tmp_end_to_end_apply_patch.txt",
+    "constraints": [],
+    "risk_level": "medium",
+    "requires_planning": true
+  },
+  "session": {
+    "project_root": "E:\\Projects\\UltraInfinity",
+    "governance": {
+      "require_plan_approval": true,
+      "require_action_approval": false,
+      "max_iterations": 4,
+      "protected_paths": [],
+      "forbidden_actions": []
+    },
+    "policy": {
+      "risk_tolerance": "medium",
+      "strategy_style": "balanced",
+      "auto_commit": false,
+      "run_tests_after_change": false,
+      "custom_rules": []
+    }
+  }
+}

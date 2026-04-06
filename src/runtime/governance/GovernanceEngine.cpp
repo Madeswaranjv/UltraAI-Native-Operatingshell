@@ -185,29 +185,6 @@ GovernanceReport GovernanceEngine::evaluate(const intent::Strategy& strategy,
   report.reason = report.approved ? "Approved by governance policy."
                                   : "Rejected by governance policy.";
 
-  if (memoryManager != nullptr) {
-    memoryManager->recordRiskEvaluation("governance_risk:" + strategy.name,
-                                        state.snapshot, report.risk.value,
-                                        report.approved ? 0.20 : 0.90,
-                                        report.determinism.value,
-                                        "governance_risk_classified");
-    memoryManager->recordMergeOutcome("governance:" + strategy.name, state.snapshot,
-                                      report.approved, report.reason);
-    memory::StrategicOutcome outcome;
-    outcome.version = state.snapshot.version;
-    outcome.category = "governance";
-    outcome.subject = strategy.name;
-    outcome.success = report.approved;
-    outcome.rolledBack = !report.approved;
-    outcome.predictedRisk = clamp01(report.risk.value);
-    outcome.observedRisk = report.approved ? 0.1 : 0.9;
-    outcome.estimatedTokens = report.tokenCost.estimatedTokens;
-    outcome.compressedTokens = report.tokenCost.estimatedTokens;
-    outcome.predictedConfidence = report.determinism.value;
-    outcome.observedConfidence = report.approved ? 0.85 : 0.15;
-    memoryManager->strategic.recordOutcome(outcome);
-    memoryManager->applyStrategicAdjustments();
-  }
 
   return report;
 }

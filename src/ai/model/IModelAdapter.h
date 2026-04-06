@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ultra::ai::model {
@@ -52,10 +53,25 @@ inline nlohmann::ordered_json toJson(const ModelInfo& info) {
   return payload;
 }
 
-inline nlohmann::ordered_json toJson(const ModelRequest& request) {
+inline std::string providerSchemaToolName(std::string tool) {
+  return tool;
+}
+
+inline std::vector<std::string> providerSchemaToolNames(
+    const ModelRequest& request) {
   std::vector<std::string> tools = request.toolsAvailable;
   std::sort(tools.begin(), tools.end());
   tools.erase(std::unique(tools.begin(), tools.end()), tools.end());
+  for (std::string& tool : tools) {
+    tool = providerSchemaToolName(std::move(tool));
+  }
+  std::sort(tools.begin(), tools.end());
+  tools.erase(std::unique(tools.begin(), tools.end()), tools.end());
+  return tools;
+}
+
+inline nlohmann::ordered_json toJson(const ModelRequest& request) {
+  std::vector<std::string> tools = providerSchemaToolNames(request);
 
   nlohmann::ordered_json toolsPayload = nlohmann::ordered_json::array();
   for (const std::string& tool : tools) {

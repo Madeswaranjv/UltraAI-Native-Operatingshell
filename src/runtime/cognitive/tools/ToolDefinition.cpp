@@ -11,7 +11,7 @@ bool ToolDefinition::is_valid() const noexcept {
 
 std::vector<ToolDefinition> defaultToolDefinitions() {
   std::vector<ToolDefinition> tools;
-  tools.reserve(5U);
+  tools.reserve(6U);
 
   tools.push_back(ToolDefinition{
       "query_symbol",
@@ -43,8 +43,13 @@ std::vector<ToolDefinition> defaultToolDefinitions() {
       {},
       "Runtime daemon status and indexing diagnostics."});
 
+  tools.push_back(ToolDefinition{
+      "apply_patch",
+      "Apply a unified diff via 'ultra apply_patch <path> <diff>'.",
+      {},
+      "Patch application result with verification and build status."});
+
   return tools;
 }
 
 }  // namespace ultra::runtime::cognitive::tools
-

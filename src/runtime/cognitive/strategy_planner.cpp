@@ -114,6 +114,167 @@ double riskValueForTolerance(const intent::RiskTolerance tolerance) {
   return 0.50;
 }
 
+bool hasMemoryConstraint(const intent::IntentMemoryContext& memory,
+                         const std::string_view value) {
+  return std::any_of(memory.knownConstraints.begin(),
+                     memory.knownConstraints.end(),
+                     [value](const std::string& entry) {
+                       return entry == value;
+                     });
+}
+
+std::string firstMemoryPattern(const std::vector<std::string>& values) {
+  return values.empty() ? std::string{} : values.front();
+}
+
+double aggregateFeedbackScore(const intent::StrategyScore& score) {
+  return std::clamp((score.successRate * 0.35) +
+                        ((1.0 - score.recoveryCost) * 0.20) +
+                        (score.executionEfficiency * 0.25) +
+                        (score.confidenceScore * 0.20),
+                    0.0,
+                    1.0);
+}
+
+nlohmann::ordered_json recentPlanPerformanceJson(
+    const intent::IntentMemoryContext& memory) {
+  nlohmann::ordered_json recentPlans = nlohmann::ordered_json::array();
+  for (const intent::PlanPerformance& plan : memory.recentPlanPerformance) {
+    recentPlans.push_back({
+        {"plan_hash", plan.planHash},
+        {"score", plan.score},
+        {"iteration_index", plan.iterationIndex},
+        {"strategy_type", plan.strategyType},
+    });
+  }
+  return recentPlans;
+}
+
+intent::ActionKind memoryAdjustedActionKind(const intent::Intent& intentValue) {
+  const bool guarded = intentValue.memory.repeatedFailureDetected ||
+                       hasMemoryConstraint(intentValue.memory, "tight_scope") ||
+                       intentValue.memory.strategyFeedback.simplifyPlan ||
+                       intentValue.memory.strategyFeedback.increaseTaskGranularity ||
+                       intentValue.memory.strategyFeedback.forceVariation;
+  if (!guarded) {
+    return actionKindForGoal(intentValue.goal.type);
+  }
+
+  if (intentValue.goal.type == intent::GoalType::RefactorModule) {
+    return intent::ActionKind::ModifySymbolBody;
+  }
+
+  return actionKindForGoal(intentValue.goal.type);
+}
+
+std::string memoryStrategyName(const intent::Intent& intentValue) {
+  const intent::StrategyFeedbackMemory& feedback = intentValue.memory.strategyFeedback;
+  if (feedback.reinforcePattern && !feedback.preferredStrategyType.empty()) {
+    return "feedback_reuse_" + normalizeToken(feedback.preferredStrategyType);
+  }
+  if (feedback.forceVariation || feedback.avoidRepeatedPlan) {
+    return "feedback_varied_" + normalizeToken(intent::toString(intentValue.goal.type));
+  }
+  if (feedback.simplifyPlan || feedback.increaseTaskGranularity ||
+      intentValue.memory.repeatedFailureDetected) {
+    return "feedback_guarded_" + normalizeToken(intent::toString(intentValue.goal.type));
+  }
+  if (intentValue.memory.hasReusableStrategy) {
+    return "memory_reuse_" + normalizeToken(intent::toString(intentValue.goal.type));
+  }
+  return "deterministic_" + normalizeToken(intent::toString(intentValue.goal.type));
+}
+
+std::string memoryStrategyDetails(const intent::Intent& intentValue) {
+  std::string details = "Deterministic fallback strategy action.";
+  const intent::StrategyFeedbackMemory& feedback = intentValue.memory.strategyFeedback;
+
+  if (feedback.reinforcePattern && !feedback.preferredStrategyType.empty()) {
+    details = "Reinforce high-score strategy: " + feedback.preferredStrategyType;
+  } else if (intentValue.memory.hasReusableStrategy) {
+    const std::string pattern = firstMemoryPattern(intentValue.memory.successfulPatterns);
+    if (!pattern.empty()) {
+      details = "Reuse successful pattern: " + pattern;
+    }
+  }
+
+  const std::string failedPattern = firstMemoryPattern(intentValue.memory.failedPatterns);
+  if (!failedPattern.empty()) {
+    details += " Avoid prior failure: " + failedPattern;
+  }
+
+  if (!feedback.strategyType.empty()) {
+    details += " Last strategy=" + feedback.strategyType;
+    details += " score=" + std::to_string(aggregateFeedbackScore(feedback.latestScore));
+  }
+  if (feedback.forceVariation) {
+    details += " Force variation from repeated low-score plan.";
+  }
+  if (feedback.simplifyPlan) {
+    details += " Simplify execution after recovery-heavy iteration.";
+  }
+  if (feedback.increaseTaskGranularity) {
+    details += " Increase task granularity.";
+  }
+  if (!feedback.avoidedStrategyType.empty()) {
+    details += " Avoid strategy: " + feedback.avoidedStrategyType;
+  }
+
+  return details;
+}
+
+std::size_t memoryScopedFilesChanged(const intent::Intent& intentValue) {
+  const std::size_t filesConstraint =
+      std::max<std::size_t>(1U, intentValue.constraints.maxFilesChanged);
+  const intent::StrategyFeedbackMemory& feedback = intentValue.memory.strategyFeedback;
+  if (intentValue.memory.repeatedFailureDetected ||
+      hasMemoryConstraint(intentValue.memory, "tight_scope") ||
+      feedback.simplifyPlan || feedback.increaseTaskGranularity ||
+      feedback.forceVariation) {
+    return 1U;
+  }
+  if (feedback.reinforcePattern || intentValue.memory.hasReusableStrategy) {
+    return std::min<std::size_t>(filesConstraint, 2U);
+  }
+  return 1U;
+}
+
+std::size_t memoryScopedDependencyDepth(const intent::Intent& intentValue) {
+  const std::size_t depthConstraint =
+      std::max<std::size_t>(1U, intentValue.constraints.maxImpactDepth);
+  const intent::StrategyFeedbackMemory& feedback = intentValue.memory.strategyFeedback;
+  if (intentValue.memory.repeatedFailureDetected ||
+      hasMemoryConstraint(intentValue.memory, "tight_scope") ||
+      feedback.simplifyPlan || feedback.increaseTaskGranularity ||
+      feedback.forceVariation) {
+    return 1U;
+  }
+  if (feedback.reinforcePattern || intentValue.memory.hasReusableStrategy) {
+    return std::min<std::size_t>(depthConstraint, 2U);
+  }
+  return 1U;
+}
+
+double memoryAdjustedRisk(const intent::Intent& intentValue) {
+  const intent::StrategyFeedbackMemory& feedback = intentValue.memory.strategyFeedback;
+  double value = riskValueForTolerance(intentValue.risk);
+  if (feedback.reinforcePattern && !feedback.forceVariation &&
+      !intentValue.memory.repeatedFailureDetected) {
+    value = std::max(0.10, value - 0.15);
+  } else if (intentValue.memory.hasReusableStrategy &&
+             !intentValue.memory.repeatedFailureDetected) {
+    value = std::max(0.10, value - 0.10);
+  }
+  if (intentValue.memory.repeatedFailureDetected || feedback.simplifyPlan ||
+      feedback.increaseTaskGranularity || feedback.forceVariation) {
+    value = std::min(value, 0.30);
+  }
+  if (feedback.reinforcePattern && feedback.latestScore.confidenceScore >= 0.80) {
+    value = std::max(0.10, value - 0.05);
+  }
+  return value;
+}
+
 std::optional<std::size_t> parseSizeToken(const std::string_view token) {
   const std::string trimmed = trimCopy(token);
   if (trimmed.empty()) {
@@ -417,6 +578,35 @@ model::ModelRequest buildModelRequest(const intent::Intent& intentValue) {
                   {"target", intentValue.goal.target} }},
       {"risk_tolerance", intent::toString(intentValue.risk)},
       {"branch_scope", intentValue.constraints.branchScope},
+      {"memory", {
+          {"query_key", intentValue.memory.queryKey},
+          {"successful_patterns", intentValue.memory.successfulPatterns},
+          {"failed_patterns", intentValue.memory.failedPatterns},
+          {"known_constraints", intentValue.memory.knownConstraints},
+          {"prior_outcomes", intentValue.memory.priorOutcomes},
+          {"repeated_failure_detected", intentValue.memory.repeatedFailureDetected},
+          {"strategy_feedback", {
+              {"strategy_type", intentValue.memory.strategyFeedback.strategyType},
+              {"outcome", intentValue.memory.strategyFeedback.outcome},
+              {"plan_hash", intentValue.memory.strategyFeedback.planHash},
+              {"reinforce_pattern", intentValue.memory.strategyFeedback.reinforcePattern},
+              {"simplify_plan", intentValue.memory.strategyFeedback.simplifyPlan},
+              {"increase_task_granularity", intentValue.memory.strategyFeedback.increaseTaskGranularity},
+              {"avoid_repeated_plan", intentValue.memory.strategyFeedback.avoidRepeatedPlan},
+              {"force_variation", intentValue.memory.strategyFeedback.forceVariation},
+              {"preferred_strategy_type", intentValue.memory.strategyFeedback.preferredStrategyType},
+              {"avoided_strategy_type", intentValue.memory.strategyFeedback.avoidedStrategyType},
+              {"latest_score", {
+                  {"success_rate", intentValue.memory.strategyFeedback.latestScore.successRate},
+                  {"failure_count", intentValue.memory.strategyFeedback.latestScore.failureCount},
+                  {"recovery_cost", intentValue.memory.strategyFeedback.latestScore.recoveryCost},
+                  {"execution_efficiency", intentValue.memory.strategyFeedback.latestScore.executionEfficiency},
+                  {"confidence_score", intentValue.memory.strategyFeedback.latestScore.confidenceScore},
+                  {"overall_score", aggregateFeedbackScore(intentValue.memory.strategyFeedback.latestScore)}
+              }},
+              {"recent_plans", recentPlanPerformanceJson(intentValue.memory)}
+          }}
+      }},
   };
 
   request.constraints = {
@@ -658,25 +848,30 @@ void StrategyPlanner::setModel(model::IModel* model) noexcept {
 intent::Strategy StrategyPlanner::generateDeterministic(
     const intent::Intent& intentValue) const {
   intent::Strategy strategy;
-  strategy.name =
-      "deterministic_" + normalizeToken(intent::toString(intentValue.goal.type));
+  strategy.name = memoryStrategyName(intentValue);
+
+  const std::size_t estimatedFilesChanged = memoryScopedFilesChanged(intentValue);
+  const std::size_t estimatedDependencyDepth =
+      memoryScopedDependencyDepth(intentValue);
 
   intent::Action action;
-  action.kind = actionKindForGoal(intentValue.goal.type);
+  action.kind = memoryAdjustedActionKind(intentValue);
   action.target = defaultTarget(intentValue);
-  action.details = "Deterministic fallback strategy action.";
-  action.estimatedFilesChanged = 1U;
-  action.estimatedDependencyDepth = 1U;
-  action.publicApiSurface = false;
+  action.details = memoryStrategyDetails(intentValue);
+  action.estimatedFilesChanged = estimatedFilesChanged;
+  action.estimatedDependencyDepth = estimatedDependencyDepth;
+  action.publicApiSurface = intentValue.options.allowPublicAPIChange &&
+                            !hasMemoryConstraint(intentValue.memory,
+                                                 "avoid_public_api");
   strategy.proposedActions.push_back(std::move(action));
 
-  strategy.risk.value = riskValueForTolerance(intentValue.risk);
+  strategy.risk.value = memoryAdjustedRisk(intentValue);
   strategy.risk.classification = intentValue.risk;
   strategy.risk.tolerance = intentValue.risk;
 
   strategy.impact.radius = strategy.risk.value;
-  strategy.impact.estimatedFiles = 1U;
-  strategy.impact.dependencyDepth = 1U;
+  strategy.impact.estimatedFiles = estimatedFilesChanged;
+  strategy.impact.dependencyDepth = estimatedDependencyDepth;
   strategy.impact.centrality = 0.0;
   strategy.impact.maxFilesConstraint =
       std::max<std::size_t>(1U, intentValue.constraints.maxFilesChanged);
@@ -690,8 +885,11 @@ intent::Strategy StrategyPlanner::generateDeterministic(
   strategy.tokenCost.budget = intentValue.constraints.tokenBudget;
   strategy.tokenCost.estimatedTokens = std::min<std::size_t>(
       strategy.tokenCost.budget,
-      std::max<std::size_t>(1U, strategy.tokenCost.budget / 8U));
-  strategy.tokenCost.withinBudget = true;
+      std::max<std::size_t>(
+          1U,
+          (estimatedFilesChanged * 128U) + (estimatedDependencyDepth * 64U)));
+  strategy.tokenCost.withinBudget =
+      strategy.tokenCost.estimatedTokens <= strategy.tokenCost.budget;
 
   return strategy;
 }

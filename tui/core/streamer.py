@@ -58,7 +58,24 @@ MODEL_RESPONSE_RE = re.compile(
     r"^\[ULTRA-DEBUG\] ModelGenerate response\. ok=(?P<ok>true|false) "
     r"error=(?P<error>.*?) output_len=(?P<output_len>\d+)$"
 )
-
+TOOL_CALL_DETECTED_RE = re.compile(
+    r"^\[TOOL_CALL_DETECTED\] count=(?P<count>\d+) "
+    r"source=(?P<source>\S+) tools=(?P<tools>.*)$"
+)
+TOOL_ROUTER_EXECUTED_RE = re.compile(
+    r"^\[TOOL_ROUTER_EXECUTED\] tool=(?P<tool>\S+) "
+    r"transport=(?P<transport>\S+) ok=(?P<ok>true|false)$"
+)
+EXECUTION_KERNEL_APPLIED_RE = re.compile(
+    r"^\[EXECUTION_KERNEL_APPLIED\] tool=(?P<tool>\S+) "
+    r"ok=(?P<ok>true|false) applied=(?P<applied>true|false)"
+    r"(?: file_verified=(?P<file_verified>true|false))?$"
+)
+FAILURE_TRACE_RE = re.compile(
+    r"^\[FAILURE TRACE\] phase=(?P<phase>\S+) "
+    r"module=(?P<module>\S+) error_type=(?P<error_type>\S+) "
+    r"root_cause=(?P<root_cause>.*)$"
+)
 LOOP_PHASE_TO_APP_STATE = {
     "INIT": AppState.INITIALIZING,
     "PLAN": AppState.PLANNING,
@@ -273,6 +290,53 @@ class EngineStreamer:
             self._render_live_status(live)
             return
 
+        tool_call_match = TOOL_CALL_DETECTED_RE.match(normalized)
+        if tool_call_match:
+            live.event_detail = (
+                f"tool call detected via {tool_call_match.group('source')} • "
+                f"{tool_call_match.group('tools') or tool_call_match.group('count')}"
+            )
+            self._render_live_status(live)
+            return
+
+        tool_router_match = TOOL_ROUTER_EXECUTED_RE.match(normalized)
+        if tool_router_match:
+            live.event_detail = (
+                f"tool router executed {tool_router_match.group('tool')} • "
+                f"{tool_router_match.group('transport')} • "
+                f"{tool_router_match.group('ok')}"
+            )
+            self._render_live_status(live)
+            return
+
+        execution_applied_match = EXECUTION_KERNEL_APPLIED_RE.match(normalized)
+        if execution_applied_match:
+            verified = execution_applied_match.group("file_verified")
+            verification_label = (
+                f" • verified={verified}" if verified is not None else ""
+            )
+            live.event_detail = (
+                f"execution applied {execution_applied_match.group('tool')} • "
+                f"ok={execution_applied_match.group('ok')} • "
+                f"applied={execution_applied_match.group('applied')}"
+                f"{verification_label}"
+            )
+            self._render_live_status(live)
+            return
+
+        failure_trace_match = FAILURE_TRACE_RE.match(normalized)
+        if failure_trace_match:
+            failure_phase = failure_trace_match.group("phase")
+            if failure_phase in LOOP_PHASE_TO_APP_STATE:
+                live.phase = failure_phase
+                self.sm.set_state(LOOP_PHASE_TO_APP_STATE[failure_phase])
+            live.event_detail = (
+                f"failure {failure_trace_match.group('module')}: "
+                f"{failure_trace_match.group('root_cause')}"
+            )
+            self._render_live_status(live)
+            return
+
         task_output_match = TASK_OUTPUT_RE.match(normalized)
         if task_output_match:
             live.event_detail = (
@@ -306,13 +370,13 @@ class EngineStreamer:
             next_index = self._next_output_break(text, rendered)
             self.output.append_active(text[rendered:next_index])
             rendered = next_index
-            await asyncio.sleep(random.uniform(0.02, 0.05))
+            await asyncio.sleep(0.01)
 
         self.output.update_active(text)
         live.output_revealed = True
 
     def _next_output_break(self, text: str, start: int) -> int:
-        end = min(len(text), start + random.randint(14, 32))
+        end = min(len(text), start + random.randint(72, 192))
         while end < len(text) and not text[end - 1].isspace() and not text[end].isspace():
             end += 1
         return min(end, len(text))
@@ -408,23 +472,86 @@ class EngineStreamer:
             ),
         )
 
+    def _execution_timer_text(self, backend_result: dict) -> str:
+        timer = backend_result.get("execution_timer")
+        if isinstance(timer, dict):
+            duration = timer.get("duration_seconds")
+            try:
+                return f"Total execution time: {float(duration):.2f} seconds"
+            except (TypeError, ValueError):
+                return ""
+        return ""
+
+    def _tool_execution_lines(self, backend_result: dict) -> list[str]:
+        tool_execution = backend_result.get("tool_execution")
+        if not isinstance(tool_execution, dict):
+            return []
+
+        tool_name = str(tool_execution.get("tool", "") or "tool")
+        ok = str(bool(tool_execution.get("ok", False))).lower()
+        lines = [f"[tool] {tool_name} ok={ok}"]
+
+        if "applied" in tool_execution:
+            lines.append(f"applied={str(bool(tool_execution.get('applied'))).lower()}")
+        if "file_verified" in tool_execution:
+            lines.append(
+                f"file_verified={str(bool(tool_execution.get('file_verified'))).lower()}"
+            )
+        error_text = str(tool_execution.get("error", "") or "")
+        if error_text.strip():
+            lines.append(f"error={error_text}")
+        stderr_text = str(backend_result.get("_stderr", "") or "").strip()
+        if ok == "false" and stderr_text and stderr_text != error_text:
+            lines.append(f"stderr={stderr_text}")
+        return lines
+
+    def _failure_trace_lines(self, backend_result: dict) -> list[str]:
+        traces = backend_result.get("failure_traces")
+        if not isinstance(traces, list):
+            return []
+
+        lines: list[str] = []
+        for trace in traces:
+            if not isinstance(trace, dict):
+                continue
+            phase = str(trace.get("phase", "unknown") or "unknown")
+            module = str(trace.get("module", "unknown") or "unknown")
+            error_type = str(trace.get("error_type", "unknown") or "unknown")
+            root_cause = str(trace.get("root_cause", "unknown") or "unknown")
+            lines.append(
+                f"[FAILURE TRACE] phase={phase} module={module} "
+                f"error_type={error_type} root_cause={root_cause}"
+            )
+        return lines
+
     def _final_output_text(self, backend_result: dict) -> str:
         llm_output = str(
             backend_result.get("llm_output", backend_result.get("llmOutput", "")) or ""
         )
         if llm_output.strip():
-            return llm_output
+            base_text = llm_output
+        else:
+            output = str(backend_result.get("output", "") or "")
+            if output.strip():
+                base_text = output
+            else:
+                error = str(backend_result.get("error", "") or "")
+                if error.strip():
+                    base_text = f"Backend error: {error}"
+                else:
+                    base_text = "(No output returned by cognitive_run.)"
 
-        output = str(backend_result.get("output", "") or "")
-        if output.strip():
-            return output
-
-        error = str(backend_result.get("error", "") or "")
-        if error.strip():
-            return f"Backend error: {error}"
-
-        return "(No output returned by cognitive_run.)"
-
+        sections = [base_text.strip()]
+        tool_lines = self._tool_execution_lines(backend_result)
+        if tool_lines:
+            sections.append("\n".join(tool_lines))
+        timer_text = self._execution_timer_text(backend_result)
+        if timer_text:
+            sections.append(timer_text)
+        failure_lines = self._failure_trace_lines(backend_result)
+        if failure_lines:
+            sections.append("\n".join(failure_lines))
+        return "\n\n".join(section for section in sections if section)
     def _normalize_backend_result(self, result: dict) -> dict:
         normalized = dict(result) if isinstance(result, dict) else {}
 
@@ -793,7 +920,7 @@ class EngineStreamer:
 
         if ultra_bin is None:
             return self._error_backend_response(
-                "ultra binary not found in PATH or build/. Run cmake --build build first."
+                "ultra binary not found in PATH or build/. Run ultra build --release first."
             )
 
         payload_file: Optional[str] = None
@@ -804,7 +931,7 @@ class EngineStreamer:
                 delete=False,
                 suffix=".json",
             ) as temp_payload:
-                temp_payload.write(json.dumps(payload))
+                temp_payload.write(json.dumps(payload, ensure_ascii=False))
                 payload_file = temp_payload.name
 
             proc = subprocess.Popen(

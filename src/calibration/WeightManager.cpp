@@ -5,23 +5,11 @@
 #include <fstream>
 #include <iostream>
 #include <algorithm>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <thread>
 #include <vector>
 
 namespace {
 
 constexpr int kMaxWriteAttempts = 2;
-
-struct PersistenceState {
-  std::mutex mutex;
-  bool workerRunning{false};
-  bool persistenceDisabled{false};
-  bool failureLogged{false};
-  std::optional<nlohmann::json> pendingPayload;
-};
 
 nlohmann::json buildSortedPayload(
     const std::unordered_map<std::string, float>& weights) {
@@ -36,26 +24,6 @@ nlohmann::json buildSortedPayload(
     payload[name] = weights.at(name);
   }
   return payload;
-}
-
-std::shared_ptr<PersistenceState> persistenceStateForPath(
-    const std::filesystem::path& path) {
-  static std::mutex registryMutex;
-  static std::unordered_map<std::string, std::weak_ptr<PersistenceState>>
-      registry;
-
-  const std::string key = path.lexically_normal().string();
-  std::lock_guard<std::mutex> lock(registryMutex);
-  const auto found = registry.find(key);
-  if (found != registry.end()) {
-    if (std::shared_ptr<PersistenceState> existing = found->second.lock()) {
-      return existing;
-    }
-  }
-
-  auto created = std::make_shared<PersistenceState>();
-  registry[key] = created;
-  return created;
 }
 
 bool writePayloadWithRetry(const std::filesystem::path& weightsFile,
@@ -81,82 +49,6 @@ bool writePayloadWithRetry(const std::filesystem::path& weightsFile,
   return false;
 }
 
-void runPersistenceWorker(const std::filesystem::path& weightsFile,
-                          const std::shared_ptr<PersistenceState>& state) {
-  while (true) {
-    std::optional<nlohmann::json> pendingPayload;
-    {
-      std::lock_guard<std::mutex> lock(state->mutex);
-      if (state->persistenceDisabled) {
-        state->pendingPayload.reset();
-        state->workerRunning = false;
-        return;
-      }
-
-      if (!state->pendingPayload.has_value()) {
-        state->workerRunning = false;
-        return;
-      }
-
-      pendingPayload = std::move(state->pendingPayload);
-      state->pendingPayload.reset();
-    }
-
-    if (pendingPayload.has_value() &&
-        writePayloadWithRetry(weightsFile, *pendingPayload)) {
-      continue;
-    }
-
-    bool shouldLog = false;
-    {
-      std::lock_guard<std::mutex> lock(state->mutex);
-      state->persistenceDisabled = true;
-      state->pendingPayload.reset();
-      state->workerRunning = false;
-      if (!state->failureLogged) {
-        shouldLog = true;
-        state->failureLogged = true;
-      }
-    }
-
-    if (shouldLog) {
-      ultra::core::Logger::error(
-          ultra::core::LogCategory::General,
-          "Failed to write weights.json after " +
-              std::to_string(kMaxWriteAttempts) + " attempts: " +
-              weightsFile.string() +
-              " (disabling calibration persistence for this process)");
-    }
-    return;
-  }
-}
-
-void enqueueNonBlockingSave(const std::filesystem::path& weightsFile,
-                            nlohmann::json payload) {
-  const std::shared_ptr<PersistenceState> state =
-      persistenceStateForPath(weightsFile);
-
-  bool startWorker = false;
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->persistenceDisabled) {
-      return;
-    }
-
-    state->pendingPayload = std::move(payload);
-    if (!state->workerRunning) {
-      state->workerRunning = true;
-      startWorker = true;
-    }
-  }
-
-  if (startWorker) {
-    std::thread([weightsFile, state]() {
-      runPersistenceWorker(weightsFile, state);
-    }).detach();
-  }
-}
-
 }  // namespace
 
 namespace ultra::calibration {
@@ -179,7 +71,7 @@ float WeightManager::getWeight(const std::string& name, float defaultVal) const 
 
 void WeightManager::setWeight(const std::string& name, float value) {
   weights_[name] = value;
-  enqueueNonBlockingSave(weightsFile_, buildSortedPayload(weights_));
+  (void)save();
 }
 
 bool WeightManager::load() {

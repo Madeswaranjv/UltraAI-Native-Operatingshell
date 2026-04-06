@@ -11,6 +11,10 @@
 #include <string_view>
 #include <vector>
 
+namespace ultra::memory {
+class CognitiveMemoryManager;
+}
+
 namespace ultra::runtime::cognitive {
 
 enum class UltraLoopState : std::uint8_t {
@@ -34,10 +38,49 @@ enum class StageSignal : std::uint8_t {
   Retry = 1U,
   Replan = 2U,
   TerminateSuccess = 3U,
-  TerminateFailure = 4U
+  TerminateFailure = 4U,
+  SIG_CONVERGENCE_REACHED = 5U
 };
 
 [[nodiscard]] const char* toString(StageSignal signal) noexcept;
+
+struct ConvergenceSample {
+  std::size_t iteration{0U};
+  double verificationScore{0.0};
+  double goalDistanceMetric{0.0};
+  std::uint64_t planSignatureHash{0U};
+  double deltaImprovement{0.0};
+};
+
+struct ConvergenceDecision {
+  bool reached{false};
+  StageSignal signal{StageSignal::Continue};
+  bool verificationStagnated{false};
+  bool goalDistanceStable{false};
+  bool repeatedPlan{false};
+  bool diminishingReturns{false};
+  std::string reason;
+};
+
+class ConvergenceTracker {
+ public:
+  explicit ConvergenceTracker(std::size_t capacity = 4U);
+
+  void observe(ConvergenceSample sample);
+
+  [[nodiscard]] ConvergenceDecision evaluate(
+      std::size_t maxStagnationIterations,
+      double minImprovementDelta,
+      std::size_t maxPlanRepetitions) const;
+
+  [[nodiscard]] const std::vector<ConvergenceSample>& history() const noexcept;
+
+ private:
+  void trimHistory();
+
+  std::size_t capacity_{0U};
+  std::vector<ConvergenceSample> history_;
+};
 
 struct RepairRecord {
   std::size_t iteration{0U};
@@ -46,6 +89,10 @@ struct RepairRecord {
   std::vector<std::string> taskIds;
   std::string decision;
   std::string reason;
+  std::string overlayId;
+  std::vector<std::string> affectedNodes;
+  bool verified{false};
+  double successRate{0.0};
 };
 
 struct ArbitrationDecisionRecord {
@@ -62,6 +109,15 @@ struct IntentConsistencyRecord {
   bool consistent{true};
   std::string planId;
   std::string reason;
+};
+
+struct FailureTrace {
+  std::size_t iteration{0U};
+  std::string phase;
+  std::string module;
+  std::string errorType;
+  std::string rootCause;
+  std::string taskId;
 };
 
 struct UltraLoopFrame {
@@ -94,6 +150,16 @@ struct UltraLoopFrame {
   TaskGraph taskGraph{};
   bool hasExecutionResult{false};
   ::ultra::runtime::Result executionResult{};
+  double verificationScore{0.0};
+  double goalDistanceMetric{0.0};
+  std::uint64_t planSignatureHash{0U};
+  double deltaImprovement{0.0};
+  ::ultra::runtime::intent::StrategyScore currentStrategyScore{};
+  ::ultra::runtime::intent::StrategyFeedbackMemory latestStrategyFeedback{};
+  std::vector<::ultra::runtime::intent::StrategyFeedbackMemory>
+      strategyFeedbackLog;
+  std::vector<::ultra::runtime::intent::PlanPerformance> planPerformanceHistory;
+  std::size_t feedbackCommittedIteration{0U};
 
   std::string intentId;
   std::string originalIntentId;
@@ -210,6 +276,7 @@ struct UltraLoopBindings {
   IReanchorStage* reanchor{nullptr};
   IReplanningStage* replanning{nullptr};
   IMemoryStage* memory{nullptr};
+  const ::ultra::memory::CognitiveMemoryManager* cognitiveMemory{nullptr};
 };
 
 struct TransitionRecord {
@@ -221,6 +288,9 @@ struct TransitionRecord {
 struct UltraLoopConfig {
   std::size_t maxIterations{8U};
   std::size_t maxRetriesPerIteration{2U};
+  std::size_t maxStagnationIterations{2U};
+  double minImprovementDelta{0.05};
+  std::size_t maxPlanRepetitions{2U};
   std::function<void(UltraLoopState,
                      const StageResult&,
                      const UltraLoopFrame&)>
@@ -231,6 +301,7 @@ struct UltraLoopReport {
   bool success{false};
   bool terminatedByIterationCap{false};
   UltraLoopState terminalState{UltraLoopState::TERMINATE};
+  StageSignal terminalSignal{StageSignal::Continue};
   std::size_t iterations{0U};
   std::size_t retries{0U};
   std::vector<std::string> missingLayers;
@@ -238,6 +309,9 @@ struct UltraLoopReport {
   std::vector<RepairRecord> repairs;
   std::vector<ArbitrationDecisionRecord> arbitration;
   std::vector<IntentConsistencyRecord> intentConsistency;
+  std::vector<::ultra::runtime::intent::StrategyFeedbackMemory>
+      strategyFeedback;
+  std::vector<::ultra::runtime::intent::PlanPerformance> planPerformance;
   std::string message;
 };
 

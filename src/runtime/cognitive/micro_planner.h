@@ -12,6 +12,7 @@ struct MicroPlanInput {
   std::string strategyId;
   std::string planId;
   std::vector<TaskPayload> taskPayloads;
+  ::ultra::runtime::intent::IntentMemoryContext memory;
 };
 
 class MicroPlanner {

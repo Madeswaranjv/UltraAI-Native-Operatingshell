@@ -1,5 +1,7 @@
 #pragma once
 
+#include "BuildExecutor.h"
+
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -27,8 +29,21 @@ class BuildEngine {
                                    const std::vector<std::string>& rebuildSet,
                                    std::size_t allCppCount);
 
+  [[nodiscard]] bool lastBuildRequired() const noexcept {
+    return lastBuildResult_.buildRequired;
+  }
+
+  [[nodiscard]] bool lastBuildExecuted() const noexcept {
+    return lastBuildResult_.buildExecuted;
+  }
+
+  [[nodiscard]] const BuildExecutionResult& lastBuildResult() const noexcept {
+    return lastBuildResult_;
+  }
+
  private:
   std::unique_ptr<ultra::platform::IProcessExecutor> executor_;
+  BuildExecutionResult lastBuildResult_{};
 };
 
 }  // namespace ultra::build

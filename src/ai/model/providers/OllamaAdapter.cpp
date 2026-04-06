@@ -256,9 +256,7 @@ void OllamaAdapter::shutdown() {
 
 nlohmann::ordered_json OllamaAdapter::buildProviderRequest(
     const ModelRequest& request) const {
-  std::vector<std::string> tools = request.toolsAvailable;
-  std::sort(tools.begin(), tools.end());
-  tools.erase(std::unique(tools.begin(), tools.end()), tools.end());
+  std::vector<std::string> tools = providerSchemaToolNames(request);
 
   nlohmann::ordered_json toolsPayload = nlohmann::ordered_json::array();
   for (const std::string& tool : tools) {

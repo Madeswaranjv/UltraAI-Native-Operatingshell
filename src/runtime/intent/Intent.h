@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace ultra::runtime::intent {
 
@@ -42,11 +43,56 @@ struct StrategyOptions {
   bool allowCrossModuleMove{false};
 };
 
+struct StrategyScore {
+  double successRate{0.0};
+  std::size_t failureCount{0U};
+  double recoveryCost{0.0};
+  double executionEfficiency{0.0};
+  double confidenceScore{0.0};
+};
+
+struct PlanPerformance {
+  std::uint64_t planHash{0U};
+  double score{0.0};
+  std::size_t iterationIndex{0U};
+  std::string strategyType;
+};
+
+struct StrategyFeedbackMemory {
+  std::string strategyType;
+  std::string outcome;
+  std::uint64_t planHash{0U};
+  StrategyScore latestScore{};
+  std::vector<PlanPerformance> recentPlans;
+  bool reinforcePattern{false};
+  bool simplifyPlan{false};
+  bool increaseTaskGranularity{false};
+  bool avoidRepeatedPlan{false};
+  bool forceVariation{false};
+  std::string preferredStrategyType;
+  std::string avoidedStrategyType;
+};
+
+struct IntentMemoryContext {
+  std::string queryKey;
+  std::vector<std::string> pastSimilarGoals;
+  std::vector<std::string> knownConstraints;
+  std::vector<std::string> priorOutcomes;
+  std::vector<std::string> successfulPatterns;
+  std::vector<std::string> failedPatterns;
+  std::vector<std::string> recoveryPatterns;
+  StrategyFeedbackMemory strategyFeedback{};
+  std::vector<PlanPerformance> recentPlanPerformance;
+  bool repeatedFailureDetected{false};
+  bool hasReusableStrategy{false};
+};
+
 struct Intent {
   Goal goal;
   Constraints constraints;
   RiskTolerance risk{RiskTolerance::MEDIUM};
   StrategyOptions options;
+  IntentMemoryContext memory;
 };
 
 [[nodiscard]] std::string toString(GoalType type);
@@ -56,4 +102,3 @@ struct Intent {
                                      std::size_t fallbackTokenBudget);
 
 }  // namespace ultra::runtime::intent
-

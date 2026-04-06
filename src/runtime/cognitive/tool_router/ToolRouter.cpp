@@ -41,6 +41,15 @@ std::string quoteForShell(const std::string& raw) {
   return escaped;
 }
 
+std::string commandWithWorkingDirectory(const std::filesystem::path& cwd,
+                                        const std::string& command) {
+#if defined(_WIN32)
+  return "cd /d " + quoteForShell(cwd.string()) + " && " + command;
+#else
+  return "cd " + quoteForShell(cwd.string()) + " && " + command;
+#endif
+}
+
 std::string lowerAscii(std::string value) {
   std::transform(value.begin(),
                  value.end(),
@@ -70,12 +79,63 @@ bool seemsBinaryText(const std::string& content) {
   return content.find('\0') != std::string::npos;
 }
 
+std::string canonicalToolName(std::string tool) {
+  // Route through the canonical underscore tool namespace while
+  // accepting legacy hyphenated aliases.
+  std::replace(tool.begin(), tool.end(), '-', '_');
+  return tool;
+}
+
 std::string formatToolResponse(const nlohmann::ordered_json& payload) {
   const std::string dumped = payload.dump();
   if (!payload.value("ok", true)) {
     return "ERROR: " + dumped;
   }
   return dumped;
+}
+
+std::optional<nlohmann::ordered_json> parseTrailingJsonLine(
+    const std::string& text) {
+  std::size_t candidateEnd = text.size();
+  while (candidateEnd > 0U &&
+         (text[candidateEnd - 1U] == '\n' || text[candidateEnd - 1U] == '\r' ||
+          text[candidateEnd - 1U] == ' ' || text[candidateEnd - 1U] == '\t')) {
+    --candidateEnd;
+  }
+  if (candidateEnd == 0U) {
+    return std::nullopt;
+  }
+
+  while (candidateEnd > 0U) {
+    std::size_t lineStart = text.rfind('\n', candidateEnd - 1U);
+    lineStart = lineStart == std::string::npos ? 0U : lineStart + 1U;
+    while (lineStart < candidateEnd &&
+           (text[lineStart] == '\r' || text[lineStart] == ' ' ||
+            text[lineStart] == '\t')) {
+      ++lineStart;
+    }
+    if (lineStart < candidateEnd && text[lineStart] == '{') {
+      try {
+        nlohmann::ordered_json parsed = nlohmann::ordered_json::parse(
+            text.substr(lineStart, candidateEnd - lineStart));
+        if (parsed.is_object()) {
+          return parsed;
+        }
+      } catch (...) {
+      }
+    }
+
+    if (lineStart == 0U) {
+      break;
+    }
+    candidateEnd = lineStart - 1U;
+    while (candidateEnd > 0U &&
+           (text[candidateEnd - 1U] == '\n' || text[candidateEnd - 1U] == '\r')) {
+      --candidateEnd;
+    }
+  }
+
+  return std::nullopt;
 }
 
 ToolRouter::CommandResult runWithPlatformExecutor(const std::string& command) {
@@ -99,11 +159,11 @@ ToolRouter::CommandResult runWithPlatformExecutor(const std::string& command) {
 #if defined(_WIN32)
   ultra::platform::WindowsProcessExecutor executor;
   const ultra::platform::ProcessResult processResult =
-      executor.execute("cmd /C " + quoteForShell(redirected));
+      executor.execute(redirected);
 #else
   ultra::platform::UnixProcessExecutor executor;
   const ultra::platform::ProcessResult processResult =
-      executor.execute("/bin/sh -lc " + quoteForShell(redirected));
+      executor.execute(redirected);
 #endif
 
   result.exitCode = processResult.exitCode;
@@ -148,12 +208,15 @@ ToolRouter::ToolRouter(CommandRunner commandRunner,
 std::string ToolRouter::route_and_execute(
     const std::string& tool,
     const std::map<std::string, std::string>& args) {
-  if (const std::optional<std::string> localResult = execute_local_tool(tool, args);
+  const std::string dispatchTool = canonicalToolName(tool);
+
+  if (const std::optional<std::string> localResult =
+          execute_local_tool(dispatchTool, args);
       localResult.has_value()) {
     return *localResult;
   }
 
-  const std::optional<std::string> command = build_command(tool, args);
+  const std::optional<std::string> command = build_command(dispatchTool, args);
   if (!command.has_value()) {
     return "ERROR: invalid tool request or missing arguments for tool '" + tool +
            "'.";
@@ -174,7 +237,7 @@ std::string ToolRouter::route_and_execute(
     return secondAttempt;
   }
 
-  if (tool == "read_source") {
+  if (dispatchTool == "read_source") {
     if (const std::optional<std::string> fallback = fallback_read_source(args);
         fallback.has_value()) {
       core::Logger::warning(
@@ -233,6 +296,9 @@ std::optional<std::string> ToolRouter::execute_local_tool(
   }
   if (tool == "search_files") {
     return execute_search_files(args);
+  }
+  if (tool == "apply_patch") {
+    return execute_apply_patch(args);
   }
   if (tool == "run_command") {
     return execute_run_command(args);
@@ -580,6 +646,137 @@ std::string ToolRouter::execute_search_files(
   return formatToolResponse(payload);
 }
 
+std::string ToolRouter::execute_apply_patch(
+    const std::map<std::string, std::string>& args) const {
+  nlohmann::ordered_json payload;
+  payload["ok"] = false;
+  payload["applied"] = false;
+  payload["file_verified"] = false;
+  payload["exit_code"] = 1;
+  payload["stdout"] = "";
+  payload["stderr"] = "";
+  payload["diff_bytes"] = 0;
+
+  const std::string diffText =
+      find_argument(args, "diff")
+          .value_or(find_argument(args, "changes").value_or(std::string{}));
+  if (diffText.empty()) {
+    payload["error"] = "missing required argument: diff or changes";
+    return formatToolResponse(payload);
+  }
+
+  const std::filesystem::path projectPath(
+      find_argument(args, "project_path")
+          .value_or(std::filesystem::current_path().generic_string()));
+  payload["project_path"] = projectPath.generic_string();
+  if (const std::optional<std::string> fileArg = find_argument(args, "file");
+      fileArg.has_value()) {
+    payload["file"] = *fileArg;
+  }
+  if (const std::optional<std::string> pathArg = find_argument(args, "path");
+      pathArg.has_value()) {
+    payload["path"] = *pathArg;
+  }
+
+  std::error_code ec;
+  if (!std::filesystem::exists(projectPath, ec) || ec ||
+      !std::filesystem::is_directory(projectPath, ec)) {
+    payload["error"] = "project_path is not a directory: " +
+                         projectPath.generic_string();
+    return formatToolResponse(payload);
+  }
+
+  const std::filesystem::path tempDir = std::filesystem::temp_directory_path(ec);
+  const auto suffix =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  const std::filesystem::path diffPath =
+      (ec ? std::filesystem::path("ultra_apply_patch.diff")
+          : tempDir / ("ultra_apply_patch_" + std::to_string(suffix) + ".diff"));
+
+  {
+    std::ofstream output(diffPath, std::ios::binary | std::ios::trunc);
+    if (!output.is_open()) {
+      payload["error"] = "failed to create temporary diff file";
+      return formatToolResponse(payload);
+    }
+    output << diffText;
+    if (!output.good()) {
+      payload["error"] = "failed while writing temporary diff file";
+      std::error_code removeError;
+      std::filesystem::remove(diffPath, removeError);
+      return formatToolResponse(payload);
+    }
+  }
+
+  payload["diff_bytes"] = static_cast<std::int64_t>(diffText.size());
+  const std::string command = commandWithWorkingDirectory(
+      projectPath,
+      "ultra apply_patch " + quote_argument(projectPath.string()) + " " +
+          quote_argument(diffPath.string()));
+  const CommandResult commandResult =
+      commandRunner_ ? commandRunner_(command) : CommandResult{};
+
+  const std::string stdoutText =
+      limit_output(commandResult.output, kMaxCommandOutputBytes);
+  const std::string stderrText =
+      limit_output(commandResult.error, kMaxCommandOutputBytes);
+  std::error_code removeError;
+  std::filesystem::remove(diffPath, removeError);
+
+  payload["stdout"] = stdoutText;
+  payload["stderr"] = stderrText;
+  payload["exit_code"] = commandResult.exitCode;
+  payload["duration_ms"] = commandResult.durationMs;
+  payload["applied"] = commandResult.exitCode == 0;
+  payload["ok"] = commandResult.exitCode == 0;
+
+  if (const std::optional<nlohmann::ordered_json> summary =
+          parseTrailingJsonLine(stdoutText);
+      summary.has_value()) {
+    payload["patch_result"] = *summary;
+    if (summary->contains("applied") && (*summary)["applied"].is_boolean()) {
+      payload["applied"] = (*summary)["applied"].get<bool>();
+    }
+    if (summary->contains("file_verified") &&
+        (*summary)["file_verified"].is_boolean()) {
+      payload["file_verified"] = (*summary)["file_verified"].get<bool>();
+    }
+    if (summary->contains("ok") && (*summary)["ok"].is_boolean()) {
+      payload["ok"] =
+          payload["ok"].get<bool>() && (*summary)["ok"].get<bool>();
+    }
+    if (summary->contains("build_required")) {
+      payload["build_required"] = (*summary)["build_required"];
+    }
+    if (summary->contains("build_executed")) {
+      payload["build_executed"] = (*summary)["build_executed"];
+    }
+    if (summary->contains("build_exit_code")) {
+      payload["build_exit_code"] = (*summary)["build_exit_code"];
+    }
+    if (summary->contains("rolled_back")) {
+      payload["rolled_back"] = (*summary)["rolled_back"];
+    }
+    if (!payload["ok"].get<bool>() && summary->contains("error") &&
+        (*summary)["error"].is_string()) {
+      payload["error"] = (*summary)["error"].get<std::string>();
+    }
+  }
+
+  if (!payload["ok"].get<bool>() && !payload.contains("error")) {
+    if (!stderrText.empty()) {
+      payload["error"] = stderrText;
+    } else if (!stdoutText.empty()) {
+      payload["error"] = stdoutText;
+    } else {
+      payload["error"] =
+          "ultra apply_patch failed with exit code " +
+          std::to_string(commandResult.exitCode);
+    }
+  }
+  return formatToolResponse(payload);
+}
+
 std::string ToolRouter::execute_run_command(
     const std::map<std::string, std::string>& args) const {
   nlohmann::ordered_json payload;
@@ -634,11 +831,11 @@ std::string ToolRouter::execute_run_command(
 #if defined(_WIN32)
   ultra::platform::WindowsProcessExecutor executor;
   const ultra::platform::ProcessResult processResult =
-      executor.execute("cmd /C " + quoteForShell(redirected));
+      executor.execute(redirected);
 #else
   ultra::platform::UnixProcessExecutor executor;
   const ultra::platform::ProcessResult processResult =
-      executor.execute("/bin/sh -lc " + quoteForShell(redirected));
+      executor.execute(redirected);
 #endif
 
   std::string stdoutText = slurpFile(stdoutPath);

@@ -11,6 +11,7 @@
 #include "../../memory/lru_manager.h"
 #include "../governance/Policy.h"
 #include "../intent/Intent.h"
+#include "../intent/Strategy.h"
 
 #include <external/json.hpp>
 
@@ -109,6 +110,9 @@ class ExecutionKernel {
       std::shared_ptr<ai::orchestration::IMultiModelOrchestrator>
           modelOrchestrator = nullptr);
 
+  [[nodiscard]] static Action buildActionFromStrategy(
+      const intent::Action& strategyAction,
+      const CognitiveState& state);
   Result execute(const Action& action, const CognitiveState& state);
   Result executeIntent(const intent::Intent& intent,
                        const CognitiveState& state,

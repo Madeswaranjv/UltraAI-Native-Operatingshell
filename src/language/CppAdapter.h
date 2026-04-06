@@ -24,9 +24,11 @@ class CppAdapter : public ILanguageAdapter {
                   const std::filesystem::path& diffFile) override;
 
   int getLastBuildExitCode() const override { return lastBuildExitCode_; }
+  nlohmann::json lastPatchOutcome() const override { return lastPatchOutcome_; }
 
  private:
   int lastBuildExitCode_{0};
+  nlohmann::json lastPatchOutcome_ = nlohmann::json::object();
 };
 
 }  // namespace ultra::language

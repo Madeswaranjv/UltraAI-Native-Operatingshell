@@ -22,6 +22,7 @@ TEST(ToolRegistryTest, RegistersDefaultTools) {
   EXPECT_NE(registry.get_tool("impact_analysis"), nullptr);
   EXPECT_NE(registry.get_tool("get_context"), nullptr);
   EXPECT_NE(registry.get_tool("get_status"), nullptr);
+  EXPECT_NE(registry.get_tool("apply_patch"), nullptr);
 }
 
 TEST(ToolRegistryTest, RejectsInvalidToolDefinitions) {

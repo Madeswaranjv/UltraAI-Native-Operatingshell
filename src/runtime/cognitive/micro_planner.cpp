@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -105,6 +106,119 @@ TaskPayload fallbackPayload(const std::string& target) {
   return payload;
 }
 
+bool hasMemoryConstraint(const ::ultra::runtime::intent::IntentMemoryContext& memory,
+                         const std::string_view value) {
+  return std::any_of(memory.knownConstraints.begin(),
+                     memory.knownConstraints.end(),
+                     [value](const std::string& entry) {
+                       return entry == value;
+                     });
+}
+
+bool memoryContainsHint(const ::ultra::runtime::intent::IntentMemoryContext& memory,
+                        const std::initializer_list<std::string_view> hints) {
+  const auto containsAny = [&hints](const std::vector<std::string>& values) {
+    return std::any_of(values.begin(), values.end(),
+                       [&hints](const std::string& entry) {
+                         const std::string normalized = normalizeToken(entry);
+                         return std::any_of(hints.begin(), hints.end(),
+                                            [&normalized](const std::string_view hint) {
+                                              return normalized.find(normalizeToken(std::string(hint))) !=
+                                                     std::string::npos;
+                                            });
+                       });
+  };
+
+  return containsAny(memory.successfulPatterns) ||
+         containsAny(memory.failedPatterns) ||
+         containsAny(memory.recoveryPatterns);
+}
+
+bool isActionPayloadType(const TaskPayload& payload,
+                         const ::ultra::runtime::ActionType type) {
+  return payload.kind == TaskPayloadKind::Action && payload.action.type == type;
+}
+
+std::size_t firstActionPayloadIndex(const std::vector<TaskPayload>& payloads) {
+  for (std::size_t index = 0U; index < payloads.size(); ++index) {
+    if (payloads[index].kind == TaskPayloadKind::Action) {
+      return index;
+    }
+  }
+  return payloads.size();
+}
+
+TaskPayload preflightPayload(const ::ultra::runtime::ActionType type,
+                             const std::string& target) {
+  TaskPayload payload;
+  payload.kind = TaskPayloadKind::Action;
+  payload.action.type = type;
+  payload.action.target = target;
+  return payload;
+}
+
+TaskPayload memoryPreflightPayload(
+    const std::string& target,
+    const ::ultra::runtime::intent::IntentMemoryContext& memory) {
+  return preflightPayload(
+      memoryContainsHint(memory, {"impact", "dependency", "radius"})
+          ? ::ultra::runtime::ActionType::ImpactPrediction
+          : ::ultra::runtime::ActionType::ContextExtraction,
+      target);
+}
+
+void injectAdaptivePreflight(std::vector<TaskPayload>& payloads,
+                             const MicroPlanInput& input,
+                             const std::string& target) {
+  const bool requirePreflight = input.memory.repeatedFailureDetected ||
+                                hasMemoryConstraint(input.memory, "require_preflight");
+  const bool forceGranularity =
+      input.memory.strategyFeedback.increaseTaskGranularity ||
+      input.memory.strategyFeedback.forceVariation ||
+      input.memory.strategyFeedback.avoidRepeatedPlan;
+  if (!(requirePreflight || forceGranularity)) {
+    return;
+  }
+
+  std::size_t insertionIndex = firstActionPayloadIndex(payloads);
+  if (insertionIndex >= payloads.size()) {
+    return;
+  }
+
+  if (requirePreflight &&
+      !(isActionPayloadType(payloads[insertionIndex],
+                            ::ultra::runtime::ActionType::ContextExtraction) ||
+        isActionPayloadType(payloads[insertionIndex],
+                            ::ultra::runtime::ActionType::ImpactPrediction))) {
+    payloads.insert(payloads.begin() + insertionIndex,
+                    memoryPreflightPayload(target, input.memory));
+    ++insertionIndex;
+  }
+
+  if (!forceGranularity) {
+    return;
+  }
+
+  insertionIndex = firstActionPayloadIndex(payloads);
+  if (!isActionPayloadType(payloads[insertionIndex],
+                           ::ultra::runtime::ActionType::ContextExtraction)) {
+    payloads.insert(payloads.begin() + insertionIndex,
+                    preflightPayload(::ultra::runtime::ActionType::ContextExtraction,
+                                     target));
+    ++insertionIndex;
+  } else {
+    ++insertionIndex;
+  }
+
+  if (insertionIndex >= payloads.size() ||
+      !isActionPayloadType(payloads[insertionIndex],
+                           ::ultra::runtime::ActionType::ImpactPrediction)) {
+    payloads.insert(payloads.begin() + std::min(insertionIndex, payloads.size()),
+                    preflightPayload(::ultra::runtime::ActionType::ImpactPrediction,
+                                     target));
+  }
+}
+
 TaskPayload normalizePayload(TaskPayload payload,
                              const std::string& target,
                              const std::string& taskId) {
@@ -191,6 +305,7 @@ TaskGraph MicroPlanner::generate_plan(const MicroPlanInput& input) const {
   if (payloads.empty()) {
     payloads.push_back(fallbackPayload(target));
   }
+  injectAdaptivePreflight(payloads, input, target);
 
   TaskGraph graph;
   std::string previousTaskId;

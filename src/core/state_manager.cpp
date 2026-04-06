@@ -6,6 +6,7 @@
 #include "../metrics/PerformanceMetrics.h"
 #include "../runtime/change_queue.h"
 #include "../runtime/CPUGovernor.h"
+#include "../runtime/cognitive/contract_enforcement.h"
 
 #include <algorithm>
 #include <chrono>
@@ -584,7 +585,13 @@ void StateManager::ensureSnapshotCurrent(
     const runtime::GraphSnapshot& snapshot) const {
   std::shared_lock lock(graphMutex_);
   if (snapshot.version != globalVersion_) {
-    throw std::runtime_error("Snapshot version mismatch. Request a fresh snapshot.");
+    throw ::ultra::runtime::contracts::ContractViolationException({
+        ::ultra::runtime::contracts::LayerId::L5_OVERLAY,
+        ::ultra::runtime::contracts::ViolationType::OverlayBypass,
+        "StateManager::ensureSnapshotCurrent",
+        "Snapshot version mismatch. Request a fresh snapshot.",
+        ::ultra::runtime::contracts::ContractValidator::currentPhase(),
+    });
   }
 }
 
@@ -597,21 +604,24 @@ KernelMutationOutcome StateManager::applyOverlayMutation(
         "state_manager::apply_overlay_mutation");
   }
   if (!mutation) {
-    return KernelMutationOutcome{
-        false, false, 0U, 0U, {}, {}, "Overlay mutation callback is empty."};
+    throw ::ultra::runtime::contracts::ContractViolationException({
+        ::ultra::runtime::contracts::LayerId::L5_OVERLAY,
+        ::ultra::runtime::contracts::ViolationType::OverlayBypass,
+        "StateManager::applyOverlayMutation",
+        "Overlay mutation callback is empty.",
+        ::ultra::runtime::contracts::ContractValidator::currentPhase(),
+    });
   }
 
   std::unique_lock lock(graphMutex_);
   if (expectedSnapshot.version != globalVersion_) {
-    return KernelMutationOutcome{false,
-                                 false,
-                                 globalVersion_,
-                                 globalVersion_,
-                                 graph_ ? graph_->getDeterministicHash()
-                                        : std::string{},
-                                 graph_ ? graph_->getDeterministicHash()
-                                        : std::string{},
-                                 "Snapshot version mismatch. Request a fresh snapshot."};
+    throw ::ultra::runtime::contracts::ContractViolationException({
+        ::ultra::runtime::contracts::LayerId::L5_OVERLAY,
+        ::ultra::runtime::contracts::ViolationType::OverlayBypass,
+        "StateManager::applyOverlayMutation",
+        "Snapshot version mismatch. Request a fresh snapshot.",
+        ::ultra::runtime::contracts::ContractValidator::currentPhase(),
+    });
   }
 
   KernelMutationOutcome outcome;
@@ -623,24 +633,22 @@ KernelMutationOutcome StateManager::applyOverlayMutation(
     try {
       expectedHash = expectedSnapshot.deterministicHash();
     } catch (...) {
-      return KernelMutationOutcome{
-          false,
-          false,
-          globalVersion_,
-          globalVersion_,
-          outcome.hashBefore,
-          outcome.hashBefore,
-          "Snapshot hash mismatch. Request a fresh snapshot."};
+      throw ::ultra::runtime::contracts::ContractViolationException({
+          ::ultra::runtime::contracts::LayerId::L4_GRAPH,
+          ::ultra::runtime::contracts::ViolationType::ImmutableMutation,
+          "StateManager::applyOverlayMutation",
+          "Snapshot hash mismatch. Request a fresh snapshot.",
+          ::ultra::runtime::contracts::ContractValidator::currentPhase(),
+      });
     }
     if (expectedHash != outcome.hashBefore) {
-      return KernelMutationOutcome{
-          false,
-          false,
-          globalVersion_,
-          globalVersion_,
-          outcome.hashBefore,
-          outcome.hashBefore,
-          "Snapshot hash mismatch. Request a fresh snapshot."};
+      throw ::ultra::runtime::contracts::ContractViolationException({
+          ::ultra::runtime::contracts::LayerId::L4_GRAPH,
+          ::ultra::runtime::contracts::ViolationType::ImmutableMutation,
+          "StateManager::applyOverlayMutation",
+          "Snapshot hash mismatch. Request a fresh snapshot.",
+          ::ultra::runtime::contracts::ContractValidator::currentPhase(),
+      });
     }
   }
 
@@ -725,14 +733,6 @@ KernelMutationOutcome StateManager::applyOverlayMutation(
       graph_ ? graph_->getDeterministicHash() : std::string{};
   if (hashAfter.empty() || hashAfter != hashAfterRecheck) {
     rollback();
-    runtime::GraphSnapshot failedSnapshot;
-    failedSnapshot.graph = graph_;
-    failedSnapshot.version = globalVersion_;
-    failedSnapshot.branch = activeBranch_;
-    cognitiveMemoryManager_.recordRiskEvaluation(
-        "diff_risk:overlay_mutation", failedSnapshot,
-        diffResult.delta.riskScore.overallRisk, 1.00, 0.10,
-        "hash_integrity_failure");
     outcome.message =
         "Overlay hash integrity verification failed; mutation rolled back.";
     return outcome;
@@ -750,10 +750,6 @@ KernelMutationOutcome StateManager::applyOverlayMutation(
   committedSnapshot.version = globalVersion_;
   committedSnapshot.branch = activeBranch_;
   cognitiveMemoryManager_.bindToSnapshot(&committedSnapshot);
-  cognitiveMemoryManager_.recordRiskEvaluation(
-      "diff_risk:overlay_mutation", committedSnapshot,
-      diffResult.delta.riskScore.overallRisk, 0.20, 0.80,
-      "overlay_mutation_committed");
 
   std::map<std::uint64_t, ai::SymbolRecord> symbolById;
   for (const ai::SymbolRecord& symbol : state_.symbols) {

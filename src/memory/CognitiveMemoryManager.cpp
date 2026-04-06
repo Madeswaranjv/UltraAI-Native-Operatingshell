@@ -2,6 +2,7 @@
 
 #include <external/json.hpp>
 #include "../metrics/PerformanceMetrics.h"
+#include "../runtime/cognitive/contract_enforcement.h"
 //E:\Projects\Ultra\src\memory\CognitiveMemoryManager.cpp
 #include <algorithm>
 #include <cmath>
@@ -83,6 +84,8 @@ MemoryQuery::MemoryQuery(const CognitiveMemoryManager& manager,
 
 std::vector<EpisodicMemoryMatch> MemoryQuery::getEpisodic(
     const std::string& intentSignature) const {
+  ::ultra::runtime::contracts::ContractValidator::assertMemoryRead(
+      "CognitiveMemoryManager::MemoryQuery::getEpisodic");
   if (manager_ == nullptr) {
     return {};
   }
@@ -107,6 +110,8 @@ std::vector<EpisodicMemoryMatch> MemoryQuery::getEpisodic(
 
 std::vector<StrategicMemoryMatch> MemoryQuery::getStrategic(
     const std::string& goalType) const {
+  ::ultra::runtime::contracts::ContractValidator::assertMemoryRead(
+      "CognitiveMemoryManager::MemoryQuery::getStrategic");
   if (manager_ == nullptr) {
     return {};
   }
@@ -133,6 +138,8 @@ std::vector<StrategicMemoryMatch> MemoryQuery::getStrategic(
 
 std::vector<EpisodicMemoryMatch> MemoryQuery::getFailures(
     const std::string& errorType) const {
+  ::ultra::runtime::contracts::ContractValidator::assertMemoryRead(
+      "CognitiveMemoryManager::MemoryQuery::getFailures");
   if (manager_ == nullptr) {
     return {};
   }
@@ -157,6 +164,8 @@ std::vector<EpisodicMemoryMatch> MemoryQuery::getFailures(
 
 std::vector<EpisodicMemoryMatch> MemoryQuery::getSuccessfulPatterns(
     const std::string& taskType) const {
+  ::ultra::runtime::contracts::ContractValidator::assertMemoryRead(
+      "CognitiveMemoryManager::MemoryQuery::getSuccessfulPatterns");
   if (manager_ == nullptr) {
     return {};
   }
@@ -201,31 +210,9 @@ void CognitiveMemoryManager::bindToSnapshot(const runtime::GraphSnapshot* snapsh
     return;
   }
 
-  const bool changed =
-      snapshot->version != boundVersion_ ||
-      snapshot->branch != boundBranch_;
-
-  // No manager-level locking required here.
   boundVersion_ = snapshot->version;
   boundBranch_ = snapshot->branch;
   working.bindToSnapshotVersion(snapshot->version);
-
-  if (!changed) {
-    return;
-  }
-
-  EpisodicEvent event;
-  event.version = snapshot->version;
-  event.branchId = snapshot->branch.toString();
-  event.type = EpisodicEventType::SnapshotBound;
-  event.subject = "graph_snapshot";
-  event.success = true;
-  event.riskScore = 0.0;
-  event.confidenceScore = 1.0;
-  event.message = "working_memory_bound";
-
-  episodic.recordEvent(event);
-  persistEpisodic();
 }
 
 void CognitiveMemoryManager::setGraphScale(
@@ -242,6 +229,8 @@ void CognitiveMemoryManager::recordIntentExecution(
     const bool success,
     const bool rolledBack,
     const std::string& message) {
+  ::ultra::runtime::contracts::ContractValidator::assertMemoryWrite(
+      "CognitiveMemoryManager::recordIntentExecution");
   bindToSnapshot(&snapshot);
 
   EpisodicEvent event;
@@ -294,6 +283,8 @@ void CognitiveMemoryManager::recordIntentStart(
     const double riskScore,
     const double confidenceScore,
     const std::string& message) {
+  ::ultra::runtime::contracts::ContractValidator::assertMemoryWrite(
+      "CognitiveMemoryManager::recordIntentStart");
   bindToSnapshot(&snapshot);
 
   EpisodicEvent event;
@@ -316,6 +307,8 @@ void CognitiveMemoryManager::recordIntentEvaluation(
     const double riskScore,
     const double confidenceScore,
     const std::string& message) {
+  ::ultra::runtime::contracts::ContractValidator::assertMemoryWrite(
+      "CognitiveMemoryManager::recordIntentEvaluation");
   bindToSnapshot(&snapshot);
 
   EpisodicEvent event;
@@ -352,6 +345,8 @@ void CognitiveMemoryManager::recordRiskEvaluation(
     const double observedRiskScore,
     const double confidenceScore,
     const std::string& message) {
+  ::ultra::runtime::contracts::ContractValidator::assertMemoryWrite(
+      "CognitiveMemoryManager::recordRiskEvaluation");
   bindToSnapshot(&snapshot);
 
   EpisodicEvent event;
@@ -386,6 +381,8 @@ void CognitiveMemoryManager::recordMergeOutcome(
     const runtime::GraphSnapshot& snapshot,
     const bool success,
     const std::string& message) {
+  ::ultra::runtime::contracts::ContractValidator::assertMemoryWrite(
+      "CognitiveMemoryManager::recordMergeOutcome");
   bindToSnapshot(&snapshot);
 
   EpisodicEvent event;
@@ -429,7 +426,9 @@ void CognitiveMemoryManager::recordMergeOutcome(
   persistStrategic();
 }
 
-MemoryQuery CognitiveMemoryManager::query(const std::size_t limit) const noexcept {
+MemoryQuery CognitiveMemoryManager::query(const std::size_t limit) const {
+  ::ultra::runtime::contracts::ContractValidator::assertMemoryRead(
+      "CognitiveMemoryManager::query");
   return MemoryQuery(*this, limit);
 }
 

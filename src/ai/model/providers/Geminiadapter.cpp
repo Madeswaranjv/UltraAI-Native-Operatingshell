@@ -226,9 +226,7 @@ void GeminiAdapter::shutdown() {
 
 nlohmann::ordered_json GeminiAdapter::buildProviderRequest(
     const ModelRequest& request) const {
-  std::vector<std::string> tools = request.toolsAvailable;
-  std::sort(tools.begin(), tools.end());
-  tools.erase(std::unique(tools.begin(), tools.end()), tools.end());
+  std::vector<std::string> tools = providerSchemaToolNames(request);
 
   // Gemini uses contents[].parts[] and a separate systemInstruction field.
   nlohmann::ordered_json userParts = nlohmann::ordered_json::array();

@@ -19,6 +19,7 @@ struct ContextFrame {
   RiskTolerance tolerance{RiskTolerance::MEDIUM};
   bool allowPublicApiChange{false};
   double riskThreshold{0.66};
+  IntentMemoryContext memory;
 };
 
 class IntentRuntime {
@@ -28,6 +29,8 @@ class IntentRuntime {
   [[nodiscard]] Intent resolve_structured_intent(
       const std::string& input,
       const ContextFrame& frame) const;
+  [[nodiscard]] Intent enrich_intent(const Intent& intent,
+                                     const ContextFrame& frame) const;
 
   [[nodiscard]] ::ultra::orchestration::TaskGraph decompose_intent(
       const Intent& intent) const;

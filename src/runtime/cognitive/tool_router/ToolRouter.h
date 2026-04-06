@@ -48,6 +48,8 @@ class ToolRouter {
       const std::map<std::string, std::string>& args) const;
   std::string execute_search_files(
       const std::map<std::string, std::string>& args) const;
+  std::string execute_apply_patch(
+      const std::map<std::string, std::string>& args) const;
   std::string execute_run_command(
       const std::map<std::string, std::string>& args) const;
 

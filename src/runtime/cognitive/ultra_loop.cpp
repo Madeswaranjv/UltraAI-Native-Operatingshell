@@ -1,6 +1,8 @@
 #include "ultra_loop.h"
+#include "contract_enforcement.h"
 #include "failure_recovery.h"
 #include "../intent/IntentRuntime.h"
+#include "../../memory/CognitiveMemoryManager.h"
 
 #include <algorithm>
 #include <cctype>
@@ -13,6 +15,40 @@
 namespace ultra::runtime::cognitive {
 
 namespace {
+
+constexpr double kConvergenceEpsilon = 1e-9;
+constexpr std::size_t kStrategyFeedbackHistoryLimit = 4U;
+constexpr double kLowStrategyScoreThreshold = 0.55;
+constexpr double kHighStrategyScoreThreshold = 0.75;
+
+[[nodiscard]] ::ultra::runtime::contracts::LoopPhase toContractPhase(
+    const UltraLoopState state) noexcept {
+  switch (state) {
+    case UltraLoopState::INIT:
+      return ::ultra::runtime::contracts::LoopPhase::INIT;
+    case UltraLoopState::PLAN:
+      return ::ultra::runtime::contracts::LoopPhase::PLAN;
+    case UltraLoopState::ARBITRATION:
+      return ::ultra::runtime::contracts::LoopPhase::ARBITRATION;
+    case UltraLoopState::MICRO_PLAN:
+      return ::ultra::runtime::contracts::LoopPhase::MICRO_PLAN;
+    case UltraLoopState::EXECUTE:
+      return ::ultra::runtime::contracts::LoopPhase::EXECUTE;
+    case UltraLoopState::PARTIAL_REPAIR:
+      return ::ultra::runtime::contracts::LoopPhase::PARTIAL_REPAIR;
+    case UltraLoopState::VERIFY:
+      return ::ultra::runtime::contracts::LoopPhase::VERIFY;
+    case UltraLoopState::REFLECT:
+      return ::ultra::runtime::contracts::LoopPhase::REFLECT;
+    case UltraLoopState::RE_ANCHOR:
+      return ::ultra::runtime::contracts::LoopPhase::RE_ANCHOR;
+    case UltraLoopState::REPLAN:
+      return ::ultra::runtime::contracts::LoopPhase::REPLAN;
+    case UltraLoopState::TERMINATE:
+      return ::ultra::runtime::contracts::LoopPhase::TERMINATE;
+  }
+  return ::ultra::runtime::contracts::LoopPhase::UNSPECIFIED;
+}
 
 [[nodiscard]] std::string stageFailureMessage(
     const std::string_view stageName,
@@ -65,12 +101,33 @@ namespace {
   return stream.str();
 }
 
+[[nodiscard]] double clampUnitInterval(const double value) noexcept {
+  return std::clamp(value, 0.0, 1.0);
+}
+
 void pushUnique(std::vector<std::string>& messages, std::string message) {
   if (message.empty()) {
     return;
   }
   if (std::find(messages.begin(), messages.end(), message) == messages.end()) {
     messages.push_back(std::move(message));
+  }
+}
+
+void pushUniqueBounded(std::vector<std::string>& messages,
+                       std::string message,
+                       const std::size_t limit = 4U) {
+  pushUnique(messages, std::move(message));
+  if (messages.size() > limit) {
+    messages.resize(limit);
+  }
+}
+
+template <typename T>
+void trimBoundedHistory(std::vector<T>& values,
+                        const std::size_t limit = kStrategyFeedbackHistoryLimit) {
+  if (values.size() > limit) {
+    values.erase(values.begin(), values.begin() + (values.size() - limit));
   }
 }
 
@@ -101,6 +158,16 @@ void pushUnique(std::vector<std::string>& messages, std::string message) {
   return normalized;
 }
 
+[[nodiscard]] bool containsAnyTerm(
+    const std::string_view text,
+    const std::initializer_list<std::string_view> terms) {
+  const std::string normalized = normalizeKey(text);
+  return std::any_of(terms.begin(), terms.end(),
+                     [&normalized](const std::string_view term) {
+                       return normalized.find(normalizeKey(term)) != std::string::npos;
+                     });
+}
+
 [[nodiscard]] std::string defaultIntentTarget(const UltraLoopFrame& frame) {
   if (frame.hasStructuredIntent && !frame.structuredIntent.goal.target.empty()) {
     return frame.structuredIntent.goal.target;
@@ -112,6 +179,317 @@ void pushUnique(std::vector<std::string>& messages, std::string message) {
     return frame.intentGoal;
   }
   return "workspace_root";
+}
+
+[[nodiscard]] double extractVerificationScore(
+    const UltraLoopFrame& frame,
+    const StageResult& verificationResult,
+    const std::size_t retryLimit) {
+  const std::size_t totalTasks = std::max<std::size_t>(1U, frame.taskGraph.size());
+  const std::size_t failedTasks = frame.taskGraph.failed_tasks().size();
+  const double successRatio =
+      static_cast<double>(totalTasks - std::min(totalTasks, failedTasks)) /
+      static_cast<double>(totalTasks);
+  const double executionScore =
+      (frame.hasExecutionResult && frame.executionResult.ok &&
+       !frame.executionResult.rolledBack)
+          ? 1.0
+          : 0.0;
+  const double retryPenalty =
+      retryLimit == 0U
+          ? 0.0
+          : 0.10 *
+                std::min(1.0,
+                         static_cast<double>(frame.retryCount) /
+                             static_cast<double>(retryLimit));
+
+  double score = (successRatio * 0.65) + (executionScore * 0.35) - retryPenalty;
+  if (verificationResult.signal == StageSignal::Retry) {
+    score = std::min(score, 0.60);
+  } else if (!verificationResult.success ||
+             verificationResult.signal == StageSignal::Replan) {
+    score = std::min(score, 0.25);
+  }
+
+  return clampUnitInterval(score);
+}
+
+[[nodiscard]] double extractGoalDistanceMetric(const UltraLoopFrame& frame) {
+  double distance = static_cast<double>(frame.taskGraph.failed_tasks().size());
+  if (frame.taskGraph.has_pending_tasks()) {
+    distance += 1.0;
+  }
+  if (!frame.verificationPassed) {
+    distance += 1.0;
+  }
+  if (frame.replanRequested) {
+    distance += 1.0;
+  }
+  if (frame.reanchorRequested) {
+    distance += 1.0;
+  }
+  if (frame.hasExecutionResult &&
+      (!frame.executionResult.ok || frame.executionResult.rolledBack)) {
+    distance += 1.0;
+  }
+  return distance;
+}
+
+[[nodiscard]] double aggregateStrategyScore(
+    const ::ultra::runtime::intent::StrategyScore& score) {
+  return clampUnitInterval((score.successRate * 0.35) +
+                           ((1.0 - score.recoveryCost) * 0.20) +
+                           (score.executionEfficiency * 0.25) +
+                           (score.confidenceScore * 0.20));
+}
+
+[[nodiscard]] bool strategyScoreUnset(
+    const ::ultra::runtime::intent::StrategyScore& score) noexcept {
+  return score.successRate == 0.0 && score.failureCount == 0U &&
+         score.recoveryCost == 0.0 && score.executionEfficiency == 0.0 &&
+         score.confidenceScore == 0.0;
+}
+
+[[nodiscard]] std::size_t repairCountForIteration(
+    const UltraLoopFrame& frame) {
+  return static_cast<std::size_t>(std::count_if(
+      frame.repairLog.begin(),
+      frame.repairLog.end(),
+      [&frame](const RepairRecord& record) { return record.iteration == frame.iteration; }));
+}
+
+[[nodiscard]] ::ultra::runtime::intent::StrategyScore buildStrategyScore(
+    const UltraLoopFrame& frame) {
+  const std::size_t totalTasks = std::max<std::size_t>(1U, frame.taskGraph.size());
+  const std::size_t failureCount = frame.taskGraph.failed_tasks().size();
+  const std::size_t repairCount = repairCountForIteration(frame);
+  const double successRate =
+      clampUnitInterval(static_cast<double>(totalTasks - std::min(totalTasks, failureCount)) /
+                        static_cast<double>(totalTasks));
+  const double recoveryCost =
+      clampUnitInterval(static_cast<double>(failureCount + repairCount + frame.retryCount) /
+                        static_cast<double>(totalTasks + 2U));
+  const double distancePenalty =
+      clampUnitInterval(frame.goalDistanceMetric /
+                        static_cast<double>(totalTasks + 2U));
+  const double executionEfficiency =
+      clampUnitInterval(frame.verificationScore - (recoveryCost * 0.35) -
+                        (distancePenalty * 0.25));
+  const double confidenceScore = clampUnitInterval(
+      (frame.verificationPassed ? 0.40 : 0.10) +
+      (frame.intentConsistent ? 0.20 : 0.0) +
+      ((frame.hasExecutionResult && frame.executionResult.ok &&
+        !frame.executionResult.rolledBack)
+           ? 0.20
+           : 0.0) +
+      ((1.0 - distancePenalty) * 0.20));
+
+  ::ultra::runtime::intent::StrategyScore score;
+  score.successRate = successRate;
+  score.failureCount = failureCount;
+  score.recoveryCost = recoveryCost;
+  score.executionEfficiency = executionEfficiency;
+  score.confidenceScore = confidenceScore;
+  return score;
+}
+
+[[nodiscard]] bool hasLowScoreRepeatedPlan(
+    const std::vector<::ultra::runtime::intent::PlanPerformance>& history,
+    const std::uint64_t planHash) {
+  if (planHash == 0U) {
+    return false;
+  }
+
+  return std::any_of(history.begin(), history.end(),
+                     [planHash](const ::ultra::runtime::intent::PlanPerformance& plan) {
+                       return plan.planHash == planHash &&
+                              plan.score < kLowStrategyScoreThreshold;
+                     });
+}
+
+void applyStrategyFeedbackToMemoryContext(
+    ::ultra::runtime::intent::IntentMemoryContext& memoryContext,
+    const UltraLoopFrame& frame) {
+  memoryContext.recentPlanPerformance = frame.planPerformanceHistory;
+  trimBoundedHistory(memoryContext.recentPlanPerformance);
+
+  if (!frame.latestStrategyFeedback.strategyType.empty()) {
+    memoryContext.strategyFeedback = frame.latestStrategyFeedback;
+    memoryContext.strategyFeedback.recentPlans = memoryContext.recentPlanPerformance;
+  }
+
+  if (memoryContext.strategyFeedback.strategyType.empty()) {
+    return;
+  }
+
+  std::ostringstream summary;
+  summary << "strategy=" << memoryContext.strategyFeedback.strategyType
+          << " outcome=" << memoryContext.strategyFeedback.outcome
+          << " score="
+          << aggregateStrategyScore(memoryContext.strategyFeedback.latestScore);
+  pushUniqueBounded(memoryContext.priorOutcomes, summary.str());
+
+  if (memoryContext.strategyFeedback.reinforcePattern) {
+    memoryContext.hasReusableStrategy = true;
+    if (!memoryContext.strategyFeedback.preferredStrategyType.empty()) {
+      pushUniqueBounded(memoryContext.successfulPatterns,
+                        "strategy:" +
+                            memoryContext.strategyFeedback.preferredStrategyType);
+    }
+  }
+
+  if (!memoryContext.strategyFeedback.avoidedStrategyType.empty()) {
+    pushUniqueBounded(memoryContext.failedPatterns,
+                      "strategy:" +
+                          memoryContext.strategyFeedback.avoidedStrategyType);
+  }
+
+  if (memoryContext.strategyFeedback.simplifyPlan) {
+    pushUniqueBounded(memoryContext.knownConstraints, "tight_scope");
+    pushUniqueBounded(memoryContext.knownConstraints, "simplify_plan");
+  }
+  if (memoryContext.strategyFeedback.increaseTaskGranularity) {
+    memoryContext.repeatedFailureDetected = true;
+    pushUniqueBounded(memoryContext.knownConstraints, "require_preflight");
+    pushUniqueBounded(memoryContext.knownConstraints, "increase_granularity");
+  }
+  if (memoryContext.strategyFeedback.forceVariation ||
+      memoryContext.strategyFeedback.avoidRepeatedPlan) {
+    pushUniqueBounded(memoryContext.knownConstraints, "force_variation");
+  }
+  if (memoryContext.strategyFeedback.latestScore.failureCount > 0U) {
+    memoryContext.repeatedFailureDetected = true;
+  }
+}
+
+void commitStrategyFeedback(UltraLoopFrame& frame,
+                            const std::string_view outcome) {
+  if (frame.planSignatureHash == 0U ||
+      frame.feedbackCommittedIteration == frame.iteration) {
+    return;
+  }
+
+  if (strategyScoreUnset(frame.currentStrategyScore)) {
+    frame.currentStrategyScore = buildStrategyScore(frame);
+  }
+
+  const bool repeatedLowScore =
+      hasLowScoreRepeatedPlan(frame.planPerformanceHistory, frame.planSignatureHash);
+
+  ::ultra::runtime::intent::PlanPerformance performance;
+  performance.planHash = frame.planSignatureHash;
+  performance.score = aggregateStrategyScore(frame.currentStrategyScore);
+  performance.iterationIndex = frame.iteration;
+  performance.strategyType = frame.strategyId;
+
+  ::ultra::runtime::intent::StrategyFeedbackMemory feedback;
+  feedback.strategyType = frame.strategyId;
+  feedback.outcome = std::string(outcome);
+  feedback.planHash = frame.planSignatureHash;
+  feedback.latestScore = frame.currentStrategyScore;
+  feedback.reinforcePattern =
+      performance.score >= kHighStrategyScoreThreshold &&
+      frame.currentStrategyScore.failureCount == 0U && !frame.replanRequested;
+  feedback.simplifyPlan = frame.currentStrategyScore.failureCount > 0U ||
+                          frame.currentStrategyScore.recoveryCost >= 0.40 ||
+                          frame.replanRequested;
+  feedback.increaseTaskGranularity =
+      repeatedLowScore || frame.currentStrategyScore.failureCount >= 2U ||
+      frame.currentStrategyScore.recoveryCost >= 0.55;
+  feedback.avoidRepeatedPlan = repeatedLowScore;
+  feedback.forceVariation =
+      repeatedLowScore ||
+      (frame.replanRequested && frame.currentStrategyScore.executionEfficiency < 0.65);
+  if (feedback.reinforcePattern) {
+    feedback.preferredStrategyType = frame.strategyId;
+  }
+  if (feedback.simplifyPlan || feedback.forceVariation) {
+    feedback.avoidedStrategyType = frame.strategyId;
+  }
+
+  frame.planPerformanceHistory.push_back(performance);
+  trimBoundedHistory(frame.planPerformanceHistory);
+  feedback.recentPlans = frame.planPerformanceHistory;
+  frame.latestStrategyFeedback = feedback;
+  frame.strategyFeedbackLog.push_back(feedback);
+  trimBoundedHistory(frame.strategyFeedbackLog);
+  frame.feedbackCommittedIteration = frame.iteration;
+}
+
+[[nodiscard]] bool hasVerificationStagnation(
+    const std::vector<ConvergenceSample>& history,
+    const std::size_t window) {
+  if (window == 0U || history.size() < window) {
+    return false;
+  }
+
+  const std::size_t start = history.size() - window;
+  const double baseline = history[start].verificationScore;
+  double best = baseline;
+  for (std::size_t index = start + 1U; index < history.size(); ++index) {
+    best = std::max(best, history[index].verificationScore);
+  }
+
+  return best <= baseline + kConvergenceEpsilon;
+}
+
+[[nodiscard]] bool hasGoalDistanceStability(
+    const std::vector<ConvergenceSample>& history,
+    const std::size_t window) {
+  if (window == 0U || history.size() < window) {
+    return false;
+  }
+
+  const std::size_t start = history.size() - window;
+  for (std::size_t index = start + 1U; index < history.size(); ++index) {
+    if (history[index].goalDistanceMetric <
+        history[index - 1U].goalDistanceMetric - kConvergenceEpsilon) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+[[nodiscard]] bool hasPlanRepetition(
+    const std::vector<ConvergenceSample>& history,
+    const std::size_t repetitionCount) {
+  if (repetitionCount == 0U || history.size() < repetitionCount) {
+    return false;
+  }
+
+  const std::uint64_t repeatedHash = history.back().planSignatureHash;
+  if (repeatedHash == 0U) {
+    return false;
+  }
+
+  const std::size_t start = history.size() - repetitionCount;
+  for (std::size_t index = start; index < history.size(); ++index) {
+    if (history[index].planSignatureHash != repeatedHash) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+[[nodiscard]] bool hasDiminishingReturns(
+    const std::vector<ConvergenceSample>& history,
+    const std::size_t window,
+    const double minImprovementDelta) {
+  if (window == 0U || history.size() < window) {
+    return false;
+  }
+
+  const std::size_t start = history.size() - window;
+  for (std::size_t index = start; index < history.size(); ++index) {
+    if (history[index].deltaImprovement + kConvergenceEpsilon >=
+        minImprovementDelta) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 [[nodiscard]] ::ultra::runtime::intent::Intent buildIntentSnapshot(
@@ -149,6 +527,202 @@ void pushUnique(std::vector<std::string>& messages, std::string message) {
   intentValue.risk = frame.intentTolerance;
   intentValue.options.allowPublicAPIChange = frame.intentAllowPublicApiChange;
   return ::ultra::runtime::intent::normalizeIntent(intentValue, fallbackBudget);
+}
+
+[[nodiscard]] ::ultra::runtime::intent::IntentMemoryContext buildIntentMemoryContext(
+    const UltraLoopBindings& bindings,
+    const UltraLoopFrame& frame) {
+  ::ultra::runtime::intent::IntentMemoryContext memoryContext;
+
+  const ::ultra::runtime::intent::Intent intentValue =
+      buildIntentSnapshot(frame, false);
+  const std::string target = defaultIntentTarget(frame);
+  memoryContext.queryKey = ::ultra::runtime::intent::toString(intentValue.goal.type);
+  if (!target.empty()) {
+    memoryContext.queryKey += " ";
+    memoryContext.queryKey += target;
+  }
+  if (!frame.intentGoal.empty() &&
+      normalizeKey(frame.intentGoal) != normalizeKey(target)) {
+    memoryContext.queryKey += " ";
+    memoryContext.queryKey += frame.intentGoal;
+  }
+
+  if (bindings.cognitiveMemory == nullptr) {
+    applyStrategyFeedbackToMemoryContext(memoryContext, frame);
+    return memoryContext;
+  }
+
+  const auto query = bindings.cognitiveMemory->query(4U);
+  const std::vector<::ultra::memory::EpisodicMemoryMatch> episodic =
+      query.getEpisodic(memoryContext.queryKey);
+  const std::vector<::ultra::memory::StrategicMemoryMatch> strategic =
+      query.getStrategic(memoryContext.queryKey);
+  const std::vector<::ultra::memory::EpisodicMemoryMatch> failures =
+      query.getFailures(memoryContext.queryKey);
+  const std::vector<::ultra::memory::EpisodicMemoryMatch> successes =
+      query.getSuccessfulPatterns(memoryContext.queryKey);
+
+  std::size_t failedOutcomeCount = failures.size();
+  for (const ::ultra::memory::EpisodicMemoryMatch& match : episodic) {
+    pushUniqueBounded(memoryContext.pastSimilarGoals, match.subject);
+    pushUniqueBounded(memoryContext.priorOutcomes,
+                      std::string(match.success ? "success:" : "failure:") +
+                          match.subject);
+    if (!match.message.empty() && (!match.success || match.rolledBack)) {
+      pushUniqueBounded(memoryContext.recoveryPatterns, match.message);
+    }
+  }
+
+  for (const ::ultra::memory::StrategicMemoryMatch& match : strategic) {
+    pushUniqueBounded(memoryContext.pastSimilarGoals, match.subject);
+    pushUniqueBounded(memoryContext.priorOutcomes,
+                      std::string(match.success ? "success:" : "failure:") +
+                          match.subject);
+    if (match.success && !match.rolledBack) {
+      pushUniqueBounded(memoryContext.successfulPatterns, match.subject);
+    } else {
+      ++failedOutcomeCount;
+      pushUniqueBounded(memoryContext.failedPatterns, match.subject);
+    }
+    if (match.observedRisk >= 0.70) {
+      pushUniqueBounded(memoryContext.knownConstraints, "tight_scope");
+    }
+    if (match.observedConfidence < 0.45) {
+      pushUniqueBounded(memoryContext.knownConstraints, "require_preflight");
+    }
+    if (match.rolledBack) {
+      pushUniqueBounded(memoryContext.knownConstraints, "avoid_public_api");
+    }
+  }
+
+  for (const ::ultra::memory::EpisodicMemoryMatch& match : successes) {
+    pushUniqueBounded(memoryContext.successfulPatterns, match.subject);
+    if (!match.message.empty()) {
+      pushUniqueBounded(memoryContext.recoveryPatterns, match.message);
+    }
+  }
+
+  for (const ::ultra::memory::EpisodicMemoryMatch& match : failures) {
+    pushUniqueBounded(memoryContext.failedPatterns, match.subject);
+    if (!match.message.empty()) {
+      pushUniqueBounded(memoryContext.recoveryPatterns, match.message);
+    }
+    if (match.rolledBack) {
+      pushUniqueBounded(memoryContext.knownConstraints, "avoid_public_api");
+    }
+  }
+
+  memoryContext.repeatedFailureDetected = failedOutcomeCount >= 2U;
+  memoryContext.hasReusableStrategy = !memoryContext.successfulPatterns.empty();
+  if (memoryContext.repeatedFailureDetected ||
+      !memoryContext.failedPatterns.empty()) {
+    pushUniqueBounded(memoryContext.knownConstraints, "tight_scope");
+    pushUniqueBounded(memoryContext.knownConstraints, "require_preflight");
+  }
+
+  applyStrategyFeedbackToMemoryContext(memoryContext, frame);
+  return memoryContext;
+}
+
+[[nodiscard]] ::ultra::runtime::intent::Action actionFromPayload(
+    const TaskPayload& payload,
+    const UltraLoopFrame& frame);
+
+[[nodiscard]] std::string buildFailureMemoryKey(const TaskNode& taskNode,
+                                                const UltraLoopFrame& frame,
+                                                const std::string_view message) {
+  const ::ultra::runtime::intent::Action action =
+      actionFromPayload(taskNode.payload, frame);
+  std::string key = taskNode.id;
+  if (!action.target.empty()) {
+    key += " ";
+    key += action.target;
+  }
+  if (!message.empty()) {
+    key += " ";
+    key += std::string(message);
+  }
+  return key;
+}
+
+[[nodiscard]] std::optional<RecoveryAction> inferRecoveryActionFromMemory(
+    const std::vector<::ultra::memory::EpisodicMemoryMatch>& failures) {
+  std::size_t retryVotes = 0U;
+  std::size_t skipVotes = 0U;
+  std::size_t replanVotes = 0U;
+
+  for (const ::ultra::memory::EpisodicMemoryMatch& match : failures) {
+    const std::string summary = match.type + " " + match.subject + " " +
+                                match.message;
+    if (containsAnyTerm(summary,
+                        {"timeout", "retry", "busy", "temporarily",
+                         "unavailable", "rate limit"})) {
+      ++retryVotes;
+    }
+    if (containsAnyTerm(summary, {"skip", "unsupported"})) {
+      ++skipVotes;
+    }
+    if (match.rolledBack ||
+        containsAnyTerm(summary,
+                        {"rollback", "validation", "invalid", "missing",
+                         "rejected", "does not match"})) {
+      ++replanVotes;
+    }
+  }
+
+  if (replanVotes >= 2U || failures.size() >= 3U) {
+    return RecoveryAction::REPLAN_REQUIRED;
+  }
+  if (skipVotes > 0U) {
+    return RecoveryAction::SKIP_TASK;
+  }
+  if (retryVotes > 0U) {
+    return RecoveryAction::RETRY_TASK;
+  }
+  if (!failures.empty() && failures.front().rolledBack) {
+    return RecoveryAction::REPLAN_REQUIRED;
+  }
+  return std::nullopt;
+}
+
+void populateFailureMemoryHints(FailureContext& failureContext,
+                                const UltraLoopBindings& bindings,
+                                const TaskNode& failedTask,
+                                const UltraLoopFrame& frame,
+                                const std::string_view message) {
+  if (bindings.cognitiveMemory == nullptr) {
+    return;
+  }
+
+  const std::string queryKey = buildFailureMemoryKey(failedTask, frame, message);
+  if (queryKey.empty()) {
+    return;
+  }
+
+  const auto query = bindings.cognitiveMemory->query(4U);
+  const std::vector<::ultra::memory::EpisodicMemoryMatch> failures =
+      query.getFailures(queryKey);
+
+  failureContext.repeated_failure_detected = failures.size() >= 2U;
+  failureContext.memory_action = inferRecoveryActionFromMemory(failures);
+  for (const ::ultra::memory::EpisodicMemoryMatch& match : failures) {
+    pushUniqueBounded(failureContext.recovery_patterns, match.subject);
+    if (!match.message.empty()) {
+      pushUniqueBounded(failureContext.recovery_patterns, match.message);
+    }
+  }
+}
+
+void syncWorkingMemory(const UltraLoopFrame& frame) {
+  if (frame.cognitiveState == nullptr || !frame.cognitiveState->workingSet) {
+    return;
+  }
+
+  frame.cognitiveState->workingSet->bindToSnapshotVersion(
+      frame.cognitiveState->pinnedVersion);
+  frame.cognitiveState->workingSet->syncVersions(
+      frame.cognitiveState->pinnedVersion);
 }
 
 [[nodiscard]] ::ultra::runtime::intent::ActionKind actionKindFromActionType(
@@ -432,8 +1006,105 @@ const char* toString(const StageSignal signal) noexcept {
       return "TerminateSuccess";
     case StageSignal::TerminateFailure:
       return "TerminateFailure";
+    case StageSignal::SIG_CONVERGENCE_REACHED:
+      return "SIG-CONVERGENCE-REACHED";
   }
   return "TerminateFailure";
+}
+
+ConvergenceTracker::ConvergenceTracker(const std::size_t capacity)
+    : capacity_(std::max<std::size_t>(1U, capacity)) {}
+
+void ConvergenceTracker::observe(ConvergenceSample sample) {
+  if (!history_.empty()) {
+    const ConvergenceSample& previous = history_.back();
+    const double verificationGain =
+        std::max(0.0, sample.verificationScore - previous.verificationScore);
+    const double goalDistanceGain =
+        std::max(0.0,
+                 previous.goalDistanceMetric - sample.goalDistanceMetric);
+    sample.deltaImprovement = verificationGain + goalDistanceGain;
+  } else {
+    sample.deltaImprovement = 0.0;
+  }
+
+  history_.push_back(std::move(sample));
+  trimHistory();
+}
+
+ConvergenceDecision ConvergenceTracker::evaluate(
+    const std::size_t maxStagnationIterations,
+    const double minImprovementDelta,
+    const std::size_t maxPlanRepetitions) const {
+  ConvergenceDecision decision;
+  decision.verificationStagnated =
+      hasVerificationStagnation(history_, maxStagnationIterations);
+  decision.goalDistanceStable =
+      hasGoalDistanceStability(history_, maxStagnationIterations);
+  decision.repeatedPlan =
+      hasPlanRepetition(history_, maxPlanRepetitions);
+  decision.diminishingReturns =
+      hasDiminishingReturns(history_, maxStagnationIterations,
+                            minImprovementDelta);
+
+  decision.reached = decision.verificationStagnated ||
+                     decision.goalDistanceStable ||
+                     decision.repeatedPlan ||
+                     decision.diminishingReturns;
+  decision.signal = decision.reached ? StageSignal::SIG_CONVERGENCE_REACHED
+                                     : StageSignal::Continue;
+
+  if (history_.empty()) {
+    decision.reason = "Convergence tracker has no bounded observations yet.";
+    return decision;
+  }
+
+  const ConvergenceSample& latest = history_.back();
+  std::vector<std::string> triggers;
+  if (decision.verificationStagnated) {
+    triggers.emplace_back("verification_stagnation");
+  }
+  if (decision.goalDistanceStable) {
+    triggers.emplace_back("goal_distance_stability");
+  }
+  if (decision.repeatedPlan) {
+    triggers.emplace_back("plan_repetition");
+  }
+  if (decision.diminishingReturns) {
+    triggers.emplace_back("diminishing_returns");
+  }
+
+  std::ostringstream message;
+  if (decision.reached) {
+    message << toString(decision.signal) << " iteration=" << latest.iteration
+            << " triggers=" << joinTaskIds(triggers)
+            << " verification_score=" << latest.verificationScore
+            << " goal_distance=" << latest.goalDistanceMetric
+            << " plan_hash=" << latest.planSignatureHash
+            << " delta_improvement=" << latest.deltaImprovement;
+  } else {
+    message << "Convergence not reached. iteration=" << latest.iteration
+            << " verification_score=" << latest.verificationScore
+            << " goal_distance=" << latest.goalDistanceMetric
+            << " plan_hash=" << latest.planSignatureHash
+            << " delta_improvement=" << latest.deltaImprovement;
+  }
+  decision.reason = message.str();
+  return decision;
+}
+
+const std::vector<ConvergenceSample>& ConvergenceTracker::history() const noexcept {
+  return history_;
+}
+
+void ConvergenceTracker::trimHistory() {
+  if (history_.size() <= capacity_) {
+    return;
+  }
+
+  history_.erase(history_.begin(),
+                 history_.begin() +
+                     static_cast<std::ptrdiff_t>(history_.size() - capacity_));
 }
 
 IntentConsistencyRecord evaluateIntentConsistency(const UltraLoopFrame& frame) {
@@ -686,6 +1357,11 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
   bool memoryInvoked = false;
   bool running = true;
   const FailureRecoveryEngine failureRecoveryEngine{};
+  const std::size_t convergenceWindow = std::max<std::size_t>(
+      std::max<std::size_t>(config_.maxStagnationIterations,
+                            config_.maxPlanRepetitions),
+      2U);
+  ConvergenceTracker convergenceTracker(convergenceWindow);
 
   auto transitionTo = [&](const UltraLoopState nextState, std::string reason) {
     const UltraLoopState currentState = state;
@@ -726,8 +1402,10 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
 
   auto handleTerminalSignal = [&](const std::string_view stageName,
                                   const StageResult& result) {
-    if (result.signal == StageSignal::TerminateSuccess) {
+    if (result.signal == StageSignal::TerminateSuccess ||
+        result.signal == StageSignal::SIG_CONVERGENCE_REACHED) {
       report.success = true;
+      report.terminalSignal = result.signal;
       report.message = stageTerminationMessage(stageName, result, true);
       transitionTo(UltraLoopState::TERMINATE, report.message);
       return true;
@@ -736,6 +1414,7 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
     if (result.signal == StageSignal::TerminateFailure) {
       notifyFailure(result);
       report.success = false;
+      report.terminalSignal = result.signal;
       report.message = stageTerminationMessage(stageName, result, false);
       transitionTo(UltraLoopState::TERMINATE, report.message);
       return true;
@@ -774,6 +1453,22 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
   auto resolveStructuredIntent = [&]() {
     StageResult result;
 
+    const ::ultra::runtime::intent::IntentMemoryContext memoryContext =
+        buildIntentMemoryContext(bindings, frame);
+
+    const ::ultra::runtime::intent::ContextFrame context{
+        frame.intentGoal,
+        frame.intentTarget,
+        frame.intentBranchId,
+        frame.intentTokenBudget,
+        frame.intentImpactDepth,
+        frame.intentMaxFilesChanged,
+        frame.intentTolerance,
+        frame.intentAllowPublicApiChange,
+        frame.intentRiskThreshold,
+        memoryContext,
+    };
+
     if (frame.hasStructuredIntent) {
       if (frame.intentGoal.empty()) {
         frame.intentGoal = frame.structuredIntent.goal.target;
@@ -783,6 +1478,9 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
                                  ? frame.intentGoal
                                  : frame.structuredIntent.goal.target;
       }
+      ::ultra::runtime::intent::IntentRuntime intentRuntime;
+      frame.structuredIntent =
+          intentRuntime.enrich_intent(frame.structuredIntent, context);
       if (frame.intentId.empty()) {
         frame.intentId =
             ::ultra::runtime::intent::toString(frame.structuredIntent.goal.type);
@@ -799,21 +1497,9 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
       result.success = true;
       result.signal = StageSignal::Continue;
       result.message =
-          "Structured intent already supplied; skipping re-resolution.";
+          "Structured intent already supplied; enriched with bounded memory.";
       return result;
     }
-
-    const ::ultra::runtime::intent::ContextFrame context{
-        frame.intentGoal,
-        frame.intentTarget,
-        frame.intentBranchId,
-        frame.intentTokenBudget,
-        frame.intentImpactDepth,
-        frame.intentMaxFilesChanged,
-        frame.intentTolerance,
-        frame.intentAllowPublicApiChange,
-        frame.intentRiskThreshold,
-    };
 
     const std::string resolvedGoal =
         frame.intentGoal.empty() ? frame.intentId : frame.intentGoal;
@@ -877,9 +1563,14 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
     switch (taskNode.payload.kind) {
       case TaskPayloadKind::Action: {
         ::ultra::runtime::Action action = taskNode.payload.action;
-        if (action.id.empty()) {
-          action.id = taskNode.id;
+        if (taskNode.payload.plannedAction.has_value()) {
+          action = ::ultra::runtime::ExecutionKernel::buildActionFromStrategy(
+              *taskNode.payload.plannedAction,
+              stateRef);
+          action.riskScore = taskNode.payload.action.riskScore;
+          action.confidenceScore = taskNode.payload.action.confidenceScore;
         }
+        action.id = taskNode.id;
         if (action.snapshotVersion == 0U) {
           action.snapshotVersion = stateRef.snapshot.version;
         }
@@ -887,18 +1578,23 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
           action.branch = stateRef.snapshot.branch.toString();
         }
 
+        const ::ultra::runtime::contracts::ScopedTaskGraphAuthorization
+            authorization(taskNode.id);
         frame.executionResult = bindings.executionKernel->execute(action, stateRef);
         frame.executionId = taskNode.id;
         break;
       }
 
-      case TaskPayloadKind::Intent:
+      case TaskPayloadKind::Intent: {
+        const ::ultra::runtime::contracts::ScopedTaskGraphAuthorization
+            authorization(taskNode.id);
         frame.executionResult = bindings.executionKernel->executeIntent(
             taskNode.payload.intent,
             stateRef,
             taskNode.payload.policy);
         frame.executionId = taskNode.id;
         break;
+      }
     }
 
     frame.hasExecutionResult = true;
@@ -989,6 +1685,14 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
         frame.taskGraph.has_pending_tasks(),
         frame.taskGraph.failed_tasks().size(),
     };
+    populateFailureMemoryHints(
+        failureContext,
+        bindings,
+        failedTask,
+        frame,
+        failureContext.execution_result.message.empty()
+            ? failureResult.message
+            : failureContext.execution_result.message);
 
     const RecoveryAction action = failureRecoveryEngine.decide(failureContext);
 
@@ -1035,7 +1739,10 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
   };
 
   while (running) {
-    switch (state) {
+    const ::ultra::runtime::contracts::ScopedLoopPhase phaseScope(
+        toContractPhase(state));
+    try {
+      switch (state) {
       case UltraLoopState::INIT: {
         report.missingLayers = detectMissingLayers(bindings);
         if (!report.missingLayers.empty()) {
@@ -1097,6 +1804,12 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
         frame.taskGraph = TaskGraph{};
         frame.hasExecutionResult = false;
         frame.executionResult = {};
+        frame.verificationScore = 0.0;
+        frame.goalDistanceMetric = 0.0;
+        frame.planSignatureHash = 0U;
+        frame.deltaImprovement = 0.0;
+        frame.currentStrategyScore = {};
+        frame.feedbackCommittedIteration = 0U;
         frame.executionId.clear();
         clearRepairContext();
         frame.intentConsistent = true;
@@ -1233,10 +1946,14 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
             frame.strategyId,
             frame.planId,
             std::move(plannerPayloads),
+            frame.structuredIntent.memory,
         };
 
         frame.taskGraph = bindings.microPlanner->generate_plan(input);
         frame.hasTaskGraph = !frame.taskGraph.empty();
+        frame.planSignatureHash = frame.hasTaskGraph
+                                      ? frame.taskGraph.structural_hash()
+                                      : 0U;
 
         if (!frame.hasTaskGraph) {
           StageResult missingGraph;
@@ -1250,6 +1967,7 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
           break;
         }
 
+        syncWorkingMemory(frame);
         transitionTo(UltraLoopState::EXECUTE,
                      "Micro planner produced TaskGraph output.");
         break;
@@ -1418,9 +2136,41 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
         record.reason = frame.repairReason.empty()
                             ? "Partial repair requested deterministic recovery."
                             : frame.repairReason;
+        const bool shouldRetry = repairDecisionRequestsRetry(record.decision);
+        TaskGraphRepairOverlay repairOverlay =
+            frame.taskGraph.create_repair_overlay(
+                frame.repairTaskIds,
+                shouldRetry ? frame.retryCount + 1U : frame.retryCount);
+        record.overlayId = repairOverlay.metadata().overlayId;
+        record.affectedNodes = repairOverlay.metadata().affectedNodes;
+
+        auto logRepairRecord = [&](const RepairRecord& repairRecord) {
+          frame.repairLog.push_back(repairRecord);
+          std::cerr << "[UltraLoop][Repair] iteration=" << repairRecord.iteration
+                    << " attempt=" << repairRecord.attempt
+                    << " site=" << repairRecord.site
+                    << " decision=" << repairRecord.decision
+                    << " overlay=" << repairRecord.overlayId
+                    << " verified=" << (repairRecord.verified ? "true" : "false")
+                    << " success_rate=" << repairRecord.successRate
+                    << " tasks=" << joinTaskIds(repairRecord.taskIds)
+                    << " affected=" << joinTaskIds(repairRecord.affectedNodes)
+                    << " reason=" << repairRecord.reason << "\n";
+        };
+
+        if (repairOverlay.empty()) {
+          record.reason += " Repair overlay could not isolate the requested "
+                           "subgraph.";
+          logRepairRecord(record);
+          frame.replanRequested = true;
+          transitionTo(UltraLoopState::REPLAN,
+                       "Partial repair could not isolate requested tasks.");
+          clearRepairContext();
+          break;
+        }
 
         bool repaired = false;
-        const bool shouldRetry = repairDecisionRequestsRetry(record.decision);
+        std::size_t repairedTaskCount = 0U;
         if (shouldRetry) {
           if (frame.retryCount >= config_.maxRetriesPerIteration) {
             frame.replanRequested = true;
@@ -1430,35 +2180,33 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
           }
 
           for (const std::string& taskId : frame.repairTaskIds) {
-            repaired = frame.taskGraph.reopen_task(taskId) || repaired;
+            if (repairOverlay.reopen_task(taskId)) {
+              repaired = true;
+              ++repairedTaskCount;
+            }
           }
-          if (repaired) {
-            ++frame.retryCount;
-            ++report.retries;
-          }
-          record.attempt = frame.retryCount;
+          record.attempt = frame.retryCount + (repaired ? 1U : 0U);
         } else if (record.decision == "SKIP_TASK") {
           for (const std::string& taskId : frame.repairTaskIds) {
-            bool advanced = frame.taskGraph.reset_failed(taskId);
+            bool advanced = repairOverlay.reset_failed(taskId);
             if (!advanced) {
-              advanced = frame.taskGraph.reopen_task(taskId);
+              advanced = repairOverlay.reopen_task(taskId);
             }
-            if (advanced && frame.taskGraph.mark_completed(taskId)) {
+            if (advanced && repairOverlay.mark_completed(taskId)) {
               repaired = true;
+              ++repairedTaskCount;
             }
           }
           record.attempt = frame.retryCount;
         }
-
-        frame.repairLog.push_back(record);
-        std::cerr << "[UltraLoop][Repair] iteration=" << record.iteration
-                  << " attempt=" << record.attempt
-                  << " site=" << record.site
-                  << " decision=" << record.decision
-                  << " tasks=" << joinTaskIds(record.taskIds)
-                  << " reason=" << record.reason << "\n";
+        record.successRate =
+            record.taskIds.empty()
+                ? 0.0
+                : static_cast<double>(repairedTaskCount) /
+                      static_cast<double>(record.taskIds.size());
 
         if (!repaired) {
+          logRepairRecord(record);
           frame.replanRequested = true;
           transitionTo(UltraLoopState::REPLAN,
                        "Partial repair could not recover requested tasks.");
@@ -1466,12 +2214,41 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
           break;
         }
 
+        if (!repairOverlay.verify()) {
+          record.reason += " Repair overlay verification failed.";
+          logRepairRecord(record);
+          frame.replanRequested = true;
+          transitionTo(UltraLoopState::REPLAN,
+                       "Partial repair verification failed.");
+          clearRepairContext();
+          break;
+        }
+        record.verified = repairOverlay.metadata().verified;
+
+        const std::optional<TaskGraph> mergedGraph =
+            frame.taskGraph.merge_repair_overlay(repairOverlay);
+        if (!mergedGraph.has_value()) {
+          logRepairRecord(record);
+          frame.replanRequested = true;
+          transitionTo(UltraLoopState::REPLAN,
+                       "Partial repair merge was rejected.");
+          clearRepairContext();
+          break;
+        }
+
+        frame.taskGraph = std::move(*mergedGraph);
+        if (shouldRetry) {
+          ++frame.retryCount;
+          ++report.retries;
+        }
+        logRepairRecord(record);
         frame.hasExecutionResult = false;
         frame.executionResult = {};
         frame.executionId.clear();
         clearRepairContext();
         transitionTo(UltraLoopState::EXECUTE,
-                     "Partial repair preserved successful work and reopened targeted tasks.");
+                     "Partial repair verified an isolated overlay and merged "
+                     "the targeted subgraph.");
         break;
       }
 
@@ -1480,9 +2257,17 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
         if (handleTerminalSignal("Verification", verificationResult)) {
           break;
         }
+        frame.verificationPassed =
+            verificationResult.success &&
+            verificationResult.signal == StageSignal::Continue;
+        frame.verificationScore =
+            extractVerificationScore(frame,
+                                     verificationResult,
+                                     config_.maxRetriesPerIteration);
+        frame.goalDistanceMetric = extractGoalDistanceMetric(frame);
+        frame.currentStrategyScore = buildStrategyScore(frame);
         if (verificationResult.success &&
             verificationResult.signal == StageSignal::Continue) {
-          frame.verificationPassed = true;
           transitionTo(UltraLoopState::REFLECT,
                        "Verification stage passed.");
           break;
@@ -1535,6 +2320,11 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
           break;
         }
 
+        frame.currentStrategyScore = buildStrategyScore(frame);
+        commitStrategyFeedback(frame,
+                               frame.reanchorRequested ? "reanchor"
+                                                       : "verified");
+
         if (!runMemoryCheckpoint("REFLECT")) {
           break;
         }
@@ -1547,12 +2337,34 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
           break;
         }
 
-        report.success = true;
-        report.message = reflectionResult.message.empty()
-                             ? "Loop completed deterministic execution cycle."
-                             : reflectionResult.message;
-        transitionTo(UltraLoopState::TERMINATE,
-                     "Reflection and memory checkpoint completed.");
+        convergenceTracker.observe({
+            frame.iteration,
+            frame.verificationScore,
+            frame.goalDistanceMetric,
+            frame.planSignatureHash,
+            0.0,
+        });
+        frame.deltaImprovement = convergenceTracker.history().empty()
+                                     ? 0.0
+                                     : convergenceTracker.history().back()
+                                           .deltaImprovement;
+
+        const ConvergenceDecision convergenceDecision =
+            convergenceTracker.evaluate(config_.maxStagnationIterations,
+                                        config_.minImprovementDelta,
+                                        config_.maxPlanRepetitions);
+        if (convergenceDecision.reached) {
+          StageResult convergenceResult;
+          convergenceResult.success = true;
+          convergenceResult.signal = convergenceDecision.signal;
+          convergenceResult.message = convergenceDecision.reason;
+          if (handleTerminalSignal("Convergence", convergenceResult)) {
+            break;
+          }
+        }
+
+        transitionTo(UltraLoopState::PLAN,
+                     "Reflection completed; convergence not yet reached.");
         break;
       }
 
@@ -1592,6 +2404,11 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
           transitionTo(UltraLoopState::TERMINATE, report.message);
           break;
         }
+
+        frame.currentStrategyScore = buildStrategyScore(frame);
+        commitStrategyFeedback(frame,
+                               frame.verificationPassed ? "replan"
+                                                        : "replan_failure");
 
         if (!runMemoryCheckpoint("REPLAN")) {
           break;
@@ -1641,8 +2458,34 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
         report.repairs = frame.repairLog;
         report.arbitration = frame.arbitrationLog;
         report.intentConsistency = frame.intentConsistencyLog;
+        report.strategyFeedback = frame.strategyFeedbackLog;
+        report.planPerformance = frame.planPerformanceHistory;
         running = false;
         break;
+      }
+    }
+    }
+    catch (const ::ultra::runtime::contracts::ContractViolationException& ex) {
+      StageResult violationResult;
+      violationResult.success = false;
+      violationResult.signal = StageSignal::Retry;
+      violationResult.message = ex.what();
+      notifyFailure(violationResult);
+
+      if (state == UltraLoopState::INIT || state == UltraLoopState::REPLAN ||
+          state == UltraLoopState::TERMINATE) {
+        report.success = false;
+        report.message = ex.what();
+        transitionTo(UltraLoopState::TERMINATE, report.message);
+        continue;
+      }
+
+      try {
+        dispatchRecovery("contract_violation");
+      } catch (const ::ultra::runtime::contracts::ContractViolationException& recoveryEx) {
+        report.success = false;
+        report.message = recoveryEx.what();
+        transitionTo(UltraLoopState::TERMINATE, report.message);
       }
     }
   }
@@ -1655,6 +2498,12 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
   }
   if (report.intentConsistency.empty()) {
     report.intentConsistency = frame.intentConsistencyLog;
+  }
+  if (report.strategyFeedback.empty()) {
+    report.strategyFeedback = frame.strategyFeedbackLog;
+  }
+  if (report.planPerformance.empty()) {
+    report.planPerformance = frame.planPerformanceHistory;
   }
 
   return report;

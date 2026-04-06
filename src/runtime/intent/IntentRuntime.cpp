@@ -6,10 +6,20 @@
 #include <algorithm>
 #include <filesystem>
 #include <stdexcept>
+#include <string_view>
 
 namespace ultra::runtime::intent {
 
 namespace {
+
+[[nodiscard]] bool hasMemoryConstraint(const IntentMemoryContext& memory,
+                                       const std::string_view value) {
+  return std::any_of(memory.knownConstraints.begin(),
+                     memory.knownConstraints.end(),
+                     [value](const std::string& entry) {
+                       return entry == value;
+                     });
+}
 
 [[nodiscard]] ::ultra::authority::AuthorityIntentRequest buildAuthorityIntentRequest(
     const std::string& input,
@@ -87,6 +97,67 @@ namespace {
   return normalizeIntent(intent, fallbackTokenBudget);
 }
 
+[[nodiscard]] Intent applyMemoryContext(Intent intent,
+                                        const IntentMemoryContext& memory,
+                                        const std::size_t fallbackTokenBudget) {
+  intent.memory = memory;
+
+  if (memory.repeatedFailureDetected || !memory.failedPatterns.empty()) {
+    intent.constraints.maxImpactDepth =
+        std::max<std::size_t>(1U,
+                              std::min<std::size_t>(intent.constraints.maxImpactDepth,
+                                                    1U));
+    intent.constraints.maxFilesChanged =
+        std::max<std::size_t>(1U,
+                              std::min<std::size_t>(intent.constraints.maxFilesChanged,
+                                                    2U));
+  }
+
+  if (hasMemoryConstraint(memory, "avoid_public_api")) {
+    intent.options.allowPublicAPIChange = false;
+  }
+
+  if (hasMemoryConstraint(memory, "require_preflight")) {
+    intent.options.allowCrossModuleMove = false;
+    intent.options.allowSignatureChange = false;
+  }
+
+  if (memory.hasReusableStrategy && !memory.repeatedFailureDetected) {
+    intent.options.allowRename = intent.options.allowRename ||
+                                 intent.goal.type == GoalType::ModifySymbol;
+  }
+
+  if (memory.strategyFeedback.simplifyPlan ||
+      hasMemoryConstraint(memory, "simplify_plan")) {
+    intent.constraints.maxImpactDepth = 1U;
+    intent.constraints.maxFilesChanged = 1U;
+  }
+
+  if (memory.strategyFeedback.increaseTaskGranularity ||
+      hasMemoryConstraint(memory, "increase_granularity")) {
+    intent.constraints.maxImpactDepth = 1U;
+    intent.constraints.maxFilesChanged = 1U;
+    intent.options.allowRename = false;
+    intent.options.allowSignatureChange = false;
+    intent.options.allowCrossModuleMove = false;
+  }
+
+  if (memory.strategyFeedback.forceVariation ||
+      hasMemoryConstraint(memory, "force_variation")) {
+    intent.options.allowCrossModuleMove = false;
+    intent.options.allowSignatureChange = false;
+  }
+
+  if (memory.strategyFeedback.reinforcePattern &&
+      !memory.strategyFeedback.preferredStrategyType.empty() &&
+      !memory.repeatedFailureDetected) {
+    intent.options.allowRename =
+        intent.options.allowRename || intent.goal.type == GoalType::ModifySymbol;
+  }
+
+  return normalizeIntent(intent, fallbackTokenBudget);
+}
+
 }  // namespace
 
 Intent IntentRuntime::process_input(const std::string& input) const {
@@ -107,6 +178,13 @@ IntentEvaluation IntentRuntime::evaluate_intent(
   return evaluator_.evaluateIntent(intent, state);
 }
 
+Intent IntentRuntime::enrich_intent(const Intent& intent,
+                                    const ContextFrame& frame) const {
+  const std::size_t fallbackTokenBudget =
+      frame.tokenBudget == 0U ? 4096U : frame.tokenBudget;
+  return applyMemoryContext(intent, frame.memory, fallbackTokenBudget);
+}
+
 Intent IntentRuntime::resolve_structured_intent(const std::string& input,
                                                 const ContextFrame& frame) const {
   const ::ultra::authority::AuthorityIntentRequest request =
@@ -122,7 +200,10 @@ Intent IntentRuntime::resolve_structured_intent(const std::string& input,
 
   const std::size_t fallbackTokenBudget =
       request.tokenBudget == 0U ? 4096U : request.tokenBudget;
-  return buildStructuredIntent(request, simulation, fallbackTokenBudget);
+  return applyMemoryContext(
+      buildStructuredIntent(request, simulation, fallbackTokenBudget),
+      frame.memory,
+      fallbackTokenBudget);
 }
 
 }  // namespace ultra::runtime::intent

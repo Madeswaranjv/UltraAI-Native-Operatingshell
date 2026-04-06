@@ -1,6 +1,7 @@
 #include "ExecutionKernel.h"
 
 #include "CognitiveRuntime.h"
+#include "contract_enforcement.h"
 #include "tool_router/ToolRouter.h"
 
 #include "../ContextExtractor.h"
@@ -16,6 +17,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -29,7 +31,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
-#include<iostream>
+#include <iostream>
 namespace ultra::runtime {
 
 namespace {
@@ -734,7 +736,314 @@ bool isKnownSymbolTarget(const GraphSnapshot& snapshot,
   return false;
 }
 
-const std::map<std::string, std::vector<std::string>>& fallbackToolInputParams() {
+std::string trimAscii(std::string value) {
+  const auto notSpace = [](const unsigned char ch) {
+    return !std::isspace(ch);
+  };
+  value.erase(value.begin(),
+              std::find_if(value.begin(), value.end(), notSpace));
+  value.erase(std::find_if(value.rbegin(), value.rend(), notSpace).base(),
+              value.end());
+  return value;
+}
+
+std::string stripMarkdownCodeFence(const std::string& text) {
+  std::string trimmed = trimAscii(text);
+  if (trimmed.rfind("```", 0U) != 0U) {
+    return trimmed;
+  }
+
+  const std::size_t bodyStart = trimmed.find('\n');
+  const std::size_t fenceEnd = trimmed.rfind("```");
+  if (bodyStart == std::string::npos || fenceEnd <= bodyStart) {
+    return trimmed;
+  }
+  return trimAscii(trimmed.substr(bodyStart + 1U, fenceEnd - bodyStart - 1U));
+}
+
+std::string normalizeToolName(std::string value) {
+  value = trimAscii(std::move(value));
+  std::replace(value.begin(), value.end(), '-', '_');
+  std::transform(value.begin(),
+                 value.end(),
+                 value.begin(),
+                 [](const unsigned char ch) {
+                   return static_cast<char>(std::tolower(ch));
+                 });
+  return value;
+}
+
+std::string jsonValueToString(const nlohmann::ordered_json& value) {
+  if (value.is_string()) {
+    return value.get<std::string>();
+  }
+  if (value.is_boolean()) {
+    return value.get<bool>() ? "true" : "false";
+  }
+  if (value.is_number_integer()) {
+    return std::to_string(value.get<long long>());
+  }
+  if (value.is_number_unsigned()) {
+    return std::to_string(value.get<unsigned long long>());
+  }
+  if (value.is_number_float()) {
+    std::ostringstream stream;
+    stream << value.get<double>();
+    return stream.str();
+  }
+  if (value.is_null()) {
+    return {};
+  }
+  return value.dump();
+}
+
+std::optional<nlohmann::ordered_json> parseJsonFromText(const std::string& text) {
+  const std::string stripped = stripMarkdownCodeFence(text);
+  if (stripped.empty()) {
+    return std::nullopt;
+  }
+
+  const auto tryParse = [](const std::string& candidate)
+      -> std::optional<nlohmann::ordered_json> {
+    try {
+      return nlohmann::ordered_json::parse(candidate);
+    } catch (...) {
+      return std::nullopt;
+    }
+  };
+
+  if (std::optional<nlohmann::ordered_json> parsed = tryParse(stripped);
+      parsed.has_value()) {
+    return parsed;
+  }
+
+  const std::vector<std::pair<char, char>> delimiters = {
+      {'{', '}'},
+      {'[', ']'},
+  };
+  for (const auto& delimiter : delimiters) {
+    const std::size_t start = stripped.find(delimiter.first);
+    const std::size_t end = stripped.rfind(delimiter.second);
+    if (start == std::string::npos || end == std::string::npos || end <= start) {
+      continue;
+    }
+    if (std::optional<nlohmann::ordered_json> parsed =
+            tryParse(stripped.substr(start, end - start + 1U));
+        parsed.has_value()) {
+      return parsed;
+    }
+  }
+
+  return std::nullopt;
+}
+
+nlohmann::ordered_json toolArgumentsFromJsonObject(
+    const nlohmann::ordered_json& object) {
+  if (!object.is_object()) {
+    return nlohmann::ordered_json::object();
+  }
+
+  const auto parseArgumentNode = [](const nlohmann::ordered_json& value) {
+    if (value.is_object()) {
+      return value;
+    }
+    if (value.is_string()) {
+      if (std::optional<nlohmann::ordered_json> parsed =
+              parseJsonFromText(value.get<std::string>());
+          parsed.has_value() && parsed->is_object()) {
+        return *parsed;
+      }
+      nlohmann::ordered_json payload = nlohmann::ordered_json::object();
+      payload["input"] = value.get<std::string>();
+      return payload;
+    }
+    nlohmann::ordered_json payload = nlohmann::ordered_json::object();
+    payload["input"] = value;
+    return payload;
+  };
+
+  if (object.contains("function") && object.at("function").is_object()) {
+    const auto& functionObject = object.at("function");
+    if (functionObject.contains("arguments")) {
+      return parseArgumentNode(functionObject.at("arguments"));
+    }
+    nlohmann::ordered_json payload = nlohmann::ordered_json::object();
+    for (auto it = functionObject.begin(); it != functionObject.end(); ++it) {
+      if (it.key() == "name") {
+        continue;
+      }
+      payload[it.key()] = it.value();
+    }
+    return payload;
+  }
+
+  if (object.contains("arguments")) {
+    return parseArgumentNode(object.at("arguments"));
+  }
+  if (object.contains("args")) {
+    return parseArgumentNode(object.at("args"));
+  }
+
+  nlohmann::ordered_json payload = nlohmann::ordered_json::object();
+  static const std::set<std::string> kReservedKeys = {
+      "tool",
+      "name",
+      "type",
+      "function",
+  };
+  for (auto it = object.begin(); it != object.end(); ++it) {
+    if (kReservedKeys.find(it.key()) != kReservedKeys.end()) {
+      continue;
+    }
+    payload[it.key()] = it.value();
+  }
+  return payload;
+}
+
+std::optional<ai::model::ToolCall> toolCallFromJsonObject(
+    const nlohmann::ordered_json& object) {
+  if (!object.is_object()) {
+    return std::nullopt;
+  }
+
+  ai::model::ToolCall toolCall;
+  if (object.contains("tool") && object.at("tool").is_string()) {
+    toolCall.name = normalizeToolName(object.at("tool").get<std::string>());
+  }
+  if (toolCall.name.empty() && object.contains("name") && object.at("name").is_string()) {
+    toolCall.name = normalizeToolName(object.at("name").get<std::string>());
+  }
+  if (toolCall.name.empty() && object.contains("function") &&
+      object.at("function").is_object()) {
+    const auto& functionObject = object.at("function");
+    if (functionObject.contains("name") && functionObject.at("name").is_string()) {
+      toolCall.name = normalizeToolName(functionObject.at("name").get<std::string>());
+    }
+  }
+  if (toolCall.name.empty()) {
+    return std::nullopt;
+  }
+
+  toolCall.arguments = toolArgumentsFromJsonObject(object);
+  return toolCall;
+}
+
+void appendToolCallsFromJson(const nlohmann::ordered_json& value,
+                             std::vector<ai::model::ToolCall>& toolCalls) {
+  if (value.is_array()) {
+    for (const auto& entry : value) {
+      appendToolCallsFromJson(entry, toolCalls);
+    }
+    return;
+  }
+
+  if (!value.is_object()) {
+    return;
+  }
+
+  if (value.contains("tool_calls")) {
+    appendToolCallsFromJson(value.at("tool_calls"), toolCalls);
+  }
+  if (value.contains("tool_call")) {
+    appendToolCallsFromJson(value.at("tool_call"), toolCalls);
+  }
+  if (value.contains("payload")) {
+    appendToolCallsFromJson(value.at("payload"), toolCalls);
+  }
+  if (value.contains("response")) {
+    appendToolCallsFromJson(value.at("response"), toolCalls);
+  }
+
+  if (std::optional<ai::model::ToolCall> toolCall = toolCallFromJsonObject(value);
+      toolCall.has_value()) {
+    toolCalls.push_back(std::move(*toolCall));
+  }
+}
+
+std::vector<ai::model::ToolCall> extractToolCallsFromText(const std::string& text) {
+  std::vector<ai::model::ToolCall> toolCalls;
+  if (std::optional<nlohmann::ordered_json> parsed = parseJsonFromText(text);
+      parsed.has_value()) {
+    appendToolCallsFromJson(*parsed, toolCalls);
+  }
+  return toolCalls;
+}
+
+std::map<std::string, std::string> orderedJsonToStringMap(
+    const nlohmann::ordered_json& value) {
+  std::map<std::string, std::string> result;
+  if (!value.is_object()) {
+    return result;
+  }
+
+  for (auto it = value.begin(); it != value.end(); ++it) {
+    result[it.key()] = jsonValueToString(it.value());
+  }
+  return result;
+}
+
+std::optional<nlohmann::ordered_json> parseToolOutputJson(
+    const std::string& output) {
+  std::string candidate = trimAscii(output);
+  if (candidate.rfind("ERROR:", 0U) == 0U) {
+    candidate = trimAscii(candidate.substr(6U));
+  } else if (candidate.rfind("[ERROR]", 0U) == 0U) {
+    candidate = trimAscii(candidate.substr(7U));
+  }
+  return parseJsonFromText(candidate);
+}
+
+std::string summarizeExecutedTools(
+    const std::vector<ai::model::ToolCall>& toolCalls) {
+  std::vector<std::string> names;
+  std::set<std::string> seen;
+  for (const ai::model::ToolCall& toolCall : toolCalls) {
+    if (toolCall.name.empty() || !seen.insert(toolCall.name).second) {
+      continue;
+    }
+    names.push_back(toolCall.name);
+  }
+  if (names.empty()) {
+    return "Executed tool calls.";
+  }
+
+  std::ostringstream stream;
+  stream << "Executed tool calls: ";
+  for (std::size_t index = 0U; index < names.size(); ++index) {
+    if (index > 0U) {
+      stream << ", ";
+    }
+    stream << names[index];
+  }
+  stream << '.';
+  return stream.str();
+}
+
+std::string summarizeToolCallNames(
+    const std::vector<ai::model::ToolCall>& toolCalls) {
+  std::vector<std::string> names;
+  std::set<std::string> seen;
+  for (const ai::model::ToolCall& toolCall : toolCalls) {
+    if (toolCall.name.empty() || !seen.insert(toolCall.name).second) {
+      continue;
+    }
+    names.push_back(toolCall.name);
+  }
+  if (names.empty()) {
+    return "none";
+  }
+
+  std::ostringstream stream;
+  for (std::size_t index = 0U; index < names.size(); ++index) {
+    if (index > 0U) {
+      stream << ", ";
+    }
+    stream << names[index];
+  }
+  return stream.str();
+}
+
+const std::map<std::string, std::vector<std::string>>& fallbackToolRequiredParams() {
   static const std::map<std::string, std::vector<std::string>> kToolInputs = {
       {"read_file", {"path"}},
       {"write_file", {"path", "content"}},
@@ -742,16 +1051,30 @@ const std::map<std::string, std::vector<std::string>>& fallbackToolInputParams()
       {"delete_file", {"path"}},
       {"list_dir", {}},
       {"search_files", {"pattern"}},
+      {"apply_patch", {}},
       {"run_command", {"command"}},
   };
   return kToolInputs;
 }
 
-bool isNativeToolRouterTool(const std::string& toolName) {
-  return fallbackToolInputParams().find(toolName) !=
-         fallbackToolInputParams().end();
+const std::map<std::string, std::vector<std::string>>& fallbackToolAllowedParams() {
+  static const std::map<std::string, std::vector<std::string>> kToolInputs = {
+      {"read_file", {"path"}},
+      {"write_file", {"path", "content", "create_dirs"}},
+      {"append_file", {"path", "content"}},
+      {"delete_file", {"path"}},
+      {"list_dir", {"path", "recursive"}},
+      {"search_files", {"pattern", "path", "case_sensitive"}},
+      {"apply_patch", {"diff", "changes", "file", "path", "project_path"}},
+      {"run_command", {"command", "cwd", "timeout_ms"}},
+  };
+  return kToolInputs;
 }
 
+bool isNativeToolRouterTool(const std::string& toolName) {
+  return fallbackToolAllowedParams().find(normalizeToolName(toolName)) !=
+         fallbackToolAllowedParams().end();
+}
 bool requiresModelGeneration(const intent::ActionKind kind) {
   switch (kind) {
     case intent::ActionKind::ModifySymbolBody:
@@ -801,8 +1124,8 @@ ai::model::ModelRequest buildModelRequestForStrategyAction(
     const CognitiveState& state) {
   ai::model::ModelRequest request;
   request.systemPrompt =
-      "You are UltraInfinity coding execution stage. Generate deterministic "
-      "code-level changes and actionable implementation output.";
+      "You are UltraInfinity deterministic execution. Return only real "
+      "filesystem tool calls. Do not simulate, explain, or describe edits.";
 
   std::ostringstream prompt;
   prompt << "Action Kind: " << intent::toString(strategyAction.kind) << "\n";
@@ -814,25 +1137,19 @@ ai::model::ModelRequest buildModelRequestForStrategyAction(
          << strategyAction.estimatedDependencyDepth << "\n";
   prompt << "Branch: " << state.snapshot.branch.toString() << "\n";
   prompt << "Snapshot Version: " << state.snapshot.version << "\n";
-  prompt << "Return concrete implementation content suitable for deterministic "
-            "execution.";
+  prompt << "Use the native apply_patch tool only. Return either tool_calls or "
+            "a single JSON object like "
+            "{\"tool\":\"apply_patch\",\"changes\":\"<unified diff>\"}.\n";
+  prompt << "The patch must be a unified diff that can be applied directly to "
+            "real files. No prose.";
   request.prompt = prompt.str();
 
-  request.temperature = 0.10;
-  request.maxTokens = std::max<std::size_t>(
-      512U,
-      strategyAction.estimatedFilesChanged *
-          std::max<std::size_t>(256U, strategyAction.estimatedDependencyDepth * 128U));
-
-  request.toolsAvailable = {
-      "read_file",
-      "write_file",
-      "append_file",
-      "delete_file",
-      "list_dir",
-      "search_files",
-      "run_command",
-  };
+  request.temperature = 0.05;
+  const std::size_t estimatedBudget =
+      strategyAction.estimatedFilesChanged * 320U +
+      strategyAction.estimatedDependencyDepth * 160U;
+  request.maxTokens = std::clamp<std::size_t>(estimatedBudget, 384U, 1536U);
+  request.toolsAvailable = {"apply_patch"};
 
   request.contextPayload = {
       {"action_kind", intent::toString(strategyAction.kind)},
@@ -842,6 +1159,7 @@ ai::model::ModelRequest buildModelRequestForStrategyAction(
       {"estimated_dependency_depth", strategyAction.estimatedDependencyDepth},
       {"branch", state.snapshot.branch.toString()},
       {"snapshot_version", state.snapshot.version},
+      {"tool_required", "apply_patch"},
   };
   return request;
 }
@@ -922,6 +1240,12 @@ ExecutionKernel::ExecutionKernel(
                              : ai::orchestration::MultiModelOrchestrator::
                                    createDefault(stateManager.projectRoot())) {}
 
+Action ExecutionKernel::buildActionFromStrategy(
+    const intent::Action& strategyAction,
+    const CognitiveState& state) {
+  return strategyActionToKernelAction(strategyAction, state);
+}
+
 RiskLevel ExecutionKernel::maxRisk(const RiskLevel left,
                                    const RiskLevel right) noexcept {
   return static_cast<int>(right) > static_cast<int>(left) ? right : left;
@@ -935,38 +1259,65 @@ GovernanceDecision ExecutionKernel::evaluate_action(
   decision.risk = RiskLevel::Low;
   decision.confidence = 0.92F;
 
+  const std::string normalizedTool = normalizeToolName(tool);
   std::vector<std::string> reasons;
   std::size_t unknownParameterCount = 0U;
 
   const cognitive::tools::ToolDefinition* definition =
-      toolExecutor_.registry().get_tool(tool);
+      toolExecutor_.registry().get_tool(normalizedTool);
   std::vector<std::string> requiredArgs;
+  std::vector<std::string> allowedArgs;
   if (definition != nullptr) {
     requiredArgs = definition->input_params;
+    allowedArgs = definition->input_params;
+    if (const auto fallbackAllowed =
+            fallbackToolAllowedParams().find(normalizedTool);
+        fallbackAllowed != fallbackToolAllowedParams().end()) {
+      if (allowedArgs.empty()) {
+        allowedArgs = fallbackAllowed->second;
+      }
+      if (requiredArgs.empty()) {
+        if (const auto fallbackRequired =
+                fallbackToolRequiredParams().find(normalizedTool);
+            fallbackRequired != fallbackToolRequiredParams().end()) {
+          requiredArgs = fallbackRequired->second;
+        }
+      }
+    }
   } else {
-    const auto fallbackTool = fallbackToolInputParams().find(tool);
-    if (fallbackTool != fallbackToolInputParams().end()) {
-      requiredArgs = fallbackTool->second;
-    } else {
+    const auto fallbackAllowed = fallbackToolAllowedParams().find(normalizedTool);
+    if (fallbackAllowed == fallbackToolAllowedParams().end()) {
       decision.allowed = false;
       decision.risk = RiskLevel::Critical;
       decision.confidence = 0.0F;
-      decision.reason = "Unknown tool: " + tool;
+      decision.reason = "Unknown tool: " + normalizedTool;
       core::Logger::warning(core::LogCategory::General,
-                            "Governance blocked unknown tool '" + tool + "'.");
+                            "Governance blocked unknown tool '" +
+                                normalizedTool + "'.");
       return decision;
+    }
+
+    allowedArgs = fallbackAllowed->second;
+    if (const auto fallbackRequired =
+            fallbackToolRequiredParams().find(normalizedTool);
+        fallbackRequired != fallbackToolRequiredParams().end()) {
+      requiredArgs = fallbackRequired->second;
     }
   }
 
-  if (tool == "query_symbol" || tool == "read_source" ||
-      tool == "read_file" || tool == "list_dir" ||
-      tool == "search_files") {
+  if (normalizedTool == "query_symbol" || normalizedTool == "read_source" ||
+      normalizedTool == "read_file" || normalizedTool == "list_dir" ||
+      normalizedTool == "search_files") {
     decision.risk = RiskLevel::Low;
-  } else if (tool == "impact_analysis" || tool == "get_context" ||
-             tool == "get_status") {
+  } else if (normalizedTool == "impact_analysis" ||
+             normalizedTool == "get_context" ||
+             normalizedTool == "get_status") {
     decision.risk = RiskLevel::Medium;
-  } else if (tool == "write_file" || tool == "append_file" ||
-             tool == "delete_file" || tool == "run_command") {
+  } else if (normalizedTool == "write_file" ||
+             normalizedTool == "append_file" ||
+             normalizedTool == "delete_file" ||
+             normalizedTool == "run_command" ||
+             normalizedTool == "apply_patch") {
     decision.risk = RiskLevel::High;
     reasons.push_back("Mutable tool execution requires strict governance.");
   } else {
@@ -989,6 +1340,17 @@ GovernanceDecision ExecutionKernel::evaluate_action(
     }
   }
 
+  if (normalizedTool == "apply_patch") {
+    const bool hasPatchPayload =
+        (args.find("diff") != args.end() && !args.at("diff").empty()) ||
+        (args.find("changes") != args.end() && !args.at("changes").empty());
+    if (!hasPatchPayload) {
+      decision.risk = maxRisk(decision.risk, RiskLevel::Critical);
+      decision.confidence -= 0.45F;
+      reasons.push_back("apply_patch requires diff or changes payload");
+    }
+  }
+
   for (const auto& [key, value] : args) {
     if (value.empty()) {
       decision.risk = maxRisk(decision.risk, RiskLevel::Critical);
@@ -998,7 +1360,7 @@ GovernanceDecision ExecutionKernel::evaluate_action(
     }
 
     const bool known =
-        std::find(requiredArgs.begin(), requiredArgs.end(), key) != requiredArgs.end();
+        std::find(allowedArgs.begin(), allowedArgs.end(), key) != allowedArgs.end();
     if (!known) {
       ++unknownParameterCount;
       decision.risk = maxRisk(decision.risk, RiskLevel::High);
@@ -1007,7 +1369,7 @@ GovernanceDecision ExecutionKernel::evaluate_action(
     }
   }
 
-  if (tool == "query_symbol" || tool == "impact_analysis") {
+  if (normalizedTool == "query_symbol" || normalizedTool == "impact_analysis") {
     const auto symbolsTablePath = resolveSymbolsTablePath();
     if (!symbolsTablePath.has_value()) {
       decision.risk = maxRisk(decision.risk, RiskLevel::Critical);
@@ -1025,8 +1387,8 @@ GovernanceDecision ExecutionKernel::evaluate_action(
   }
 
   const std::size_t historyFailures =
-      std::max(toolExecutor_.consecutive_failures(tool),
-               toolFailureCounts_[tool]);
+      std::max(toolExecutor_.consecutive_failures(normalizedTool),
+               toolFailureCounts_[normalizedTool]);
   if (historyFailures >= 2U) {
     decision.risk = maxRisk(decision.risk, RiskLevel::High);
     decision.confidence -=
@@ -1077,7 +1439,7 @@ GovernanceDecision ExecutionKernel::evaluate_action(
 
   core::Logger::info(
       core::LogCategory::General,
-      "Governance decision tool='" + tool + "' risk=" +
+      "Governance decision tool='" + normalizedTool + "' risk=" +
           toString(decision.risk) + " confidence=" +
           std::to_string(decision.confidence) + " allowed=" +
           (decision.allowed ? "true" : "false") + " reason='" +
@@ -1219,6 +1581,15 @@ Result ExecutionKernel::executeIntent(const intent::Intent& intentValue,
   action.snapshotVersion = state.snapshot.version;
   action.intentRequest = intentValue;
   action.policy = policy;
+  if (action.type != ActionType::IntentEvaluation) {
+    Result result;
+    result.type = action.type;
+    result.risk = RiskLevel::Critical;
+    result.ok = false;
+    result.message =
+        "ExecutionKernel::executeIntent refuses to execute non-intent actions.";
+    return result;
+  }
   return execute(action, state);
 }
 
@@ -1317,22 +1688,14 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
     }
 
     case ActionType::SimulateChange: {
-      // DEBUG — if you see this, strategyActionToKernelAction mapped to SimulateChange
-      std::cerr << "[ULTRA-DEBUG] SimulateChange entered. target=" << action.target << "\n";
-      const ai::RuntimeState& runtimeState = requireRuntimeState(state.snapshot);
-      engine::impact::ImpactPredictionEngine engine(
-          runtimeState, state.snapshot.graphStore, state.snapshot.version);
-      const bool symbolTarget = isKnownSymbolTarget(state.snapshot, action.target);
-      const engine::impact::SimulationResult simulation =
-          symbolTarget ? engine.simulateSymbolChange(action.target)
-                       : engine.simulateFileChange(action.target);
-      result.payload = buildSimulationJson(simulation);
-      result.impactedNodes = collectImpactNodeIds(
-          simulation.prediction, symbolNodeIds, fileNodeIds);
-      result.normalizedPaths = collectNormalizedPaths(result.payload);
-      result.risk = toRiskLevel(simulation.prediction.risk.score);
-      result.ok = true;
-      result.message = "Change simulation completed.";
+      result.ok = false;
+      result.risk = RiskLevel::Critical;
+      result.payload = {
+          {"target", action.target},
+          {"disabled", true},
+      };
+      result.message =
+          "SimulateChange is disabled; deterministic execution requires real tool calls.";
       break;
     }
 
@@ -1340,7 +1703,6 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
       const ai::orchestration::OrchestrationContext orchestrationContext =
           buildOrchestrationContext(action);
 
-      // DEBUG — printed to stderr so it doesn't pollute the JSON stdout
       std::cerr << "[ULTRA-DEBUG] ModelGenerate entered."
                 << " provider=" << action.modelProvider
                 << " prompt_len=" << (action.modelRequest.has_value()
@@ -1390,7 +1752,6 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
       lastModelTextOutput_ = response.textOutput;
       result.text_output = lastModelTextOutput_;
 
-      // DEBUG
       std::cerr << "[ULTRA-DEBUG] ModelGenerate response."
                 << " ok=" << (response.ok ? "true" : "false")
                 << " error=" << response.errorMessage
@@ -1422,10 +1783,133 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
       result.normalizedPaths = collectNormalizedPaths(result.payload);
       result.risk = response.ok ? RiskLevel::Low : RiskLevel::Medium;
       result.ok = response.ok;
-      result.message = response.ok ? "Model generation completed."
-                                   : (response.errorMessage.empty()
-                                          ? "Model generation failed."
-                                          : response.errorMessage);
+      if (!response.ok) {
+        result.message = response.errorMessage.empty()
+                             ? "Model generation failed."
+                             : response.errorMessage;
+        break;
+      }
+
+      const bool providerSuppliedToolCalls = !response.toolCalls.empty();
+      std::vector<ai::model::ToolCall> toolCalls = response.toolCalls;
+      if (toolCalls.empty()) {
+        toolCalls = extractToolCallsFromText(response.textOutput);
+        if (!toolCalls.empty()) {
+          result.payload["tool_calls_inferred"] = true;
+        }
+      }
+      if (toolCalls.empty()) {
+        result.ok = false;
+        result.risk = RiskLevel::High;
+        result.message = "Model generation returned no executable tool calls.";
+        break;
+      }
+      nlohmann::ordered_json detectedToolCalls = nlohmann::ordered_json::array();
+      for (const ai::model::ToolCall& toolCall : toolCalls) {
+        detectedToolCalls.push_back(
+            {{"tool", normalizeToolName(toolCall.name)},
+             {"arguments", toolCall.arguments}});
+      }
+      result.payload["tool_call_detected"] = true;
+      result.payload["tool_call_count"] = toolCalls.size();
+      result.payload["tool_call_source"] =
+          providerSuppliedToolCalls ? "provider" : "text";
+      result.payload["tool_calls_detected"] = std::move(detectedToolCalls);
+      if (!response.textOutput.empty()) {
+        result.payload["model_text_output"] = response.textOutput;
+      }
+      result.payload.erase("text_output");
+      result.text_output.clear();
+      lastModelTextOutput_.clear();
+      std::cerr << "[TOOL_CALL_DETECTED] count=" << toolCalls.size()
+                << " source="
+                << (providerSuppliedToolCalls ? "provider" : "text")
+                << " tools=" << summarizeToolCallNames(toolCalls) << "\n";
+      nlohmann::ordered_json toolResults = nlohmann::ordered_json::array();
+      bool toolFailure = false;
+      std::string toolFailureMessage;
+      for (std::size_t index = 0U; index < toolCalls.size(); ++index) {
+        const ai::model::ToolCall& toolCall = toolCalls[index];
+        Action toolAction;
+        toolAction.type = ActionType::ToolExecution;
+        toolAction.id = action.id + ":tool:" + std::to_string(index + 1U);
+        toolAction.target = action.target;
+        toolAction.branch = action.branch;
+        toolAction.snapshotVersion = action.snapshotVersion;
+        toolAction.toolName = normalizeToolName(toolCall.name);
+        toolAction.toolArgs = orderedJsonToStringMap(toolCall.arguments);
+        if (toolAction.toolName == "apply_patch" &&
+            toolAction.toolArgs.find("project_path") == toolAction.toolArgs.end()) {
+          toolAction.toolArgs["project_path"] = stateManager_.projectRoot().string();
+        }
+        if (toolAction.toolName.empty()) {
+          toolFailure = true;
+          toolFailureMessage = "Model generated a tool call without a tool name.";
+          break;
+        }
+        Result childResult = executeActionLocked(toolAction, state);
+        updateToolFailureHistory(toolAction, childResult);
+        toolResults.push_back({
+            {"args", toolAction.toolArgs},
+            {"impacted_nodes", childResult.impactedNodes},
+            {"message", childResult.message},
+            {"normalized_paths", childResult.normalizedPaths},
+            {"ok", childResult.ok},
+            {"payload", childResult.payload},
+            {"risk", toString(childResult.risk)},
+            {"text_output", childResult.text_output},
+            {"tool", toolAction.toolName},
+        });
+        result.impactedNodes.insert(result.impactedNodes.end(),
+                                    childResult.impactedNodes.begin(),
+                                    childResult.impactedNodes.end());
+        result.normalizedPaths.insert(result.normalizedPaths.end(),
+                                      childResult.normalizedPaths.begin(),
+                                      childResult.normalizedPaths.end());
+        result.risk = maxRisk(result.risk, childResult.risk);
+        result.applied = result.applied || childResult.applied;
+        if (childResult.payload.is_object() &&
+            childResult.payload.contains("output_json") &&
+            childResult.payload.at("output_json").is_object()) {
+          result.payload["tool_execution"] = childResult.payload.at("output_json");
+          if (!result.payload["tool_execution"].contains("tool")) {
+            result.payload["tool_execution"]["tool"] = toolAction.toolName;
+          }
+        }
+        if (childResult.payload.is_object() &&
+            childResult.payload.contains("tool_router_executed") &&
+            childResult.payload.at("tool_router_executed").is_boolean() &&
+            childResult.payload.at("tool_router_executed").get<bool>()) {
+          result.payload["tool_router_executed"] = true;
+        }
+        if (childResult.payload.is_object() &&
+            childResult.payload.contains("tool_router_transport") &&
+            childResult.payload.at("tool_router_transport").is_string()) {
+          result.payload["tool_router_transport"] =
+              childResult.payload.at("tool_router_transport").get<std::string>();
+        }
+        if (!childResult.ok) {
+          toolFailure = true;
+          toolFailureMessage = childResult.message;
+          break;
+        }
+      }
+      result.payload["tool_results"] = std::move(toolResults);
+      result.payload["tool_execution_summary"] = summarizeExecutedTools(toolCalls);
+      sortAndDedupe(result.impactedNodes);
+      result.normalizedPaths = normalizeAndSortPaths(std::move(result.normalizedPaths));
+      if (toolFailure) {
+        result.ok = false;
+        result.message = toolFailureMessage.empty()
+                             ? "Tool execution failed after model generation."
+                             : toolFailureMessage;
+        break;
+      }
+      result.ok = true;
+      result.text_output.clear();
+      result.payload.erase("text_output");
+      lastModelTextOutput_.clear();
+      result.message = "Model generation completed and tool calls executed.";
       break;
     }
 
@@ -1452,28 +1936,89 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
 
       std::string toolOutput;
       bool toolSucceeded = false;
-
-      if (toolExecutor_.registry().get_tool(action.toolName) != nullptr) {
-        toolOutput = toolExecutor_.execute(action.toolName, action.toolArgs);
+      bool toolRouterExecuted = false;
+      std::string routerTransport = "unavailable";
+      const std::string normalizedTool = normalizeToolName(action.toolName);
+      if (toolExecutor_.registry().get_tool(normalizedTool) != nullptr) {
+        routerTransport = "tool_executor";
+        toolOutput = toolExecutor_.execute(normalizedTool, action.toolArgs);
         toolSucceeded = toolExecutor_.last_execution_succeeded();
-      } else if (isNativeToolRouterTool(action.toolName)) {
+        toolRouterExecuted = true;
+      } else if (isNativeToolRouterTool(normalizedTool)) {
         cognitive::tool_router::ToolRouter directRouter;
-        toolOutput = directRouter.route_and_execute(action.toolName, action.toolArgs);
+        routerTransport = "direct_router";
+        toolOutput = directRouter.route_and_execute(normalizedTool, action.toolArgs);
         toolSucceeded = toolOutput.rfind("ERROR:", 0U) != 0U &&
                         toolOutput.rfind("[ERROR]", 0U) != 0U;
+        toolRouterExecuted = true;
         result.payload["router_fallback"] = true;
       } else {
-        toolOutput = "ERROR: tool '" + action.toolName + "' is not registered.";
+        toolOutput = "ERROR: tool '" + normalizedTool + "' is not registered.";
       }
-
+      result.payload["tool_router_executed"] = toolRouterExecuted;
+      result.payload["tool_router_transport"] = routerTransport;
+      if (toolRouterExecuted) {
+        std::cerr << "[TOOL_ROUTER_EXECUTED] tool=" << normalizedTool
+                  << " transport=" << routerTransport
+                  << " ok=" << (toolSucceeded ? "true" : "false") << "\n";
+      }
       result.payload["output"] = toolOutput;
+      if (std::optional<nlohmann::ordered_json> parsedOutput =
+              parseToolOutputJson(toolOutput);
+          parsedOutput.has_value()) {
+        result.payload["output_json"] = *parsedOutput;
+        if (parsedOutput->is_object()) {
+          result.payload["tool_execution"] = *parsedOutput;
+          result.payload["tool_execution"]["tool"] = normalizedTool;
+          if (parsedOutput->contains("ok") && (*parsedOutput)["ok"].is_boolean()) {
+            toolSucceeded = (*parsedOutput)["ok"].get<bool>();
+          }
+          if (parsedOutput->contains("applied") &&
+              (*parsedOutput)["applied"].is_boolean()) {
+            result.applied = (*parsedOutput)["applied"].get<bool>();
+          }
+          if (parsedOutput->contains("file_verified") &&
+              (*parsedOutput)["file_verified"].is_boolean()) {
+            result.payload["file_verified"] =
+                (*parsedOutput)["file_verified"].get<bool>();
+          }
+          if (parsedOutput->contains("error") &&
+              (*parsedOutput)["error"].is_string()) {
+            result.payload["error"] = (*parsedOutput)["error"].get<std::string>();
+            if (!toolSucceeded) {
+              result.message = (*parsedOutput)["error"].get<std::string>();
+            }
+          }
+        }
+      }
+      if (!result.applied && normalizedTool == "apply_patch") {
+        result.applied = toolSucceeded;
+      }
+      result.payload["applied"] = result.applied;
+      result.payload["ok"] = toolSucceeded;
+      if (normalizedTool == "apply_patch" || result.applied ||
+          (result.payload.contains("file_verified") &&
+           result.payload.at("file_verified").is_boolean())) {
+        std::cerr << "[EXECUTION_KERNEL_APPLIED] tool=" << normalizedTool
+                  << " ok=" << (toolSucceeded ? "true" : "false")
+                  << " applied=" << (result.applied ? "true" : "false");
+        if (result.payload.contains("file_verified") &&
+            result.payload.at("file_verified").is_boolean()) {
+          std::cerr << " file_verified="
+                    << (result.payload.at("file_verified").get<bool>()
+                            ? "true"
+                            : "false");
+        }
+        std::cerr << "\n";
+      }
       result.normalizedPaths = collectNormalizedPaths(result.payload);
       result.ok = toolSucceeded;
       result.risk = result.ok ? decision.risk : maxRisk(decision.risk, RiskLevel::High);
-      result.message =
-          result.ok ? "Tool execution completed deterministically." : toolOutput;
+      if (result.message.empty()) {
+        result.message = result.ok ? "Tool execution completed deterministically."
+                                   : toolOutput;
+      }
       break;
-
     }
 
     case ActionType::IntentEvaluation: {
@@ -1482,6 +2027,7 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
           evaluator.evaluateIntent(*action.intentRequest, state);
       result.payload["intent"] = buildIntentJson(evaluation.normalizedIntent);
       result.payload["ordered_tasks"] = evaluation.orderedTasks;
+      result.payload["child_results"] = nlohmann::ordered_json::array();
 
       nlohmann::ordered_json plans = nlohmann::ordered_json::array();
       for (const intent::PlanScore& plan : evaluation.rankedPlans) {
@@ -1511,91 +2057,11 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
         break;
       }
 
-      nlohmann::ordered_json childResults = nlohmann::ordered_json::array();
-      const std::string contextTarget =
-          !evaluation.bestPlan.strategy.proposedActions.empty()
-              ? evaluation.bestPlan.strategy.proposedActions.front().target
-              : evaluation.normalizedIntent.goal.target;
-      if (!contextTarget.empty()) {
-        Action contextAction;
-        contextAction.type = ActionType::ContextExtraction;
-        contextAction.id = "context:" + evaluation.bestPlan.strategy.name;
-        contextAction.target = contextTarget;
-        contextAction.branch = state.snapshot.branch.toString();
-        contextAction.snapshotVersion = state.snapshot.version;
-        Result childResult = executeActionLocked(contextAction, state);
-        childResults.push_back({
-            {"impacted_nodes", childResult.impactedNodes},
-            {"message", childResult.message},
-            {"normalized_paths", childResult.normalizedPaths},
-            {"ok", childResult.ok},
-            {"payload", childResult.payload},
-            {"risk", toString(childResult.risk)},
-            {"text_output", childResult.text_output},
-            {"type", toString(contextAction.type)},
-        });
-        result.impactedNodes.insert(result.impactedNodes.end(),
-                                    childResult.impactedNodes.begin(),
-                                    childResult.impactedNodes.end());
-        result.normalizedPaths.insert(result.normalizedPaths.end(),
-                                      childResult.normalizedPaths.begin(),
-                                      childResult.normalizedPaths.end());
-        if (!childResult.text_output.empty()) {
-          result.text_output = childResult.text_output;
-        }
-      }
-
-      bool intentLoopFailed = false;
-      std::string intentLoopFailReason;
-      for (const intent::Action& strategyAction :
-           evaluation.bestPlan.strategy.proposedActions) {
-        Action childAction = strategyActionToKernelAction(strategyAction, state);
-        Result childResult = executeActionLocked(childAction, state);
-        childResults.push_back({
-            {"impacted_nodes", childResult.impactedNodes},
-            {"message", childResult.message},
-            {"normalized_paths", childResult.normalizedPaths},
-            {"ok", childResult.ok},
-            {"payload", childResult.payload},
-            {"risk", toString(childResult.risk)},
-            {"target", childAction.target},
-            {"text_output", childResult.text_output},
-            {"type", toString(childAction.type)},
-        });
-        result.impactedNodes.insert(result.impactedNodes.end(),
-                                    childResult.impactedNodes.begin(),
-                                    childResult.impactedNodes.end());
-        result.normalizedPaths.insert(result.normalizedPaths.end(),
-                                      childResult.normalizedPaths.begin(),
-                                      childResult.normalizedPaths.end());
-        if (!childResult.text_output.empty()) {
-          result.text_output = childResult.text_output;
-        }
-
-        // If a generative action failed, stop — do NOT fall through to next
-        // (analysis/SimulateChange) action in the list.
-        if (!childResult.ok && childAction.type == ActionType::ModelGenerate) {
-          intentLoopFailed = true;
-          intentLoopFailReason = childResult.message;
-          break;
-        }
-      }
-
-      result.payload["child_results"] = std::move(childResults);
-      if (!result.text_output.empty()) {
-        result.payload["text_output"] = result.text_output;
-      }
-
-      if (intentLoopFailed) {
-        result.risk = RiskLevel::Medium;
-        result.ok = false;
-        result.message = intentLoopFailReason;
-        break;
-      }
-
+      result.payload["execution_deferred_to_task_graph"] = true;
       result.risk = toRiskLevel(evaluation.bestPlan.riskClassification);
       result.ok = true;
-      result.message = "Intent plan executed deterministically.";
+      result.message =
+          "Intent plan evaluated deterministically; execution deferred to TaskGraph.";
       break;
     }
   }
@@ -1608,47 +2074,26 @@ Result ExecutionKernel::execute(const Action& action,
                                 const CognitiveState& state) {
   Result result;
   result.type = action.type;
-  const std::string actionId = stableActionId(action);
 
   try {
-    stateManager_.cognitiveMemory().recordIntentStart(
-        actionId, state.snapshot, action.riskScore, action.confidenceScore,
-        "execution_requested:" + toString(action.type));
-  } catch (...) {
-  }
-
-  const auto recordOutcome =
-      [stateManager = &stateManager_,
-       snapshot = state.snapshot,
-       actionId,
-       riskScore = action.riskScore,
-       confidenceScore = action.confidenceScore,
-       actionType = toString(action.type)](const Result& completedResult) {
-        try {
-          stateManager->cognitiveMemory().recordIntentExecution(
-              actionId, snapshot, completedResult.ok, completedResult.rolledBack,
-              completedResult.message);
-          stateManager->cognitiveMemory().recordRiskEvaluation(
-              "execution:" + actionId, snapshot, riskScore,
-              completedResult.ok ? 0.20 : 0.90, confidenceScore,
-              completedResult.message.empty() ? actionType
-                                              : completedResult.message);
-          if (completedResult.rolledBack) {
-            stateManager->cognitiveMemory().recordMergeOutcome(
-                "rollback:" + actionId, snapshot, false,
-                completedResult.message);
-          }
-        } catch (...) {
-        }
-      };
-
-  try {
+    if (action.id.empty()) {
+      throw ::ultra::runtime::contracts::ContractViolationException({
+          ::ultra::runtime::contracts::LayerId::L15_EXECUTION_KERNEL,
+          ::ultra::runtime::contracts::ViolationType::ExecutionBypass,
+          "ExecutionKernel::execute",
+          "execution action is missing a task-graph task id",
+          ::ultra::runtime::contracts::ContractValidator::currentPhase(),
+      });
+    }
+    ::ultra::runtime::contracts::ContractValidator::assertTaskGraphExecution(
+        action.id, "ExecutionKernel::execute");
     validateAction(action, state);
     CognitiveRuntime runtime(stateManager_);
     if (action.type == ActionType::ToolExecution &&
-        runtime.toolRegistry().get_tool(action.toolName) == nullptr) {
+        runtime.toolRegistry().get_tool(action.toolName) == nullptr &&
+        !isNativeToolRouterTool(action.toolName)) {
       throw std::runtime_error(
-          "Tool execution requested an unregistered Layer 16 tool.");
+          "Tool execution requested a tool that is unavailable in Layer 16 and Layer 17.");
     }
     SnapshotPinGuard pinGuard = runtime.pin(state);
 
@@ -1670,28 +2115,11 @@ Result ExecutionKernel::execute(const Action& action,
   }
 
   sortOutputs(result);
-  // Cache the completed result before any background bookkeeping starts so the
-  // cognitive runtime can return model output immediately.
-  if (result.ok) {
-    lastResult_ = result;
-    hasLastResult_ = true;
-  }
+  lastResult_ = result;
+  hasLastResult_ = true;
   if (!result.text_output.empty()) {
     std::cerr << "[ULTRA-DEBUG] Execution result text_output bytes="
               << result.text_output.size() << "\n";
-  }
-
-  const bool offloadOutcomeRecording =
-      result.ok &&
-      (action.type == ActionType::IntentEvaluation ||
-       action.type == ActionType::ModelGenerate);
-  if (offloadOutcomeRecording) {
-    const Result resultForRecording = result;
-    std::thread([recordOutcome, resultForRecording]() {
-      recordOutcome(resultForRecording);
-    }).detach();
-  } else {
-    recordOutcome(result);
   }
   return result;
 }
@@ -1738,12 +2166,13 @@ void ExecutionKernel::updateToolFailureHistory(
     return;
   }
 
+  const std::string toolName = normalizeToolName(action.toolName);
   if (result.ok) {
-    toolFailureCounts_[action.toolName] = 0U;
+    toolFailureCounts_[toolName] = 0U;
     return;
   }
 
-  ++toolFailureCounts_[action.toolName];
+  ++toolFailureCounts_[toolName];
 }
 
 bool ExecutionKernel::hasToolCognitionLayer() const noexcept {
@@ -1753,6 +2182,7 @@ bool ExecutionKernel::hasToolCognitionLayer() const noexcept {
       "impact_analysis",
       "get_context",
       "get_status",
+      "apply_patch",
   };
 
   for (const char* tool : kRequiredTools) {
@@ -1768,5 +2198,3 @@ bool ExecutionKernel::hasToolRouterLayer() const noexcept {
 }
 
 }  // namespace ultra::runtime
-
-

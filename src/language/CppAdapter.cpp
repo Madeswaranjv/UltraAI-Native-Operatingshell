@@ -6,8 +6,11 @@
   #include "../graph/DependencyGraph.h"
   #include "../hashing/HashManager.h"
   #include "../incremental/IncrementalAnalyzer.h"
-  #include "../patch/PatchManager.h"
+  #include "../platform/IProcessExecutor.h"
   #include "../platform/WindowsProcessExecutor.h"
+#if !defined(_WIN32)
+  #include "../platform/UnixProcessExecutor.h"
+#endif
   #include "context/ContextSnapshot.h"
   #include "../scanner/ProjectScanner.h"
   #include "../utils/PathUtils.h"
@@ -15,15 +18,25 @@
   // NEW AST INCLUDES
   #include "../ai/FileRegistry.h"
   #include <algorithm>
+  #include <chrono>
   #include <cstdio>
   #include <fstream>
   #include <iomanip>
   #include <iostream>
   #include <optional>
-  #include <unordered_map>
   #include <string>
+  #include <system_error>
+  #include <unordered_map>
   namespace ultra::language {
   namespace {
+  struct PatchTargetSnapshot {
+    std::filesystem::path relativePath;
+    std::filesystem::path absolutePath;
+    bool existedBefore{false};
+    bool existedAfter{false};
+    std::string beforeContent;
+    std::string afterContent;
+  };
   std::optional<std::string> resolveInclude(
       const std::string& includeName,
       const std::filesystem::path& fromPath,
@@ -37,6 +50,176 @@
       if (candidate == sameDir) return candidate;
     }
     return it->second.front();
+  }
+  std::string quoteForShell(const std::string& raw) {
+    std::string escaped;
+    escaped.reserve(raw.size() + 2U);
+    escaped.push_back('"');
+    for (const char ch : raw) {
+      if (ch == '"') {
+        escaped += "\\\"";
+        continue;
+      }
+      escaped.push_back(ch);
+    }
+    escaped.push_back('"');
+    return escaped;
+  }
+  std::string buildCommandInWorkingDirectory(
+      const std::filesystem::path& cwd,
+      const std::string& command) {
+#if defined(_WIN32)
+    return "cd /d " + quoteForShell(cwd.string()) + " && " + command;
+#else
+    return "cd " + quoteForShell(cwd.string()) + " && " + command;
+#endif
+  }
+  std::string combineProcessOutput(
+      const ultra::platform::ProcessResult& result) {
+    std::string combined = result.stdOut;
+    if (!result.stdErr.empty()) {
+      if (!combined.empty() && combined.back() != '\n') {
+        combined.push_back('\n');
+      }
+      combined += result.stdErr;
+    }
+    return combined;
+  }
+  std::string readTextFile(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input.is_open()) {
+      return {};
+    }
+
+    std::string content((std::istreambuf_iterator<char>(input)),
+                        std::istreambuf_iterator<char>());
+    return content;
+  }
+  std::optional<std::filesystem::path> normalizeDiffPathToken(
+      const std::string& token) {
+    if (token.empty() || token == "/dev/null") {
+      return std::nullopt;
+    }
+
+    std::filesystem::path path(token);
+    const std::string generic = path.generic_string();
+    if (generic.size() > 2U &&
+        (generic.rfind("a/", 0U) == 0U || generic.rfind("b/", 0U) == 0U)) {
+      return std::filesystem::path(generic.substr(2U)).lexically_normal();
+    }
+    return path.lexically_normal();
+  }
+  std::vector<std::filesystem::path> parsePatchTargets(
+      const std::filesystem::path& diffFile) {
+    std::vector<std::filesystem::path> targets;
+    std::ifstream input(diffFile);
+    if (!input.is_open()) {
+      return targets;
+    }
+
+    std::optional<std::filesystem::path> beforePath;
+    std::string line;
+    while (std::getline(input, line)) {
+      if (line.rfind("--- ", 0U) == 0U) {
+        beforePath = normalizeDiffPathToken(line.substr(4U));
+        continue;
+      }
+      if (line.rfind("+++ ", 0U) != 0U) {
+        continue;
+      }
+
+      const std::optional<std::filesystem::path> afterPath =
+          normalizeDiffPathToken(line.substr(4U));
+      const std::optional<std::filesystem::path> chosenPath =
+          afterPath.has_value() ? afterPath : beforePath;
+      beforePath.reset();
+      if (!chosenPath.has_value()) {
+        continue;
+      }
+
+      const std::filesystem::path normalized = chosenPath->lexically_normal();
+      const auto duplicate = std::find(targets.begin(), targets.end(), normalized);
+      if (duplicate == targets.end()) {
+        targets.push_back(normalized);
+      }
+    }
+
+    return targets;
+  }
+  std::vector<PatchTargetSnapshot> snapshotPatchTargets(
+      const std::filesystem::path& root,
+      const std::vector<std::filesystem::path>& relativePaths) {
+    std::vector<PatchTargetSnapshot> snapshots;
+    snapshots.reserve(relativePaths.size());
+    for (const std::filesystem::path& relativePath : relativePaths) {
+      PatchTargetSnapshot snapshot;
+      snapshot.relativePath = relativePath.lexically_normal();
+      snapshot.absolutePath = (root / snapshot.relativePath).lexically_normal();
+
+      std::error_code ec;
+      snapshot.existedBefore = std::filesystem::exists(snapshot.absolutePath, ec) &&
+                               !ec;
+      if (snapshot.existedBefore &&
+          std::filesystem::is_regular_file(snapshot.absolutePath, ec) && !ec) {
+        snapshot.beforeContent = readTextFile(snapshot.absolutePath);
+      }
+      snapshots.push_back(std::move(snapshot));
+    }
+    return snapshots;
+  }
+  std::vector<std::string> refreshPatchVerification(
+      std::vector<PatchTargetSnapshot>& snapshots) {
+    std::vector<std::string> changedPaths;
+    for (PatchTargetSnapshot& snapshot : snapshots) {
+      std::error_code ec;
+      snapshot.existedAfter = std::filesystem::exists(snapshot.absolutePath, ec) && !ec;
+      snapshot.afterContent.clear();
+      if (snapshot.existedAfter &&
+          std::filesystem::is_regular_file(snapshot.absolutePath, ec) && !ec) {
+        snapshot.afterContent = readTextFile(snapshot.absolutePath);
+      }
+
+      if (snapshot.existedBefore != snapshot.existedAfter ||
+          snapshot.beforeContent != snapshot.afterContent) {
+        changedPaths.push_back(snapshot.relativePath.generic_string());
+      }
+    }
+    return changedPaths;
+  }
+  bool containsSkippedPatchMarker(const std::string& output) {
+    return output.find("Skipped patch") != std::string::npos;
+  }
+  ultra::platform::ProcessResult executeCapturedCommand(
+      ultra::platform::IProcessExecutor& executor,
+      const std::string& command) {
+    std::error_code ec;
+    const std::filesystem::path tempDir = std::filesystem::temp_directory_path(ec);
+    const auto suffix =
+        std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::filesystem::path stdoutPath =
+        ec ? std::filesystem::path("ultra_patch_stdout.log")
+           : tempDir / ("ultra_patch_stdout_" + std::to_string(suffix) + ".log");
+    const std::filesystem::path stderrPath =
+        ec ? std::filesystem::path("ultra_patch_stderr.log")
+           : tempDir / ("ultra_patch_stderr_" + std::to_string(suffix) + ".log");
+
+    const std::string redirected =
+        command + " > " + quoteForShell(stdoutPath.string()) + " 2> " +
+        quoteForShell(stderrPath.string());
+
+#if defined(_WIN32)
+    ultra::platform::ProcessResult result = executor.execute(redirected);
+#else
+    ultra::platform::ProcessResult result = executor.execute(redirected);
+#endif
+    result.stdOut = readTextFile(stdoutPath);
+    result.stdErr = readTextFile(stderrPath);
+
+    std::error_code removeError;
+    std::filesystem::remove(stdoutPath, removeError);
+    removeError.clear();
+    std::filesystem::remove(stderrPath, removeError);
+    return result;
   }
   void printAnalyzeSummary(std::size_t totalScanned,
                           const std::vector<std::string>& changed,
@@ -204,8 +387,173 @@
   bool CppAdapter::applyPatch(
       const std::filesystem::path& root,
       const std::filesystem::path& diffFile) {
-      (void)root;      // prevent unused parameter warning
-      (void)diffFile;  // prevent unused parameter warning
+    lastPatchOutcome_ = {
+        {"ok", false},
+        {"applied", false},
+        {"file_verified", false},
+        {"build_required", false},
+        {"build_executed", false},
+        {"build_exit_code", 0},
+        {"rolled_back", false},
+        {"error", ""},
+        {"git_output", ""},
+    };
+    if (!std::filesystem::exists(diffFile) ||
+        !std::filesystem::is_regular_file(diffFile)) {
+      ultra::core::Logger::error(
+          ultra::core::LogCategory::Patch,
+          "Diff file not found: " + diffFile.string());
+      lastBuildExitCode_ = 1;
+      lastPatchOutcome_["build_exit_code"] = lastBuildExitCode_;
+      lastPatchOutcome_["error"] = "Diff file not found: " + diffFile.string();
       return false;
-  }
-  }//namespace ultra::language
+    }
+
+    const std::vector<std::filesystem::path> patchTargets =
+        parsePatchTargets(diffFile);
+    if (patchTargets.empty()) {
+      ultra::core::Logger::error(
+          ultra::core::LogCategory::Patch,
+          "Patch verification could not resolve any target files.");
+      lastBuildExitCode_ = 1;
+      lastPatchOutcome_["build_exit_code"] = lastBuildExitCode_;
+      lastPatchOutcome_["error"] = "patch_targets_unresolved";
+      return false;
+    }
+
+    std::vector<PatchTargetSnapshot> patchSnapshots =
+        snapshotPatchTargets(root, patchTargets);
+
+    ultra::platform::WindowsProcessExecutor executor;
+    ultra::build::BuildEngine engine(
+        std::make_unique<ultra::platform::WindowsProcessExecutor>());
+
+    const std::string applyCommand =
+        buildCommandInWorkingDirectory(
+            root,
+            "git apply --verbose --whitespace=nowarn " +
+                quoteForShell(diffFile.string()));
+    const ultra::platform::ProcessResult applyResult =
+        executeCapturedCommand(executor, applyCommand);
+    const std::string gitOutput = combineProcessOutput(applyResult);
+    lastPatchOutcome_["git_output"] = gitOutput;
+    if (!applyResult.success()) {
+      lastBuildExitCode_ = applyResult.exitCode == 0 ? 1 : applyResult.exitCode;
+      const std::string errorMessage =
+          gitOutput.empty() ? "apply_patch failed during git apply." : gitOutput;
+      ultra::core::Logger::error(
+          ultra::core::LogCategory::Patch,
+          errorMessage);
+      lastPatchOutcome_["build_exit_code"] = lastBuildExitCode_;
+      lastPatchOutcome_["error"] = errorMessage;
+      return false;
+    }
+
+    if (containsSkippedPatchMarker(gitOutput)) {
+      lastBuildExitCode_ = 1;
+      lastPatchOutcome_["build_exit_code"] = lastBuildExitCode_;
+      lastPatchOutcome_["error"] = "patch_skipped_no_match";
+      ultra::core::Logger::error(
+          ultra::core::LogCategory::Patch,
+          gitOutput.empty() ? "Patch was skipped by git apply."
+                            : gitOutput);
+      return false;
+    }
+
+    const std::vector<std::string> changedPaths =
+        refreshPatchVerification(patchSnapshots);
+    const bool fileVerified = !changedPaths.empty();
+    lastPatchOutcome_["file_verified"] = fileVerified;
+    if (!fileVerified) {
+      lastBuildExitCode_ = 1;
+      lastPatchOutcome_["build_exit_code"] = lastBuildExitCode_;
+      lastPatchOutcome_["error"] = "file_not_modified";
+      ultra::core::Logger::error(
+          ultra::core::LogCategory::Patch,
+          "Patch apply completed without modifying any verified file targets.");
+      return false;
+    }
+
+    lastPatchOutcome_["applied"] = true;
+
+    const bool buildRequired =
+        ultra::build::BuildExecutor::projectHasBuildSystem(root);
+    lastPatchOutcome_["build_required"] = buildRequired;
+    if (!buildRequired) {
+      lastBuildExitCode_ = 0;
+      lastPatchOutcome_["ok"] = true;
+      return true;
+    }
+
+    const ultra::platform::ProcessResult sleepResult = executor.execute(
+        buildCommandInWorkingDirectory(root, "ultra sleep_ai"));
+    if (!sleepResult.success()) {
+      ultra::core::Logger::warning(
+          ultra::core::LogCategory::Patch,
+          "sleep_ai returned non-zero before build. Continuing with Release build.\n" +
+              combineProcessOutput(sleepResult));
+    }
+
+    lastBuildExitCode_ = engine.fullBuild(root);
+    lastPatchOutcome_["build_executed"] = engine.lastBuildExecuted();
+    lastPatchOutcome_["build_exit_code"] = lastBuildExitCode_;
+    if (lastBuildExitCode_ == 0) {
+      lastPatchOutcome_["ok"] = true;
+      return true;
+    }
+
+    if (!engine.lastBuildExecuted()) {
+      const std::string errorMessage =
+          "Release build could not be executed after patch apply; patch changes were kept.";
+      ultra::core::Logger::error(
+          ultra::core::LogCategory::Patch,
+          errorMessage);
+      lastPatchOutcome_["applied"] = true;
+      lastPatchOutcome_["file_verified"] = true;
+      lastPatchOutcome_["error"] = errorMessage;
+      return false;
+    }
+
+    const ultra::platform::ProcessResult rollbackResult = executor.execute(
+        buildCommandInWorkingDirectory(
+            root,
+            "git apply -R --whitespace=nowarn " + quoteForShell(diffFile.string())));
+    if (!rollbackResult.success()) {
+      const std::string errorMessage =
+          "Release build failed after patch apply, and rollback also failed.\n" +
+          combineProcessOutput(rollbackResult);
+      ultra::core::Logger::error(
+          ultra::core::LogCategory::Patch,
+          errorMessage);
+      const std::vector<std::string> postRollbackFailureChanges =
+          refreshPatchVerification(patchSnapshots);
+      const bool stillApplied = !postRollbackFailureChanges.empty();
+      lastPatchOutcome_["applied"] = stillApplied;
+      lastPatchOutcome_["file_verified"] = stillApplied;
+      lastPatchOutcome_["error"] = errorMessage;
+      return false;
+    }
+
+    const std::vector<std::string> postRollbackChanges =
+        refreshPatchVerification(patchSnapshots);
+    lastPatchOutcome_["applied"] = false;
+    lastPatchOutcome_["file_verified"] = !postRollbackChanges.empty();
+    if (!postRollbackChanges.empty()) {
+      lastPatchOutcome_["applied"] = true;
+      lastPatchOutcome_["error"] =
+          "rollback_incomplete_after_build_failure";
+      ultra::core::Logger::error(
+          ultra::core::LogCategory::Patch,
+          "Rollback reported success, but verified files still differ from the pre-patch snapshot.");
+      return false;
+    }
+    lastPatchOutcome_["file_verified"] = false;
+    lastPatchOutcome_["rolled_back"] = true;
+    lastPatchOutcome_["error"] =
+        "Release build failed after patch apply; patch changes were rolled back.";
+    ultra::core::Logger::error(
+        ultra::core::LogCategory::Patch,
+        "Release build failed after patch apply; patch changes were rolled back.");
+    return false;
+  }  }//namespace ultra::language
+

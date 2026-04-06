@@ -124,10 +124,10 @@ TEST(ModelAdapterRegistry, LoadsConfigAndTranslatesOpenAIResponse) {
   ASSERT_TRUE(registry.reloadConfiguration(error)) << error;
 
   const std::vector<std::string> providers = registry.listProviders();
-  ASSERT_EQ(providers.size(), 3U);
-  EXPECT_EQ(providers[0], "deepseek");
-  EXPECT_EQ(providers[1], "ollama");
-  EXPECT_EQ(providers[2], "openai");
+  const std::vector<std::string> expectedProviders = {
+      "anthropic", "deepseek", "gemini", "groq",
+      "mistral", "ollama", "openai"};
+  EXPECT_EQ(providers, expectedProviders);
 
   const nlohmann::ordered_json config = registry.providerConfiguration("openai");
   ASSERT_TRUE(config.is_object());
