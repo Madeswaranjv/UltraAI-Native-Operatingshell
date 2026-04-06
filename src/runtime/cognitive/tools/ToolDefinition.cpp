@@ -11,7 +11,7 @@ bool ToolDefinition::is_valid() const noexcept {
 
 std::vector<ToolDefinition> defaultToolDefinitions() {
   std::vector<ToolDefinition> tools;
-  tools.reserve(6U);
+  tools.reserve(13U);
 
   tools.push_back(ToolDefinition{
       "query_symbol",
@@ -24,6 +24,42 @@ std::vector<ToolDefinition> defaultToolDefinitions() {
       "Read source content via 'ultra ai_source <file>'.",
       {"file"},
       "Source file content for the requested indexed file."});
+
+  tools.push_back(ToolDefinition{
+      "read_file",
+      "Read a workspace file directly through ToolRouter.",
+      {"path"},
+      "Local file content and size metadata."});
+
+  tools.push_back(ToolDefinition{
+      "write_file",
+      "Write a workspace file through ToolRouter.",
+      {"path", "content"},
+      "Deterministic write result for the requested file."});
+
+  tools.push_back(ToolDefinition{
+      "append_file",
+      "Append content to a workspace file through ToolRouter.",
+      {"path", "content"},
+      "Deterministic append result for the requested file."});
+
+  tools.push_back(ToolDefinition{
+      "delete_file",
+      "Delete a workspace file through ToolRouter.",
+      {"path"},
+      "Deterministic delete result for the requested file."});
+
+  tools.push_back(ToolDefinition{
+      "list_dir",
+      "List workspace directory contents through ToolRouter.",
+      {},
+      "Directory entries with type and size metadata."});
+
+  tools.push_back(ToolDefinition{
+      "search_files",
+      "Search workspace files through ToolRouter.",
+      {"pattern"},
+      "Matching files, line numbers, and content snippets."});
 
   tools.push_back(ToolDefinition{
       "impact_analysis",
@@ -48,6 +84,12 @@ std::vector<ToolDefinition> defaultToolDefinitions() {
       "Apply a unified diff via 'ultra apply_patch <path> <diff>'.",
       {},
       "Patch application result with verification and build status."});
+
+  tools.push_back(ToolDefinition{
+      "run_command",
+      "Run a workspace command through ToolRouter.",
+      {"command"},
+      "Command stdout, stderr, and exit status."});
 
   return tools;
 }

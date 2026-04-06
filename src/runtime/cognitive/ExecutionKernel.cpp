@@ -2,7 +2,6 @@
 
 #include "CognitiveRuntime.h"
 #include "contract_enforcement.h"
-#include "tool_router/ToolRouter.h"
 
 #include "../ContextExtractor.h"
 #include "../governance/GovernanceEngine.h"
@@ -1043,6 +1042,193 @@ std::string summarizeToolCallNames(
   return stream.str();
 }
 
+constexpr std::size_t kApplyPatchMaxRetries = 2U;
+constexpr std::size_t kApplyPatchPreviewLimit = 768U;
+
+nlohmann::ordered_json stringMapToJson(
+    const std::map<std::string, std::string>& values) {
+  nlohmann::ordered_json payload = nlohmann::ordered_json::object();
+  for (const auto& [key, value] : values) {
+    payload[key] = value;
+  }
+  return payload;
+}
+
+std::string truncateForRetryPreview(std::string value,
+                                    const std::size_t limitBytes) {
+  if (value.size() <= limitBytes) {
+    return value;
+  }
+
+  constexpr std::string_view kNotice = "\n...[truncated for retry context]";
+  const std::size_t keep =
+      limitBytes > kNotice.size() ? limitBytes - kNotice.size() : 0U;
+  value.resize(keep);
+  value += kNotice;
+  return value;
+}
+
+std::string extractApplyPatchPreview(
+    const std::map<std::string, std::string>& toolArgs) {
+  const auto diffIt = toolArgs.find("diff");
+  if (diffIt != toolArgs.end() && !diffIt->second.empty()) {
+    return truncateForRetryPreview(diffIt->second, kApplyPatchPreviewLimit);
+  }
+
+  const auto changesIt = toolArgs.find("changes");
+  if (changesIt != toolArgs.end() && !changesIt->second.empty()) {
+    return truncateForRetryPreview(changesIt->second, kApplyPatchPreviewLimit);
+  }
+
+  return {};
+}
+
+bool allToolCallsUseApplyPatch(
+    const std::vector<ai::model::ToolCall>& toolCalls) {
+  return !toolCalls.empty() &&
+         std::all_of(toolCalls.begin(),
+                     toolCalls.end(),
+                     [](const ai::model::ToolCall& toolCall) {
+                       return normalizeToolName(toolCall.name) == "apply_patch";
+                     });
+}
+
+bool applyPatchFailureDetected(const Result& result) {
+  bool applied = result.applied;
+  if (result.payload.contains("applied") &&
+      result.payload.at("applied").is_boolean()) {
+    applied = result.payload.at("applied").get<bool>();
+  }
+
+  bool fileVerified = false;
+  if (result.payload.contains("file_verified") &&
+      result.payload.at("file_verified").is_boolean()) {
+    fileVerified = result.payload.at("file_verified").get<bool>();
+  }
+
+  const bool hasError =
+      result.payload.contains("error") && result.payload.at("error").is_string() &&
+      !trimAscii(result.payload.at("error").get<std::string>()).empty();
+
+  return !result.ok || !applied || !fileVerified || hasError;
+}
+
+std::string describeApplyPatchFailure(const Result& result) {
+  std::vector<std::string> reasons;
+
+  if (result.payload.contains("error") && result.payload.at("error").is_string()) {
+    const std::string error = trimAscii(result.payload.at("error").get<std::string>());
+    if (!error.empty()) {
+      reasons.push_back(error);
+    }
+  }
+
+  bool applied = result.applied;
+  if (result.payload.contains("applied") &&
+      result.payload.at("applied").is_boolean()) {
+    applied = result.payload.at("applied").get<bool>();
+  }
+  if (!applied) {
+    reasons.push_back("applied=false");
+  }
+
+  bool fileVerified = false;
+  if (result.payload.contains("file_verified") &&
+      result.payload.at("file_verified").is_boolean()) {
+    fileVerified = result.payload.at("file_verified").get<bool>();
+  }
+  if (!fileVerified) {
+    reasons.push_back("file_verified=false");
+  }
+
+  if (!result.message.empty()) {
+    reasons.push_back(result.message);
+  }
+
+  if (reasons.empty()) {
+    reasons.push_back("apply_patch returned an unsuccessful result");
+  }
+
+  sortAndDedupe(reasons);
+  return joinReasons(reasons);
+}
+
+nlohmann::ordered_json buildApplyPatchRetryRecord(
+    const std::size_t retryAttempt,
+    const std::string& failureReason,
+    const std::map<std::string, std::string>& toolArgs,
+    const Result& result) {
+  nlohmann::ordered_json payload = nlohmann::ordered_json::object();
+  payload["retry_attempt"] = retryAttempt;
+  payload["tool"] = "apply_patch";
+  payload["failure_reason"] = failureReason;
+  payload["previous_args"] = stringMapToJson(toolArgs);
+  payload["previous_result"] = {
+      {"message", result.message},
+      {"ok", result.ok},
+      {"applied", result.applied},
+  };
+
+  if (result.payload.contains("file_verified") &&
+      result.payload.at("file_verified").is_boolean()) {
+    payload["previous_result"]["file_verified"] =
+        result.payload.at("file_verified").get<bool>();
+  }
+  if (result.payload.contains("error") && result.payload.at("error").is_string()) {
+    payload["previous_result"]["error"] =
+        result.payload.at("error").get<std::string>();
+  }
+
+  const std::string preview = extractApplyPatchPreview(toolArgs);
+  if (!preview.empty()) {
+    payload["previous_patch_preview"] = preview;
+  }
+
+  return payload;
+}
+
+ai::model::ModelRequest buildApplyPatchRetryRequest(
+    const ai::model::ModelRequest& request,
+    const std::size_t retryAttempt,
+    const std::string& failureReason,
+    const std::map<std::string, std::string>& toolArgs,
+    const Result& result) {
+  ai::model::ModelRequest next = request;
+
+  std::ostringstream prompt;
+  prompt << request.prompt;
+  prompt << "\n\nPrevious apply_patch attempt " << retryAttempt
+         << " failed.\n";
+  prompt << "Failure reason: " << failureReason << "\n";
+  prompt << "Generate a corrected unified diff for apply_patch. "
+            "Do not repeat the previous diff unchanged. "
+            "Return only the corrected tool call.\n";
+
+  const std::string preview = extractApplyPatchPreview(toolArgs);
+  if (!preview.empty()) {
+    prompt << "Previous diff preview:\n" << preview << "\n";
+  }
+  next.prompt = prompt.str();
+
+  if (next.systemPrompt.find(
+          "Do not repeat the previous diff unchanged.") == std::string::npos) {
+    if (!next.systemPrompt.empty() && next.systemPrompt.back() != ' ') {
+      next.systemPrompt.push_back(' ');
+    }
+    next.systemPrompt +=
+        "When apply_patch fails, correct the diff using the failure context "
+        "and do not repeat the previous diff unchanged.";
+  }
+
+  if (!next.contextPayload.is_object()) {
+    next.contextPayload = nlohmann::ordered_json::object();
+  }
+  next.contextPayload["apply_patch_retry"] =
+      buildApplyPatchRetryRecord(retryAttempt, failureReason, toolArgs, result);
+  next.contextPayload["tool_required"] = "apply_patch";
+  return next;
+}
+
 const std::map<std::string, std::vector<std::string>>& fallbackToolRequiredParams() {
   static const std::map<std::string, std::vector<std::string>> kToolInputs = {
       {"read_file", {"path"}},
@@ -1071,10 +1257,6 @@ const std::map<std::string, std::vector<std::string>>& fallbackToolAllowedParams
   return kToolInputs;
 }
 
-bool isNativeToolRouterTool(const std::string& toolName) {
-  return fallbackToolAllowedParams().find(normalizeToolName(toolName)) !=
-         fallbackToolAllowedParams().end();
-}
 bool requiresModelGeneration(const intent::ActionKind kind) {
   switch (kind) {
     case intent::ActionKind::ModifySymbolBody:
@@ -1269,19 +1451,18 @@ GovernanceDecision ExecutionKernel::evaluate_action(
   std::vector<std::string> allowedArgs;
   if (definition != nullptr) {
     requiredArgs = definition->input_params;
-    allowedArgs = definition->input_params;
     if (const auto fallbackAllowed =
             fallbackToolAllowedParams().find(normalizedTool);
         fallbackAllowed != fallbackToolAllowedParams().end()) {
-      if (allowedArgs.empty()) {
-        allowedArgs = fallbackAllowed->second;
-      }
-      if (requiredArgs.empty()) {
-        if (const auto fallbackRequired =
-                fallbackToolRequiredParams().find(normalizedTool);
-            fallbackRequired != fallbackToolRequiredParams().end()) {
-          requiredArgs = fallbackRequired->second;
-        }
+      allowedArgs = fallbackAllowed->second;
+    } else {
+      allowedArgs = definition->input_params;
+    }
+    if (requiredArgs.empty()) {
+      if (const auto fallbackRequired =
+              fallbackToolRequiredParams().find(normalizedTool);
+          fallbackRequired != fallbackToolRequiredParams().end()) {
+        requiredArgs = fallbackRequired->second;
       }
     }
   } else {
@@ -1715,6 +1896,11 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
       lastModelTextOutput_.clear();
       lastSelectedProvider_.clear();
       lastProviderEndpoint_.clear();
+      ai::model::ModelRequest currentRequest = *action.modelRequest;
+      nlohmann::ordered_json applyPatchRetryHistory =
+          nlohmann::ordered_json::array();
+      std::size_t applyPatchRetryCount = 0U;
+      bool applyPatchRetryExhausted = false;
       if (modelOrchestrator_ == nullptr) {
         ai::model::ModelResponse response;
         response.ok = false;
@@ -1722,7 +1908,7 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
         response.errorMessage = "Model orchestrator is unavailable.";
         result.payload = buildModelExecutionJson(orchestrationContext,
                                                  action.modelProvider,
-                                                 *action.modelRequest, response);
+                                                 currentRequest, response);
         result.normalizedPaths = collectNormalizedPaths(result.payload);
         result.risk = RiskLevel::Medium;
         result.ok = false;
@@ -1730,186 +1916,260 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
         break;
       }
 
-      const ai::model::ModelResponse response =
-          modelOrchestrator_->generate(*action.modelRequest, orchestrationContext);
-      std::string selectedProvider = action.modelProvider;
-      std::vector<std::string> attemptedProviders;
-      if (const auto* orchestrator =
-              dynamic_cast<const ai::orchestration::MultiModelOrchestrator*>(
-                  modelOrchestrator_.get());
-          orchestrator != nullptr) {
-        const ai::orchestration::OrchestrationDecision& decision =
-            orchestrator->lastDecision();
-        if (!decision.selectedProvider.empty()) {
-          selectedProvider = decision.selectedProvider;
-        }
-        attemptedProviders = decision.attemptedProviders;
-      }
-      const std::string providerEndpoint =
-          providerEndpointForProject(stateManager_.projectRoot(), selectedProvider);
-      lastSelectedProvider_ = selectedProvider;
-      lastProviderEndpoint_ = providerEndpoint;
-      lastModelTextOutput_ = response.textOutput;
-      result.text_output = lastModelTextOutput_;
-
-      std::cerr << "[ULTRA-DEBUG] ModelGenerate response."
-                << " ok=" << (response.ok ? "true" : "false")
-                << " error=" << response.errorMessage
-                << " output_len=" << response.textOutput.size()
-                << "\n";
-      if (!selectedProvider.empty()) {
-        std::cerr << "[ULTRA-RUNTIME] provider_used=" << selectedProvider;
-        if (!providerEndpoint.empty()) {
-          std::cerr << " endpoint=" << providerEndpoint;
-        }
-        std::cerr << "\n";
-      }
-
-      result.payload = buildModelExecutionJson(orchestrationContext,
-                                               action.modelProvider,
-                                               *action.modelRequest, response);
-      if (!selectedProvider.empty()) {
-        result.payload["selected_provider"] = selectedProvider;
-      }
-      if (!attemptedProviders.empty()) {
-        result.payload["attempted_providers"] = attemptedProviders;
-      }
-      if (!providerEndpoint.empty()) {
-        result.payload["provider_endpoint"] = providerEndpoint;
-      }
-      if (!result.text_output.empty()) {
-        result.payload["text_output"] = result.text_output;
-      }
-      result.normalizedPaths = collectNormalizedPaths(result.payload);
-      result.risk = response.ok ? RiskLevel::Low : RiskLevel::Medium;
-      result.ok = response.ok;
-      if (!response.ok) {
-        result.message = response.errorMessage.empty()
-                             ? "Model generation failed."
-                             : response.errorMessage;
-        break;
-      }
-
-      const bool providerSuppliedToolCalls = !response.toolCalls.empty();
-      std::vector<ai::model::ToolCall> toolCalls = response.toolCalls;
-      if (toolCalls.empty()) {
-        toolCalls = extractToolCallsFromText(response.textOutput);
-        if (!toolCalls.empty()) {
-          result.payload["tool_calls_inferred"] = true;
-        }
-      }
-      if (toolCalls.empty()) {
+      for (;;) {
+        result.payload = nlohmann::ordered_json::object();
+        result.impactedNodes.clear();
+        result.normalizedPaths.clear();
+        result.applied = false;
+        result.text_output.clear();
+        result.message.clear();
         result.ok = false;
-        result.risk = RiskLevel::High;
-        result.message = "Model generation returned no executable tool calls.";
-        break;
-      }
-      nlohmann::ordered_json detectedToolCalls = nlohmann::ordered_json::array();
-      for (const ai::model::ToolCall& toolCall : toolCalls) {
-        detectedToolCalls.push_back(
-            {{"tool", normalizeToolName(toolCall.name)},
-             {"arguments", toolCall.arguments}});
-      }
-      result.payload["tool_call_detected"] = true;
-      result.payload["tool_call_count"] = toolCalls.size();
-      result.payload["tool_call_source"] =
-          providerSuppliedToolCalls ? "provider" : "text";
-      result.payload["tool_calls_detected"] = std::move(detectedToolCalls);
-      if (!response.textOutput.empty()) {
-        result.payload["model_text_output"] = response.textOutput;
-      }
-      result.payload.erase("text_output");
-      result.text_output.clear();
-      lastModelTextOutput_.clear();
-      std::cerr << "[TOOL_CALL_DETECTED] count=" << toolCalls.size()
-                << " source="
-                << (providerSuppliedToolCalls ? "provider" : "text")
-                << " tools=" << summarizeToolCallNames(toolCalls) << "\n";
-      nlohmann::ordered_json toolResults = nlohmann::ordered_json::array();
-      bool toolFailure = false;
-      std::string toolFailureMessage;
-      for (std::size_t index = 0U; index < toolCalls.size(); ++index) {
-        const ai::model::ToolCall& toolCall = toolCalls[index];
-        Action toolAction;
-        toolAction.type = ActionType::ToolExecution;
-        toolAction.id = action.id + ":tool:" + std::to_string(index + 1U);
-        toolAction.target = action.target;
-        toolAction.branch = action.branch;
-        toolAction.snapshotVersion = action.snapshotVersion;
-        toolAction.toolName = normalizeToolName(toolCall.name);
-        toolAction.toolArgs = orderedJsonToStringMap(toolCall.arguments);
-        if (toolAction.toolName == "apply_patch" &&
-            toolAction.toolArgs.find("project_path") == toolAction.toolArgs.end()) {
-          toolAction.toolArgs["project_path"] = stateManager_.projectRoot().string();
+        result.risk = RiskLevel::Low;
+
+        const ai::model::ModelResponse response =
+            modelOrchestrator_->generate(currentRequest, orchestrationContext);
+        std::string selectedProvider = action.modelProvider;
+        std::vector<std::string> attemptedProviders;
+        if (const auto* orchestrator =
+                dynamic_cast<const ai::orchestration::MultiModelOrchestrator*>(
+                    modelOrchestrator_.get());
+            orchestrator != nullptr) {
+          const ai::orchestration::OrchestrationDecision& decision =
+              orchestrator->lastDecision();
+          if (!decision.selectedProvider.empty()) {
+            selectedProvider = decision.selectedProvider;
+          }
+          attemptedProviders = decision.attemptedProviders;
         }
-        if (toolAction.toolName.empty()) {
-          toolFailure = true;
-          toolFailureMessage = "Model generated a tool call without a tool name.";
+        const std::string providerEndpoint =
+            providerEndpointForProject(stateManager_.projectRoot(),
+                                       selectedProvider);
+        lastSelectedProvider_ = selectedProvider;
+        lastProviderEndpoint_ = providerEndpoint;
+        lastModelTextOutput_ = response.textOutput;
+        result.text_output = lastModelTextOutput_;
+
+        std::cerr << "[ULTRA-DEBUG] ModelGenerate response."
+                  << " ok=" << (response.ok ? "true" : "false")
+                  << " error=" << response.errorMessage
+                  << " output_len=" << response.textOutput.size()
+                  << "\n";
+        if (!selectedProvider.empty()) {
+          std::cerr << "[ULTRA-RUNTIME] provider_used=" << selectedProvider;
+          if (!providerEndpoint.empty()) {
+            std::cerr << " endpoint=" << providerEndpoint;
+          }
+          std::cerr << "\n";
+        }
+
+        result.payload = buildModelExecutionJson(orchestrationContext,
+                                                 action.modelProvider,
+                                                 currentRequest, response);
+        if (!selectedProvider.empty()) {
+          result.payload["selected_provider"] = selectedProvider;
+        }
+        if (!attemptedProviders.empty()) {
+          result.payload["attempted_providers"] = attemptedProviders;
+        }
+        if (!providerEndpoint.empty()) {
+          result.payload["provider_endpoint"] = providerEndpoint;
+        }
+        if (!result.text_output.empty()) {
+          result.payload["text_output"] = result.text_output;
+        }
+        result.normalizedPaths = collectNormalizedPaths(result.payload);
+        result.risk = response.ok ? RiskLevel::Low : RiskLevel::Medium;
+        result.ok = response.ok;
+        if (!response.ok) {
+          result.message = response.errorMessage.empty()
+                               ? "Model generation failed."
+                               : response.errorMessage;
           break;
         }
-        Result childResult = executeActionLocked(toolAction, state);
-        updateToolFailureHistory(toolAction, childResult);
-        toolResults.push_back({
-            {"args", toolAction.toolArgs},
-            {"impacted_nodes", childResult.impactedNodes},
-            {"message", childResult.message},
-            {"normalized_paths", childResult.normalizedPaths},
-            {"ok", childResult.ok},
-            {"payload", childResult.payload},
-            {"risk", toString(childResult.risk)},
-            {"text_output", childResult.text_output},
-            {"tool", toolAction.toolName},
-        });
-        result.impactedNodes.insert(result.impactedNodes.end(),
-                                    childResult.impactedNodes.begin(),
-                                    childResult.impactedNodes.end());
-        result.normalizedPaths.insert(result.normalizedPaths.end(),
-                                      childResult.normalizedPaths.begin(),
-                                      childResult.normalizedPaths.end());
-        result.risk = maxRisk(result.risk, childResult.risk);
-        result.applied = result.applied || childResult.applied;
-        if (childResult.payload.is_object() &&
-            childResult.payload.contains("output_json") &&
-            childResult.payload.at("output_json").is_object()) {
-          result.payload["tool_execution"] = childResult.payload.at("output_json");
-          if (!result.payload["tool_execution"].contains("tool")) {
-            result.payload["tool_execution"]["tool"] = toolAction.toolName;
+
+        const bool providerSuppliedToolCalls = !response.toolCalls.empty();
+        std::vector<ai::model::ToolCall> toolCalls = response.toolCalls;
+        if (toolCalls.empty()) {
+          toolCalls = extractToolCallsFromText(response.textOutput);
+          if (!toolCalls.empty()) {
+            result.payload["tool_calls_inferred"] = true;
           }
         }
-        if (childResult.payload.is_object() &&
-            childResult.payload.contains("tool_router_executed") &&
-            childResult.payload.at("tool_router_executed").is_boolean() &&
-            childResult.payload.at("tool_router_executed").get<bool>()) {
-          result.payload["tool_router_executed"] = true;
-        }
-        if (childResult.payload.is_object() &&
-            childResult.payload.contains("tool_router_transport") &&
-            childResult.payload.at("tool_router_transport").is_string()) {
-          result.payload["tool_router_transport"] =
-              childResult.payload.at("tool_router_transport").get<std::string>();
-        }
-        if (!childResult.ok) {
-          toolFailure = true;
-          toolFailureMessage = childResult.message;
+        if (toolCalls.empty()) {
+          result.ok = false;
+          result.risk = RiskLevel::High;
+          result.message = "Model generation returned no executable tool calls.";
           break;
         }
-      }
-      result.payload["tool_results"] = std::move(toolResults);
-      result.payload["tool_execution_summary"] = summarizeExecutedTools(toolCalls);
-      sortAndDedupe(result.impactedNodes);
-      result.normalizedPaths = normalizeAndSortPaths(std::move(result.normalizedPaths));
-      if (toolFailure) {
-        result.ok = false;
-        result.message = toolFailureMessage.empty()
-                             ? "Tool execution failed after model generation."
-                             : toolFailureMessage;
+
+        const bool retryableApplyPatchSequence =
+            allToolCallsUseApplyPatch(toolCalls);
+        nlohmann::ordered_json detectedToolCalls =
+            nlohmann::ordered_json::array();
+        for (const ai::model::ToolCall& toolCall : toolCalls) {
+          detectedToolCalls.push_back(
+              {{"tool", normalizeToolName(toolCall.name)},
+               {"arguments", toolCall.arguments}});
+        }
+        result.payload["tool_call_detected"] = true;
+        result.payload["tool_call_count"] = toolCalls.size();
+        result.payload["tool_call_source"] =
+            providerSuppliedToolCalls ? "provider" : "text";
+        result.payload["tool_calls_detected"] = std::move(detectedToolCalls);
+        if (!response.textOutput.empty()) {
+          result.payload["model_text_output"] = response.textOutput;
+        }
+        result.payload.erase("text_output");
+        result.text_output.clear();
+        lastModelTextOutput_.clear();
+        std::cerr << "[TOOL_CALL_DETECTED] count=" << toolCalls.size()
+                  << " source="
+                  << (providerSuppliedToolCalls ? "provider" : "text")
+                  << " tools=" << summarizeToolCallNames(toolCalls) << "\n";
+
+        nlohmann::ordered_json toolResults = nlohmann::ordered_json::array();
+        bool toolFailure = false;
+        bool retryRequested = false;
+        std::string toolFailureMessage;
+        for (std::size_t index = 0U; index < toolCalls.size(); ++index) {
+          const ai::model::ToolCall& toolCall = toolCalls[index];
+          Action toolAction;
+          toolAction.type = ActionType::ToolExecution;
+          toolAction.id = action.id + ":tool:" + std::to_string(index + 1U);
+          toolAction.target = action.target;
+          toolAction.branch = action.branch;
+          toolAction.snapshotVersion = action.snapshotVersion;
+          toolAction.toolName = normalizeToolName(toolCall.name);
+          toolAction.toolArgs = orderedJsonToStringMap(toolCall.arguments);
+          if (toolAction.toolName == "apply_patch" &&
+              toolAction.toolArgs.find("project_path") ==
+                  toolAction.toolArgs.end()) {
+            toolAction.toolArgs["project_path"] =
+                stateManager_.projectRoot().string();
+          }
+          if (toolAction.toolName.empty()) {
+            toolFailure = true;
+            toolFailureMessage =
+                "Model generated a tool call without a tool name.";
+            break;
+          }
+
+          Result childResult = executeActionLocked(toolAction, state);
+          updateToolFailureHistory(toolAction, childResult);
+          toolResults.push_back({
+              {"args", toolAction.toolArgs},
+              {"impacted_nodes", childResult.impactedNodes},
+              {"message", childResult.message},
+              {"normalized_paths", childResult.normalizedPaths},
+              {"ok", childResult.ok},
+              {"payload", childResult.payload},
+              {"risk", toString(childResult.risk)},
+              {"text_output", childResult.text_output},
+              {"tool", toolAction.toolName},
+          });
+          result.impactedNodes.insert(result.impactedNodes.end(),
+                                      childResult.impactedNodes.begin(),
+                                      childResult.impactedNodes.end());
+          result.normalizedPaths.insert(result.normalizedPaths.end(),
+                                        childResult.normalizedPaths.begin(),
+                                        childResult.normalizedPaths.end());
+          result.risk = maxRisk(result.risk, childResult.risk);
+          result.applied = result.applied || childResult.applied;
+          if (childResult.payload.is_object() &&
+              childResult.payload.contains("output_json") &&
+              childResult.payload.at("output_json").is_object()) {
+            result.payload["tool_execution"] =
+                childResult.payload.at("output_json");
+            if (!result.payload["tool_execution"].contains("tool")) {
+              result.payload["tool_execution"]["tool"] = toolAction.toolName;
+            }
+          }
+          if (childResult.payload.is_object() &&
+              childResult.payload.contains("tool_router_executed") &&
+              childResult.payload.at("tool_router_executed").is_boolean() &&
+              childResult.payload.at("tool_router_executed").get<bool>()) {
+            result.payload["tool_router_executed"] = true;
+          }
+          if (childResult.payload.is_object() &&
+              childResult.payload.contains("tool_router_transport") &&
+              childResult.payload.at("tool_router_transport").is_string()) {
+            result.payload["tool_router_transport"] =
+                childResult.payload.at("tool_router_transport")
+                    .get<std::string>();
+          }
+
+          const bool applyPatchFailure =
+              toolAction.toolName == "apply_patch" &&
+              applyPatchFailureDetected(childResult);
+          if (applyPatchFailure) {
+            toolFailure = true;
+            toolFailureMessage = describeApplyPatchFailure(childResult);
+            if (retryableApplyPatchSequence &&
+                applyPatchRetryCount < kApplyPatchMaxRetries) {
+              ++applyPatchRetryCount;
+              applyPatchRetryHistory.push_back(buildApplyPatchRetryRecord(
+                  applyPatchRetryCount,
+                  toolFailureMessage,
+                  toolAction.toolArgs,
+                  childResult));
+              currentRequest = buildApplyPatchRetryRequest(currentRequest,
+                                                          applyPatchRetryCount,
+                                                          toolFailureMessage,
+                                                          toolAction.toolArgs,
+                                                          childResult);
+              retryRequested = true;
+            } else if (retryableApplyPatchSequence) {
+              applyPatchRetryExhausted = true;
+            }
+            break;
+          }
+
+          if (!childResult.ok) {
+            toolFailure = true;
+            toolFailureMessage = childResult.message;
+            break;
+          }
+        }
+
+        result.payload["tool_results"] = std::move(toolResults);
+        result.payload["tool_execution_summary"] =
+            summarizeExecutedTools(toolCalls);
+        sortAndDedupe(result.impactedNodes);
+        result.normalizedPaths =
+            normalizeAndSortPaths(std::move(result.normalizedPaths));
+        if (retryRequested) {
+          result.payload["retry_pending"] = true;
+          result.payload["retry_reason"] = toolFailureMessage;
+          continue;
+        }
+        if (toolFailure) {
+          result.ok = false;
+          result.message = toolFailureMessage.empty()
+                               ? "Tool execution failed after model generation."
+                               : toolFailureMessage;
+          break;
+        }
+
+        result.ok = true;
+        result.text_output.clear();
+        result.payload.erase("text_output");
+        lastModelTextOutput_.clear();
+        result.message = applyPatchRetryCount == 0U
+                             ? "Model generation completed and tool calls executed."
+                             : "Model generation completed and tool calls executed "
+                               "after apply_patch retry.";
         break;
       }
-      result.ok = true;
-      result.text_output.clear();
-      result.payload.erase("text_output");
-      lastModelTextOutput_.clear();
-      result.message = "Model generation completed and tool calls executed.";
+
+      result.payload["apply_patch_retry_count"] = applyPatchRetryCount;
+      if (!applyPatchRetryHistory.empty()) {
+        result.payload["apply_patch_retry_history"] = applyPatchRetryHistory;
+      }
+      if (applyPatchRetryExhausted) {
+        result.payload["apply_patch_retry_exhausted"] = true;
+      }
+      result.normalizedPaths =
+          normalizeAndSortPaths(collectNormalizedPaths(result.payload));
       break;
     }
 
@@ -1944,14 +2204,6 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
         toolOutput = toolExecutor_.execute(normalizedTool, action.toolArgs);
         toolSucceeded = toolExecutor_.last_execution_succeeded();
         toolRouterExecuted = true;
-      } else if (isNativeToolRouterTool(normalizedTool)) {
-        cognitive::tool_router::ToolRouter directRouter;
-        routerTransport = "direct_router";
-        toolOutput = directRouter.route_and_execute(normalizedTool, action.toolArgs);
-        toolSucceeded = toolOutput.rfind("ERROR:", 0U) != 0U &&
-                        toolOutput.rfind("[ERROR]", 0U) != 0U;
-        toolRouterExecuted = true;
-        result.payload["router_fallback"] = true;
       } else {
         toolOutput = "ERROR: tool '" + normalizedTool + "' is not registered.";
       }
@@ -2089,11 +2341,11 @@ Result ExecutionKernel::execute(const Action& action,
         action.id, "ExecutionKernel::execute");
     validateAction(action, state);
     CognitiveRuntime runtime(stateManager_);
+    const std::string normalizedTool = normalizeToolName(action.toolName);
     if (action.type == ActionType::ToolExecution &&
-        runtime.toolRegistry().get_tool(action.toolName) == nullptr &&
-        !isNativeToolRouterTool(action.toolName)) {
+        runtime.toolRegistry().get_tool(normalizedTool) == nullptr) {
       throw std::runtime_error(
-          "Tool execution requested a tool that is unavailable in Layer 16 and Layer 17.");
+          "Tool execution requested an unregistered tool in Layer 16.");
     }
     SnapshotPinGuard pinGuard = runtime.pin(state);
 

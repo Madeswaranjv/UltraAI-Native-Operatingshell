@@ -10,6 +10,12 @@ out/
 *.log
 .vs/
 .tmp/
+.ultra/
+.ultra_daemon/
+idea/
+tests/
+Testing/
+test-cpp/
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
