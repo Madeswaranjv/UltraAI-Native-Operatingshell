@@ -1,8 +1,0 @@
-{
-  "routing": {
-    "analysis": "openai",
-    "coding": "ollama",
-    "planning": "deepseek",
-    "reasoning": "deepseek"
-  }
-}

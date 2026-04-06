@@ -1,8 +1,0 @@
-{
-  "centrality_weight": 0.25,
-  "dependency_depth_weight": 1.0,
-  "impact_weight": 0.20000000298023224,
-  "module_proximity_weight": 1.0,
-  "recency_weight": 0.3499999940395355,
-  "usage_weight": 0.20000000298023224
-}
