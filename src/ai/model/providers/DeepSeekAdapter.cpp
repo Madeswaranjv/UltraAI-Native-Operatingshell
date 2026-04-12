@@ -124,7 +124,7 @@ bool DeepSeekAdapter::initialize(const nlohmann::ordered_json& config,
 
   config_ = config.is_object() ? config : nlohmann::ordered_json::object();
   info_.providerName = "deepseek";
-  info_.modelName = config_.value("model", std::string{"deepseek-reasoner"});
+  info_.modelName = defaultConfiguredModelName(config_, "deepseek-reasoner");
   info_.supportsStreaming = true;
   info_.supportsToolCalls = true;
   info_.localProvider = false;
@@ -245,7 +245,7 @@ nlohmann::ordered_json DeepSeekAdapter::buildProviderRequest(
   payload["context_payload"] = request.contextPayload;
   payload["max_tokens"] = request.maxTokens;
   payload["messages"] = std::move(messages);
-  payload["model"] = info_.modelName;
+  payload["model"] = configuredModelNameForRequest(config_, request, info_.modelName);
   payload["temperature"] = request.temperature;
   payload["tools"] = std::move(toolPayload);
   return payload;

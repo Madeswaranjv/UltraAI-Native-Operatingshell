@@ -59,7 +59,8 @@ void recordBranchMetric(const std::string& operation,
 BranchLifecycle::BranchLifecycle(BranchStore& store)
     : store_(store),
       chain_(nullptr),
-      activeGraph_(nullptr) {
+      activeGraph_(nullptr),
+      snapshotPersistence_(nullptr) {
 
   ownedChain_ = std::make_unique<ultra::memory::SnapshotChain>();
   ownedGraph_ = std::make_unique<ultra::memory::StateGraph>();
@@ -77,7 +78,58 @@ BranchLifecycle::BranchLifecycle(
     ultra::memory::StateGraph& activeGraph)
     : store_(store),
       chain_(&chain),
-      activeGraph_(&activeGraph) {}
+      activeGraph_(&activeGraph),
+      snapshotPersistence_(nullptr) {}
+
+BranchLifecycle::BranchLifecycle(
+    BranchStore& store,
+    ultra::memory::SnapshotChain& chain,
+    ultra::memory::StateGraph& activeGraph,
+    ultra::memory::SnapshotPersistence& snapshotPersistence)
+    : store_(store),
+      chain_(&chain),
+      activeGraph_(&activeGraph),
+      snapshotPersistence_(&snapshotPersistence) {}
+
+bool BranchLifecycle::hasSnapshotReference(const std::string& snapshotId) const {
+  if (snapshotId.empty()) {
+    return false;
+  }
+  if (chain_ != nullptr && chain_->getSnapshot(snapshotId).id != 0ULL) {
+    return true;
+  }
+  if (snapshotPersistence_ == nullptr) {
+    return false;
+  }
+  std::uint64_t parsedId = 0ULL;
+  if (!parseSnapshotId(snapshotId, parsedId)) {
+    return false;
+  }
+  return snapshotPersistence_->hasGraph(parsedId);
+}
+
+bool BranchLifecycle::loadSnapshot(std::uint64_t snapshotId,
+                                   ultra::memory::StateSnapshot& snapshot) const {
+  if (chain_ != nullptr) {
+    snapshot = chain_->getSnapshot(snapshotId);
+    if (snapshot.id != 0ULL) {
+      return true;
+    }
+  }
+  if (snapshotPersistence_ != nullptr &&
+      snapshotPersistence_->loadSnapshot(snapshotId, snapshot)) {
+    return true;
+  }
+  snapshot = ultra::memory::StateSnapshot{};
+  return false;
+}
+
+bool BranchLifecycle::persistSnapshotChain() const {
+  if (snapshotPersistence_ == nullptr || chain_ == nullptr) {
+    return true;
+  }
+  return snapshotPersistence_->saveChain(*chain_);
+}
 
 void BranchLifecycle::runMemoryGovernance(const std::string& protectedBranchId,
                                           const bool heavyMutation) {
@@ -184,18 +236,6 @@ void BranchLifecycle::enforceActiveBranchCap(
 }
 
 void BranchLifecycle::invalidateStaleSnapshotReferences() {
-  if (chain_ == nullptr) {
-    return;
-  }
-
-  std::set<std::string> retainedSnapshotIds;
-  for (const ultra::memory::StateSnapshot& snapshot : chain_->getHistory()) {
-    retainedSnapshotIds.insert(snapshot.snapshotId);
-    if (snapshot.id != 0ULL) {
-      retainedSnapshotIds.insert(std::to_string(snapshot.id));
-    }
-  }
-
   std::vector<Branch> branches = store_.getAll();
   std::sort(branches.begin(), branches.end(),
             [](const Branch& left, const Branch& right) {
@@ -206,8 +246,7 @@ void BranchLifecycle::invalidateStaleSnapshotReferences() {
     if (branch.memorySnapshotId.empty()) {
       continue;
     }
-    if (retainedSnapshotIds.find(branch.memorySnapshotId) !=
-        retainedSnapshotIds.end()) {
+    if (hasSnapshotReference(branch.memorySnapshotId)) {
       continue;
     }
     branch.memorySnapshotId.clear();
@@ -277,8 +316,29 @@ Branch BranchLifecycle::spawn(const std::string& parentId,
 
   ultra::memory::StateSnapshot snap =
       activeGraph_->snapshot(snapId);
+  snap.snapshotId = std::to_string(snapId);
+  snap.branchId = created.branchId;
+
+  const std::vector<ultra::memory::StateSnapshot> priorHistory =
+      chain_->getHistory();
 
   chain_->append(snap);
+  if (snapshotPersistence_ != nullptr) {
+    const bool graphSaved = snapshotPersistence_->saveGraph(snap);
+    const bool chainSaved = graphSaved && persistSnapshotChain();
+    if (!chainSaved) {
+      chain_->clear();
+      for (const ultra::memory::StateSnapshot& prior : priorHistory) {
+        chain_->append(prior);
+      }
+      (void)store_.remove(created.branchId);
+      ultra::core::Logger::error(
+          ultra::core::LogCategory::General,
+          "Failed to persist snapshot " + std::to_string(snapId) +
+              " for branch " + created.branchId);
+      return Branch{};
+    }
+  }
 
   created.memorySnapshotId = std::to_string(snapId);
   store_.update(created);
@@ -342,12 +402,26 @@ bool BranchLifecycle::resume(const std::string& branchId) {
     return false;
   }
 
-  ultra::memory::StateSnapshot snap =
-      chain_->getSnapshot(snapId);
-
-  if (snap.id == 0)
+  ultra::memory::StateSnapshot snap;
+  const bool snapshotInChain =
+      chain_ != nullptr && chain_->getSnapshot(snapId).id != 0ULL;
+  if (!loadSnapshot(snapId, snap)) {
     return false;
+  }
   const bool wasOverlayResident = b.isOverlayResident;
+
+  if (!snapshotInChain && chain_ != nullptr) {
+    const std::vector<ultra::memory::StateSnapshot> priorHistory =
+        chain_->getHistory();
+    chain_->append(snap);
+    if (!persistSnapshotChain()) {
+      chain_->clear();
+      for (const ultra::memory::StateSnapshot& prior : priorHistory) {
+        chain_->append(prior);
+      }
+      return false;
+    }
+  }
 
   *activeGraph_ = ultra::memory::StateGraph::fromSnapshot(snap);
 
@@ -428,14 +502,30 @@ bool BranchLifecycle::rollback(const std::string& branchId) {
     return false;
   }
 
-  ultra::memory::StateSnapshot snap =
-      chain_->getSnapshot(snapId);
-
-  if (snap.id == 0)
+  ultra::memory::StateSnapshot snap;
+  const bool snapshotInChain =
+      chain_ != nullptr && chain_->getSnapshot(snapId).id != 0ULL;
+  if (!loadSnapshot(snapId, snap)) {
     return false;
+  }
 
-  if (!chain_->rollback(snapId))
+  const std::vector<ultra::memory::StateSnapshot> priorHistory =
+      chain_->getHistory();
+  if (snapshotInChain) {
+    if (!chain_->rollback(snapId)) {
+      return false;
+    }
+  } else {
+    chain_->clear();
+    chain_->append(snap);
+  }
+  if (!persistSnapshotChain()) {
+    chain_->clear();
+    for (const ultra::memory::StateSnapshot& prior : priorHistory) {
+      chain_->append(prior);
+    }
     return false;
+  }
 
   *activeGraph_ = ultra::memory::StateGraph::fromSnapshot(snap);
   metrics::PerformanceMetrics::recordSnapshotReuse();

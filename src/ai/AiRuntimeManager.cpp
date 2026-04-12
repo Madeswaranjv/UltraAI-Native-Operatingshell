@@ -887,7 +887,8 @@ struct RuntimeDispatcher {
     std::size_t total =
         sizeof(snapshot.id) + sizeof(snapshot.nodeCount) +
         sizeof(snapshot.edgeCount) + snapshot.snapshotId.size() +
-        snapshot.graphHash.size();
+        snapshot.graphHash.size() + sizeof(snapshot.createdAt) +
+        snapshot.branchId.size();
 
     for (const ultra::memory::StateNode& node : snapshot.nodes) {
       total += sizeof(node.nodeType) + sizeof(node.version) + node.nodeId.size() +

@@ -1237,6 +1237,7 @@ const std::map<std::string, std::vector<std::string>>& fallbackToolRequiredParam
       {"delete_file", {"path"}},
       {"list_dir", {}},
       {"search_files", {"pattern"}},
+      {"simulate_intent", {"goal"}},
       {"apply_patch", {}},
       {"run_command", {"command"}},
   };
@@ -1251,6 +1252,7 @@ const std::map<std::string, std::vector<std::string>>& fallbackToolAllowedParams
       {"delete_file", {"path"}},
       {"list_dir", {"path", "recursive"}},
       {"search_files", {"pattern", "path", "case_sensitive"}},
+      {"simulate_intent", {"goal", "target", "budget", "depth", "threshold"}},
       {"apply_patch", {"diff", "changes", "file", "path", "project_path"}},
       {"run_command", {"command", "cwd", "timeout_ms"}},
   };
@@ -1340,7 +1342,17 @@ ai::model::ModelRequest buildModelRequestForStrategyAction(
       {"estimated_files_changed", strategyAction.estimatedFilesChanged},
       {"estimated_dependency_depth", strategyAction.estimatedDependencyDepth},
       {"branch", state.snapshot.branch.toString()},
+      {"model_role",
+       taskTypeForStrategyAction(strategyAction) ==
+               ai::orchestration::TaskType::Coding
+           ? "coder"
+           : "analyzer"},
       {"snapshot_version", state.snapshot.version},
+      {"stage",
+       taskTypeForStrategyAction(strategyAction) ==
+               ai::orchestration::TaskType::Coding
+           ? "coder"
+           : "analyzer"},
       {"tool_required", "apply_patch"},
   };
   return request;
@@ -1361,6 +1373,9 @@ ai::orchestration::OrchestrationContext buildModelOrchestrationForStrategyAction
                          : ai::orchestration::TaskPriority::Standard;
   context.tokenBudget = request.maxTokens;
   context.availableModels = {selectProviderForAction(strategyAction)};
+  context.modelRoleHint =
+      context.taskType == ai::orchestration::TaskType::Coding ? "coder"
+                                                              : "analyzer";
   return context;
 }
 
@@ -1491,6 +1506,7 @@ GovernanceDecision ExecutionKernel::evaluate_action(
       normalizedTool == "search_files") {
     decision.risk = RiskLevel::Low;
   } else if (normalizedTool == "impact_analysis" ||
+             normalizedTool == "simulate_intent" ||
              normalizedTool == "get_context" ||
              normalizedTool == "get_status") {
     decision.risk = RiskLevel::Medium;
@@ -1897,6 +1913,24 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
       lastSelectedProvider_.clear();
       lastProviderEndpoint_.clear();
       ai::model::ModelRequest currentRequest = *action.modelRequest;
+      if (!currentRequest.contextPayload.is_object()) {
+        currentRequest.contextPayload = nlohmann::ordered_json::object();
+      }
+      if (!action.id.empty()) {
+        currentRequest.contextPayload["task_id"] = action.id;
+      }
+      if (!action.target.empty() &&
+          (!currentRequest.contextPayload.contains("target") ||
+           !currentRequest.contextPayload.at("target").is_string() ||
+           currentRequest.contextPayload.at("target").get<std::string>().empty())) {
+        currentRequest.contextPayload["target"] = action.target;
+      }
+      if (!currentRequest.contextPayload.contains("stage")) {
+        currentRequest.contextPayload["stage"] =
+            orchestrationContext.taskType == ai::orchestration::TaskType::Coding
+                ? "coder"
+                : ai::orchestration::toString(orchestrationContext.taskType);
+      }
       nlohmann::ordered_json applyPatchRetryHistory =
           nlohmann::ordered_json::array();
       std::size_t applyPatchRetryCount = 0U;

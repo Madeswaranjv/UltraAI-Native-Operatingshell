@@ -50,6 +50,7 @@ class StateManager:
     def __init__(self):
         self.current_state = AppState.IDLE
         self.current_mode = UltraMode.USER_DRIVEN
+        self.verbose_stream = False
         self._listeners = []
 
     def set_state(self, state: AppState) -> None:
@@ -61,6 +62,9 @@ class StateManager:
 
     def set_mode(self, mode: UltraMode) -> None:
         self.current_mode = mode
+
+    def set_verbose_stream(self, enabled: bool) -> None:
+        self.verbose_stream = enabled
 
     def add_listener(self, callback) -> None:
         self._listeners.append(callback)

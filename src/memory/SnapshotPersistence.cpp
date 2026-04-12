@@ -15,32 +15,46 @@ SnapshotPersistence::SnapshotPersistence(
   chainFile_ = baseDir_ / "chain.json";
 
   std::error_code ec;
+  std::filesystem::create_directories(baseDir_, ec);
   std::filesystem::create_directories(objectsDir_, ec);
+}
+
+std::filesystem::path SnapshotPersistence::graphPath(
+    const uint64_t snapshotId) const {
+  return objectsDir_ / (std::to_string(snapshotId) + ".graph");
 }
 
 bool SnapshotPersistence::saveGraph(
     uint64_t snapshotId,
     const StateGraph& graph) {
-
-  auto file =
-      objectsDir_ / (std::to_string(snapshotId) + ".graph");
-
   StateSnapshot snap = graph.snapshot(snapshotId);
-  return runtime::SnapshotSerializer::save(snap, file);
+  return saveGraph(snap);
+}
+
+bool SnapshotPersistence::saveGraph(const StateSnapshot& snapshot) {
+  if (snapshot.id == 0ULL) {
+    return false;
+  }
+
+  std::error_code ec;
+  std::filesystem::create_directories(objectsDir_, ec);
+
+  StateSnapshot normalized = snapshot;
+  if (normalized.snapshotId.empty()) {
+    normalized.snapshotId = std::to_string(normalized.id);
+  }
+  if (normalized.createdAt.epochMs() == 0LL) {
+    normalized.createdAt = ultra::types::Timestamp::now();
+  }
+
+  return runtime::SnapshotSerializer::save(normalized, graphPath(normalized.id));
 }
 
 bool SnapshotPersistence::loadGraph(
     uint64_t snapshotId,
     StateGraph& graph) const {
-
-  auto file =
-      objectsDir_ / (std::to_string(snapshotId) + ".graph");
-
   StateSnapshot snap;
-  if (!runtime::SnapshotSerializer::load(file, snap)) {
-    return false;
-  }
-  if (snap.id != snapshotId) {
+  if (!loadSnapshot(snapshotId, snap)) {
     return false;
   }
 
@@ -49,18 +63,46 @@ bool SnapshotPersistence::loadGraph(
   return true;
 }
 
+bool SnapshotPersistence::loadSnapshot(uint64_t snapshotId,
+                                       StateSnapshot& snapshotOut) const {
+  if (!runtime::SnapshotSerializer::load(graphPath(snapshotId), snapshotOut)) {
+    return false;
+  }
+  if (snapshotOut.id != snapshotId) {
+    return false;
+  }
+  if (snapshotOut.snapshotId.empty()) {
+    snapshotOut.snapshotId = std::to_string(snapshotId);
+  }
+  return true;
+}
+
+bool SnapshotPersistence::hasGraph(uint64_t snapshotId) const {
+  std::error_code ec;
+  return std::filesystem::exists(graphPath(snapshotId), ec);
+}
+
 bool SnapshotPersistence::saveChain(
     const SnapshotChain& chain) {
+  std::error_code ec;
+  std::filesystem::create_directories(baseDir_, ec);
 
   nlohmann::json j = nlohmann::json::array();
 
   for (const auto& s : chain.getHistory()) {
+    StateSnapshot normalized = s;
+    if (normalized.snapshotId.empty()) {
+      normalized.snapshotId = std::to_string(normalized.id);
+    }
 
     nlohmann::json item;
-    item["id"] = s.id;
-    item["hash"] = s.graphHash;
-    item["nodes"] = s.nodeCount;
-    item["edges"] = s.edgeCount;
+    item["id"] = normalized.id;
+    item["snapshot_id"] = normalized.snapshotId;
+    item["branch_id"] = normalized.branchId;
+    item["timestamp_ms"] = normalized.createdAt.epochMs();
+    item["hash"] = normalized.graphHash;
+    item["nodes"] = normalized.nodeCount;
+    item["edges"] = normalized.edgeCount;
 
     j.push_back(item);
   }
@@ -85,13 +127,25 @@ bool SnapshotPersistence::loadChain(
     chain.clear();
 
     for (const auto& item : j) {
+      const uint64_t snapshotId = item.value("id", 0ULL);
+      if (snapshotId == 0ULL) {
+        continue;
+      }
 
       StateSnapshot s;
-      s.id = item.value("id", 0ULL);
-      s.snapshotId = std::to_string(s.id);
-      s.graphHash = item.value("hash", "");
-      s.nodeCount = item.value("nodes", 0ULL);
-      s.edgeCount = item.value("edges", 0ULL);
+      if (!loadSnapshot(snapshotId, s)) {
+        ultra::core::Logger::warning(
+            ultra::core::LogCategory::General,
+            "Skipping missing snapshot object " + std::to_string(snapshotId));
+        continue;
+      }
+      s.snapshotId = item.value("snapshot_id", s.snapshotId);
+      s.branchId = item.value("branch_id", s.branchId);
+      s.createdAt = ultra::types::Timestamp::fromEpochMs(
+          item.value("timestamp_ms", s.createdAt.epochMs()));
+      s.graphHash = item.value("hash", s.graphHash);
+      s.nodeCount = item.value("nodes", s.nodeCount);
+      s.edgeCount = item.value("edges", s.edgeCount);
 
       chain.append(s);
     }

@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Optional
 
 from utils.anime_words import anime_words_for_phase
@@ -76,6 +77,31 @@ FAILURE_TRACE_RE = re.compile(
     r"module=(?P<module>\S+) error_type=(?P<error_type>\S+) "
     r"root_cause=(?P<root_cause>.*)$"
 )
+LOG_PREFIX_RE = re.compile(r"^\[(?:INFO|WARNING|ERROR)\](?: \[[A-Z]+\])? (?P<message>.*)$")
+GOVERNANCE_RE = re.compile(
+    r"^Governance decision tool='(?P<tool>[^']+)' risk=(?P<risk>\S+) "
+    r"confidence=(?P<confidence>[0-9.]+) allowed=(?P<allowed>true|false) "
+    r"reason='(?P<reason>.*)'\.?$"
+)
+EXECUTING_RE = re.compile(r"^Executing: (?P<command>.*)$")
+TOOL_ROUTER_COMMAND_RE = re.compile(
+    r"^ToolRouter executing Ultra command: (?P<command>.*)$"
+)
+TOOL_ROUTER_RETRY_RE = re.compile(
+    r"^ToolRouter retrying Ultra command after failure for tool '(?P<tool>[^']+)'\.$"
+)
+MICROPLANNER_FALLBACK_RE = re.compile(
+    r"^\[MicroPlanner\] Invalid payload -> fallback to ContextExtraction\."
+    r" task=(?P<task>\S+) reason=(?P<reason>.*)$"
+)
+FAILURE_RECOVERY_RE = re.compile(
+    r"^\[FailureRecovery\] task=(?P<task>\S+) "
+    r"(?:class=(?P<failure_class>\S+) )?"
+    r"(?:memory_action=(?P<memory_action>\S+) )?"
+    r"retry=(?P<retry>\d+)/(?P<limit>\d+) "
+    r"(?:action=(?P<action>\S+) )?"
+    r"(?:(?:message|pattern)=(?P<message>.*))?$"
+)
 LOOP_PHASE_TO_APP_STATE = {
     "INIT": AppState.INITIALIZING,
     "PLAN": AppState.PLANNING,
@@ -89,6 +115,31 @@ LOOP_PHASE_TO_APP_STATE = {
     "REPLAN": AppState.REPLANNING,
     "TERMINATE": AppState.COMPLETE,
 }
+
+
+class StreamEventType(str, Enum):
+    PLAN_START = "PLAN_START"
+    PLAN_STEP = "PLAN_STEP"
+    EXECUTION_START = "EXECUTION_START"
+    EXECUTION_STEP = "EXECUTION_STEP"
+    TOOL_CALL = "TOOL_CALL"
+    TOOL_RESULT = "TOOL_RESULT"
+    GOVERNANCE_BLOCK = "GOVERNANCE_BLOCK"
+    RETRY_EVENT = "RETRY_EVENT"
+    SUCCESS = "SUCCESS"
+    FAILURE = "FAILURE"
+
+
+@dataclass
+class StreamEvent:
+    event_type: StreamEventType
+    title: str
+    detail: str = ""
+    phase: str = ""
+    raw_line: str = ""
+    indent: int = 1
+    boundary: bool = False
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -105,6 +156,13 @@ class LiveRenderState:
     output_revealed: bool = False
     stdout_lines: list[str] = field(default_factory=list)
     stderr_lines: list[str] = field(default_factory=list)
+    events: list[StreamEvent] = field(default_factory=list)
+    transcript_lines: list[str] = field(default_factory=list)
+    raw_log_lines: list[str] = field(default_factory=list)
+    current_step: str = ""
+    current_tool: str = ""
+    retry_count: int = 0
+    last_event_key: str = ""
 
 
 class EngineStreamer:
@@ -118,11 +176,24 @@ class EngineStreamer:
     def set_session(self, session) -> None:
         self.session = session
 
+    def _runtime_intent_payload(self, intent_payload: dict) -> dict:
+        runtime_payload = dict(intent_payload)
+        requested_role = runtime_payload.get("requested_role")
+        if not isinstance(requested_role, str) or not requested_role:
+            model_role = runtime_payload.get("model_role")
+            if isinstance(model_role, str) and model_role:
+                requested_role = model_role
+            else:
+                requested_role = "auto"
+        runtime_payload["model_role"] = "auto"
+        runtime_payload["requested_role"] = requested_role
+        return runtime_payload
+
     async def run_user_driven_pipeline(
         self, prompt: str, intent: IntentPayload, session
     ) -> None:
         session_dict = self._session_payload(session)
-        intent_dict = intent.to_dict()
+        intent_dict = self._runtime_intent_payload(intent.to_dict())
         intent_dict.pop("context_hint", None)
 
         payload = {
@@ -134,7 +205,7 @@ class EngineStreamer:
 
     async def run_architectural_pipeline(self, prompt: str, session) -> None:
         payload = {
-            "intent": {
+            "intent": self._runtime_intent_payload({
                 "raw_prompt": prompt,
                 "action": "add",
                 "targets": [],
@@ -142,7 +213,8 @@ class EngineStreamer:
                 "constraints": [],
                 "risk_level": session.policy.risk_tolerance,
                 "requires_planning": True,
-            },
+                "model_role": "planner",
+            }),
             "session": self._session_payload(session),
         }
         await self._run_live_cognitive_pipeline(
@@ -155,15 +227,26 @@ class EngineStreamer:
         payload: dict,
         launch_detail: str,
     ) -> None:
-        self.output.mount_new_response()
+        self.output.mount_new_response(verbose=getattr(self.sm, "verbose_stream", False))
         live = LiveRenderState(
             status_reason=launch_detail,
             anime_word=anime_words_for_phase("INIT")[0],
         )
 
         self.sm.set_state(AppState.INITIALIZING)
+        self.output.update_active_stream("")
         self.output.update_active("")
         self._render_live_status(live)
+        self._emit_event(
+            live,
+            StreamEvent(
+                StreamEventType.PLAN_STEP,
+                "Request accepted",
+                launch_detail,
+                phase="INIT",
+                indent=0,
+            ),
+        )
 
         anime_task = asyncio.create_task(self._anime_loop(live))
         try:
@@ -203,6 +286,14 @@ class EngineStreamer:
             detail_lines.append(live.status_reason)
         if live.event_detail and live.event_detail not in detail_lines:
             detail_lines.append(live.event_detail)
+        if live.current_tool:
+            tool_line = f"tool: {live.current_tool}"
+            if tool_line not in detail_lines:
+                detail_lines.append(tool_line)
+        if live.retry_count > 0:
+            retry_line = f"retry count: {live.retry_count}"
+            if retry_line not in detail_lines:
+                detail_lines.append(retry_line)
         if live.provider_used:
             provider_line = f"provider: {live.provider_used}"
             if live.provider_endpoint:
@@ -210,7 +301,7 @@ class EngineStreamer:
             if provider_line not in detail_lines:
                 detail_lines.append(provider_line)
 
-        self.output.update_active_status(banner, "\n".join(detail_lines[:2]))
+        self.output.update_active_status(banner, "\n".join(detail_lines[:3]))
 
     def _set_loop_phase(
         self,
@@ -228,101 +319,304 @@ class EngineStreamer:
             self.sm.set_state(app_state)
         self._render_live_status(live)
 
-    def _handle_stderr_line(self, line: str, live: LiveRenderState) -> None:
-        normalized = line.strip()
-        if not normalized:
+    def _strip_log_prefix(self, line: str) -> str:
+        log_prefix_match = LOG_PREFIX_RE.match(line)
+        if log_prefix_match:
+            return log_prefix_match.group("message").strip()
+        return line.strip()
+
+    def _append_raw_line(self, live: LiveRenderState, channel: str, line: str) -> None:
+        if not line:
             return
+        raw_line = f"{channel:>6} | {line}"
+        live.raw_log_lines.append(raw_line)
+        self.output.append_active_raw(raw_line + "\n")
+
+    def _is_streamable_log_line(self, channel: str, line: str) -> bool:
+        stripped = line.strip()
+        if not stripped:
+            return False
+        if channel == "stdout" and stripped.startswith("{"):
+            return False
+        return True
+
+    def _phase_heading_for(self, phase: str) -> str:
+        label = LOOP_PHASE_LABELS.get(phase, phase.lower().replace("_", " "))
+        return label.replace("_", " ").title()
+
+    def _event_key(self, event: StreamEvent) -> str:
+        return "|".join(
+            [
+                event.event_type.value,
+                event.title,
+                event.detail,
+                event.phase,
+                str(event.metadata.get("tool", "")),
+            ]
+        )
+
+    def _format_event(self, live: LiveRenderState, event: StreamEvent) -> str:
+        group_icons = {
+            StreamEventType.EXECUTION_START: "⚙️",
+            StreamEventType.SUCCESS: "✓",
+            StreamEventType.FAILURE: "✗",
+            StreamEventType.GOVERNANCE_BLOCK: "✗",
+        }
+        line_icons = {
+            StreamEventType.PLAN_STEP: "→",
+            StreamEventType.EXECUTION_STEP: "⚙️",
+            StreamEventType.TOOL_CALL: "→",
+            StreamEventType.TOOL_RESULT: "✓",
+            StreamEventType.RETRY_EVENT: "↻",
+        }
+        prefix = "  " * max(0, event.indent)
+        icon = group_icons.get(event.event_type, line_icons.get(event.event_type, "•"))
+
+        if event.event_type == StreamEventType.PLAN_START:
+            lines = [event.title]
+        else:
+            lines = [f"{prefix}{icon} {event.title}".rstrip()]
+        if event.detail:
+            detail_prefix = "  " * max(1, event.indent + 1)
+            lines.append(f"{detail_prefix}{event.detail}")
+
+        rendered = "\n".join(lines)
+        if event.boundary and live.transcript_lines:
+            rendered = "\n" + rendered
+        return rendered + "\n"
+
+    def _emit_event(self, live: LiveRenderState, event: StreamEvent) -> None:
+        event.phase = event.phase or live.phase
+        key = self._event_key(event)
+        if key == live.last_event_key:
+            return
+
+        live.last_event_key = key
+        live.events.append(event)
+        live.current_step = event.title
+        live.event_detail = event.detail or event.title
+
+        tool_name = str(event.metadata.get("tool", "") or "")
+        if tool_name:
+            live.current_tool = tool_name
+
+        retry_raw = event.metadata.get("retry_count")
+        if isinstance(retry_raw, int):
+            live.retry_count = max(live.retry_count, retry_raw)
+
+        rendered = self._format_event(live, event)
+        live.transcript_lines.append(rendered)
+        self.output.append_active_stream(rendered)
+        self._render_live_status(live)
+
+    def _make_transition_event(
+        self,
+        phase: str,
+        reason: str,
+    ) -> Optional[StreamEvent]:
+        normalized_reason = reason.strip()
+        if phase == "PLAN":
+            return StreamEvent(
+                StreamEventType.PLAN_START,
+                "Planning",
+                normalized_reason or "Building strategy from the resolved intent.",
+                phase=phase,
+                indent=0,
+                boundary=True,
+            )
+        if phase == "ARBITRATION":
+            return StreamEvent(
+                StreamEventType.PLAN_STEP,
+                "Arbitrating candidate actions",
+                normalized_reason or "Selecting a deterministic path through the plan.",
+                phase=phase,
+            )
+        if phase == "MICRO_PLAN":
+            return StreamEvent(
+                StreamEventType.PLAN_STEP,
+                "Building micro-plan",
+                normalized_reason or "Expanding the selected strategy into task graph steps.",
+                phase=phase,
+            )
+        if phase == "EXECUTE":
+            return StreamEvent(
+                StreamEventType.EXECUTION_START,
+                "Executing",
+                normalized_reason or "Running the task graph.",
+                phase=phase,
+                indent=0,
+                boundary=True,
+            )
+        if phase == "PARTIAL_REPAIR":
+            return StreamEvent(
+                StreamEventType.RETRY_EVENT,
+                "Repairing execution path",
+                normalized_reason or "Recovery requested a partial repair.",
+                phase=phase,
+                metadata={"retry_count": 1},
+            )
+        if phase in {"VERIFY", "REFLECT", "RE_ANCHOR", "REPLAN"}:
+            return StreamEvent(
+                StreamEventType.EXECUTION_STEP,
+                self._phase_heading_for(phase),
+                normalized_reason,
+                phase=phase,
+            )
+        return None
+
+    def _tool_result_detail(
+        self,
+        tool: str,
+        ok_raw: str,
+        applied_raw: str,
+        verified_raw: Optional[str],
+    ) -> tuple[str, str]:
+        ok = ok_raw == "true"
+        applied = applied_raw == "true"
+        verified = verified_raw == "true" if verified_raw is not None else None
+
+        if ok and applied and verified is True:
+            return f"{tool} completed", "Patch applied and file verification passed."
+        if ok and applied:
+            return f"{tool} completed", "Patch applied successfully."
+        if ok:
+            return f"{tool} completed", "Tool returned success."
+        if verified is False:
+            return f"{tool} failed", "Patch output did not verify against the file state."
+        return f"{tool} failed", "Tool execution returned an error state."
+
+    def _parse_runtime_line(
+        self,
+        raw_line: str,
+        live: LiveRenderState,
+    ) -> Optional[StreamEvent]:
+        normalized = raw_line.strip()
+        if not normalized:
+            return None
 
         transition_match = TRANSITION_RE.match(normalized)
         if transition_match:
-            self._set_loop_phase(
-                live,
-                transition_match.group("to"),
-                transition_match.group("reason").strip(),
-            )
-            return
+            next_phase = transition_match.group("to")
+            reason = transition_match.group("reason").strip()
+            self._set_loop_phase(live, next_phase, reason)
+            return self._make_transition_event(next_phase, reason)
 
         arbitration_match = ARBITRATION_RE.match(normalized)
         if arbitration_match:
-            live.event_detail = (
-                f"arbitration iter {arbitration_match.group('iteration')}: "
-                f"{arbitration_match.group('selected')}/"
-                f"{arbitration_match.group('candidates')} selected, "
-                f"{arbitration_match.group('conflicts')} conflicts"
+            return StreamEvent(
+                StreamEventType.PLAN_STEP,
+                "Micro-plan candidates ranked",
+                (
+                    f"Iteration {arbitration_match.group('iteration')} selected "
+                    f"{arbitration_match.group('selected')} of "
+                    f"{arbitration_match.group('candidates')} candidates with "
+                    f"{arbitration_match.group('conflicts')} conflicts."
+                ),
+                phase=live.phase,
             )
-            self._render_live_status(live)
-            return
 
         repair_match = REPAIR_RE.match(normalized)
         if repair_match:
-            live.event_detail = (
-                f"repair {repair_match.group('decision')} at "
-                f"{repair_match.group('site')} "
-                f"(attempt {repair_match.group('attempt')})"
+            attempt = int(repair_match.group("attempt"))
+            return StreamEvent(
+                StreamEventType.RETRY_EVENT,
+                "Partial repair requested",
+                (
+                    f"{repair_match.group('decision')} at {repair_match.group('site')} "
+                    f"(attempt {attempt}). {repair_match.group('reason').strip()}"
+                ),
+                phase=live.phase,
+                metadata={"retry_count": attempt},
             )
-            self._render_live_status(live)
-            return
 
         provider_match = PROVIDER_RE.match(normalized)
         if provider_match:
             live.provider_used = provider_match.group("provider")
             live.provider_endpoint = (provider_match.group("endpoint") or "").strip()
-            self._render_live_status(live)
-            return
+            detail = live.provider_used
+            if live.provider_endpoint:
+                detail += f" @ {live.provider_endpoint}"
+            return StreamEvent(
+                StreamEventType.EXECUTION_STEP,
+                "Model provider selected",
+                detail,
+                phase=live.phase,
+            )
 
         model_enter_match = MODEL_ENTER_RE.match(normalized)
         if model_enter_match:
             provider = model_enter_match.group("provider")
-            if provider and provider != "auto":
-                live.event_detail = f"model generation started via {provider}"
-            else:
-                live.event_detail = "model generation started"
-            self._render_live_status(live)
-            return
+            detail = (
+                f"Provider hint: {provider}" if provider and provider != "auto" else
+                "Generating the next executable action."
+            )
+            return StreamEvent(
+                StreamEventType.EXECUTION_STEP,
+                "Generating tool-ready action",
+                detail,
+                phase=live.phase,
+            )
 
         model_response_match = MODEL_RESPONSE_RE.match(normalized)
         if model_response_match:
-            status_label = "ready" if model_response_match.group("ok") == "true" else "failed"
-            live.event_detail = (
-                f"model response {status_label} • "
-                f"{model_response_match.group('output_len')} bytes"
+            ok = model_response_match.group("ok") == "true"
+            detail = f"{model_response_match.group('output_len')} bytes returned."
+            error = model_response_match.group("error").strip()
+            if error and error != "null":
+                detail = f"{detail} Error: {error}"
+            return StreamEvent(
+                StreamEventType.EXECUTION_STEP if ok else StreamEventType.FAILURE,
+                "Model response ready" if ok else "Model response failed",
+                detail,
+                phase=live.phase,
+                boundary=not ok,
             )
-            self._render_live_status(live)
-            return
 
         tool_call_match = TOOL_CALL_DETECTED_RE.match(normalized)
         if tool_call_match:
-            live.event_detail = (
-                f"tool call detected via {tool_call_match.group('source')} • "
-                f"{tool_call_match.group('tools') or tool_call_match.group('count')}"
+            tools = tool_call_match.group("tools") or tool_call_match.group("count")
+            tool_list = [token.strip() for token in tools.split(",") if token.strip()]
+            tool_name = tool_list[0] if len(tool_list) == 1 else ""
+            return StreamEvent(
+                StreamEventType.TOOL_CALL,
+                f"Tool call detected: {tools}",
+                f"Source: {tool_call_match.group('source')}",
+                phase=live.phase,
+                metadata={"tool": tool_name},
             )
-            self._render_live_status(live)
-            return
 
         tool_router_match = TOOL_ROUTER_EXECUTED_RE.match(normalized)
         if tool_router_match:
-            live.event_detail = (
-                f"tool router executed {tool_router_match.group('tool')} • "
-                f"{tool_router_match.group('transport')} • "
-                f"{tool_router_match.group('ok')}"
+            tool_name = tool_router_match.group("tool")
+            return StreamEvent(
+                StreamEventType.TOOL_CALL,
+                f"Running tool: {tool_name}",
+                f"Transport: {tool_router_match.group('transport')}",
+                phase=live.phase,
+                metadata={"tool": tool_name},
             )
-            self._render_live_status(live)
-            return
 
         execution_applied_match = EXECUTION_KERNEL_APPLIED_RE.match(normalized)
         if execution_applied_match:
-            verified = execution_applied_match.group("file_verified")
-            verification_label = (
-                f" • verified={verified}" if verified is not None else ""
+            tool_name = execution_applied_match.group("tool")
+            title, detail = self._tool_result_detail(
+                tool_name,
+                execution_applied_match.group("ok"),
+                execution_applied_match.group("applied"),
+                execution_applied_match.group("file_verified"),
             )
-            live.event_detail = (
-                f"execution applied {execution_applied_match.group('tool')} • "
-                f"ok={execution_applied_match.group('ok')} • "
-                f"applied={execution_applied_match.group('applied')}"
-                f"{verification_label}"
+            event_type = (
+                StreamEventType.TOOL_RESULT
+                if execution_applied_match.group("ok") == "true"
+                else StreamEventType.FAILURE
             )
-            self._render_live_status(live)
-            return
+            return StreamEvent(
+                event_type,
+                title,
+                detail,
+                phase=live.phase,
+                metadata={"tool": tool_name},
+            )
 
         failure_trace_match = FAILURE_TRACE_RE.match(normalized)
         if failure_trace_match:
@@ -330,30 +624,157 @@ class EngineStreamer:
             if failure_phase in LOOP_PHASE_TO_APP_STATE:
                 live.phase = failure_phase
                 self.sm.set_state(LOOP_PHASE_TO_APP_STATE[failure_phase])
-            live.event_detail = (
-                f"failure {failure_trace_match.group('module')}: "
-                f"{failure_trace_match.group('root_cause')}"
+            return StreamEvent(
+                StreamEventType.FAILURE,
+                f"{failure_trace_match.group('module')} failed",
+                failure_trace_match.group("root_cause"),
+                phase=failure_phase,
+                boundary=True,
             )
-            self._render_live_status(live)
-            return
 
         task_output_match = TASK_OUTPUT_RE.match(normalized)
         if task_output_match:
-            live.event_detail = (
-                f"task {task_output_match.group('task')} produced "
-                f"{task_output_match.group('output_len')} bytes"
+            return StreamEvent(
+                StreamEventType.EXECUTION_STEP,
+                f"Task output captured: {task_output_match.group('task')}",
+                f"{task_output_match.group('output_len')} bytes of text output.",
+                phase=live.phase,
             )
-            self._render_live_status(live)
-            return
+
+        microplanner_fallback = MICROPLANNER_FALLBACK_RE.match(normalized)
+        if microplanner_fallback:
+            return StreamEvent(
+                StreamEventType.PLAN_STEP,
+                "Micro-plan normalized invalid payload",
+                (
+                    f"Task {microplanner_fallback.group('task')} fell back to "
+                    f"ContextExtraction because {microplanner_fallback.group('reason')}."
+                ),
+                phase=live.phase,
+            )
+
+        governance_match = GOVERNANCE_RE.match(normalized)
+        if governance_match:
+            tool_name = governance_match.group("tool")
+            allowed = governance_match.group("allowed") == "true"
+            detail = (
+                f"Reason: {governance_match.group('reason')} "
+                f"(risk={governance_match.group('risk')}, "
+                f"confidence={governance_match.group('confidence')})"
+            )
+            return StreamEvent(
+                StreamEventType.EXECUTION_STEP if allowed else StreamEventType.GOVERNANCE_BLOCK,
+                f"Governance cleared {tool_name}" if allowed else "Governance blocked",
+                detail,
+                phase=live.phase,
+                boundary=not allowed,
+                metadata={"tool": tool_name},
+            )
+
+        executing_match = EXECUTING_RE.match(normalized)
+        if executing_match:
+            return StreamEvent(
+                StreamEventType.EXECUTION_STEP,
+                "Executing command",
+                executing_match.group("command"),
+                phase=live.phase,
+            )
+
+        tool_router_command_match = TOOL_ROUTER_COMMAND_RE.match(normalized)
+        if tool_router_command_match:
+            return StreamEvent(
+                StreamEventType.TOOL_CALL,
+                "Dispatching tool command",
+                tool_router_command_match.group("command"),
+                phase=live.phase,
+            )
+
+        tool_router_retry_match = TOOL_ROUTER_RETRY_RE.match(normalized)
+        if tool_router_retry_match:
+            return StreamEvent(
+                StreamEventType.RETRY_EVENT,
+                "Retrying tool dispatch",
+                f"Previous {tool_router_retry_match.group('tool')} command failed.",
+                phase=live.phase,
+                metadata={"tool": tool_router_retry_match.group("tool")},
+            )
+
+        failure_recovery_match = FAILURE_RECOVERY_RE.match(normalized)
+        if failure_recovery_match:
+            retry_count = int(failure_recovery_match.group("retry"))
+            action = (
+                failure_recovery_match.group("action")
+                or failure_recovery_match.group("memory_action")
+                or "REPLAN_REQUIRED"
+            )
+            message = failure_recovery_match.group("message") or "Recovery path updated."
+            return StreamEvent(
+                StreamEventType.RETRY_EVENT,
+                f"Recovery decision: {action}",
+                f"Task {failure_recovery_match.group('task')} - {message}",
+                phase=live.phase,
+                metadata={"retry_count": retry_count},
+            )
+
+        if "Repeated failures detected" in normalized:
+            return StreamEvent(
+                StreamEventType.RETRY_EVENT,
+                "Retrying action",
+                "Previous attempt failed repeatedly; the runtime is escalating recovery.",
+                phase=live.phase,
+                metadata={"retry_count": live.retry_count + 1},
+            )
 
         if normalized.startswith("[UltraLoop] "):
-            live.event_detail = normalized.replace("[UltraLoop] ", "", 1)
-            self._render_live_status(live)
-            return
+            event_type = (
+                StreamEventType.PLAN_STEP
+                if live.phase in {"PLAN", "ARBITRATION", "MICRO_PLAN", "REPLAN"}
+                else StreamEventType.EXECUTION_STEP
+            )
+            return StreamEvent(
+                event_type,
+                self._phase_heading_for(live.phase),
+                normalized.replace("[UltraLoop] ", "", 1),
+                phase=live.phase,
+            )
 
         if normalized.startswith("[FailureRecovery] "):
-            live.event_detail = normalized.replace("[FailureRecovery] ", "", 1)
-            self._render_live_status(live)
+            return StreamEvent(
+                StreamEventType.RETRY_EVENT,
+                "Recovery update",
+                normalized.replace("[FailureRecovery] ", "", 1),
+                phase=live.phase,
+                metadata={"retry_count": live.retry_count + 1},
+            )
+
+        if "apply_patch" in normalized:
+            return StreamEvent(
+                StreamEventType.TOOL_CALL,
+                "apply_patch activity",
+                normalized,
+                phase=live.phase,
+                metadata={"tool": "apply_patch"},
+            )
+
+        return None
+
+    def _handle_runtime_line(
+        self,
+        line: str,
+        live: LiveRenderState,
+        *,
+        channel: str,
+    ) -> None:
+        stripped = line.strip()
+        if not stripped:
+            return
+
+        if self._is_streamable_log_line(channel, stripped):
+            self._append_raw_line(live, channel, stripped)
+
+        event = self._parse_runtime_line(self._strip_log_prefix(stripped), live)
+        if event is not None:
+            self._emit_event(live, event)
 
     async def _progressively_reveal_output(
         self,
@@ -364,28 +785,98 @@ class EngineStreamer:
             live.output_revealed = True
             return
 
-        rendered = 0
         self.output.update_active("")
-        while rendered < len(text):
-            next_index = self._next_output_break(text, rendered)
-            self.output.append_active(text[rendered:next_index])
-            rendered = next_index
-            await asyncio.sleep(0.01)
+        for chunk in self._logical_output_chunks(text):
+            self.output.append_active(chunk)
+            await asyncio.sleep(0.025)
 
         self.output.update_active(text)
         live.output_revealed = True
 
-    def _next_output_break(self, text: str, start: int) -> int:
-        end = min(len(text), start + random.randint(72, 192))
-        while end < len(text) and not text[end - 1].isspace() and not text[end].isspace():
-            end += 1
-        return min(end, len(text))
+    def _logical_output_chunks(self, text: str) -> list[str]:
+        chunks: list[str] = []
+        paragraphs = re.split(r"(\n\s*\n)", text)
+        for token in paragraphs:
+            if not token:
+                continue
+            if re.fullmatch(r"\n\s*\n", token):
+                if chunks:
+                    chunks[-1] += token
+                continue
+
+            lines = token.splitlines(keepends=True)
+            if len(lines) <= 2:
+                chunks.append(token)
+                continue
+
+            current = ""
+            for line in lines:
+                current += line
+                if current.count("\n") >= 2 or len(current) >= 240:
+                    chunks.append(current)
+                    current = ""
+            if current:
+                chunks.append(current)
+        return chunks or [text]
+
+    def _emit_backend_summary_events(
+        self,
+        live: LiveRenderState,
+        backend_result: dict,
+    ) -> None:
+        retry_count = backend_result.get("apply_patch_retry_count")
+        if isinstance(retry_count, int) and retry_count > live.retry_count:
+            self._emit_event(
+                live,
+                StreamEvent(
+                    StreamEventType.RETRY_EVENT,
+                    "Retry summary",
+                    f"apply_patch required {retry_count} retry attempt(s).",
+                    phase=live.phase,
+                    metadata={"retry_count": retry_count, "tool": "apply_patch"},
+                ),
+            )
+
+        timer_text = self._execution_timer_text(backend_result)
+        tool_summary = str(backend_result.get("tool_execution_summary", "") or "").strip()
+        success_detail_parts = [part for part in [tool_summary, timer_text] if part]
+
+        if backend_result.get("status") == "ok":
+            self._emit_event(
+                live,
+                StreamEvent(
+                    StreamEventType.SUCCESS,
+                    "Success",
+                    " | ".join(success_detail_parts),
+                    phase=live.phase,
+                    indent=0,
+                    boundary=True,
+                ),
+            )
+            return
+
+        failure_detail = self._extract_error_text(backend_result).strip()
+        if not failure_detail:
+            failure_lines = self._failure_trace_lines(backend_result)
+            failure_detail = failure_lines[0] if failure_lines else "Execution ended with an error."
+        self._emit_event(
+            live,
+            StreamEvent(
+                StreamEventType.FAILURE,
+                "Failure",
+                failure_detail,
+                phase=live.phase,
+                indent=0,
+                boundary=True,
+            ),
+        )
 
     async def _finalize_live_response(
         self,
         live: LiveRenderState,
         backend_result: dict,
     ) -> None:
+        self._emit_backend_summary_events(live, backend_result)
         final_text = self._final_output_text(backend_result)
         if final_text and not live.output_revealed:
             live.final_output_ready = True
@@ -529,29 +1020,17 @@ class EngineStreamer:
             backend_result.get("llm_output", backend_result.get("llmOutput", "")) or ""
         )
         if llm_output.strip():
-            base_text = llm_output
-        else:
-            output = str(backend_result.get("output", "") or "")
-            if output.strip():
-                base_text = output
-            else:
-                error = str(backend_result.get("error", "") or "")
-                if error.strip():
-                    base_text = f"Backend error: {error}"
-                else:
-                    base_text = "(No output returned by cognitive_run.)"
+            return llm_output.strip()
 
-        sections = [base_text.strip()]
-        tool_lines = self._tool_execution_lines(backend_result)
-        if tool_lines:
-            sections.append("\n".join(tool_lines))
-        timer_text = self._execution_timer_text(backend_result)
-        if timer_text:
-            sections.append(timer_text)
-        failure_lines = self._failure_trace_lines(backend_result)
-        if failure_lines:
-            sections.append("\n".join(failure_lines))
-        return "\n\n".join(section for section in sections if section)
+        output = str(backend_result.get("output", "") or "")
+        if output.strip():
+            return output.strip()
+
+        error = str(backend_result.get("error", "") or "")
+        if error.strip():
+            return f"Backend error: {error}"
+
+        return "(No output returned by cognitive_run.)"
     def _normalize_backend_result(self, result: dict) -> dict:
         normalized = dict(result) if isinstance(result, dict) else {}
 
@@ -798,6 +1277,11 @@ class EngineStreamer:
                     stdout_lines.append(payload)
                     if live is not None:
                         live.stdout_lines.append(payload)
+                        self._handle_runtime_line(
+                            payload.rstrip("\r\n"),
+                            live,
+                            channel="stdout",
+                        )
                     if parsed_result is None:
                         candidate = self._parse_backend_json("".join(stdout_lines))
                         if candidate is not None:
@@ -813,7 +1297,11 @@ class EngineStreamer:
                     stderr_lines.append(payload)
                     if live is not None:
                         live.stderr_lines.append(payload)
-                        self._handle_stderr_line(payload.rstrip("\r\n"), live)
+                        self._handle_runtime_line(
+                            payload.rstrip("\r\n"),
+                            live,
+                            channel="stderr",
+                        )
                 elif channel == "stdout_closed":
                     stdout_closed = True
                 elif channel == "stderr_closed":

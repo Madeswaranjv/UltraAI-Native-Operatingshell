@@ -3,10 +3,12 @@
 #include "Branch.h"
 #include "BranchEvictionPolicy.h"
 #include "BranchStore.h"
+#include "../memory/SnapshotPersistence.h"
 #include "../memory/SnapshotChain.h"
 #include "../memory/StateGraph.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -18,6 +20,10 @@ class BranchLifecycle {
  public:
   explicit BranchLifecycle(BranchStore& store);
   BranchLifecycle(BranchStore& store, ultra::memory::SnapshotChain& chain, ultra::memory::StateGraph& activeGraph);
+  BranchLifecycle(BranchStore& store,
+                  ultra::memory::SnapshotChain& chain,
+                  ultra::memory::StateGraph& activeGraph,
+                  ultra::memory::SnapshotPersistence& snapshotPersistence);
 
   /// Create a new root branch with no parent.
   Branch create(const std::string& goal);
@@ -51,10 +57,15 @@ class BranchLifecycle {
   void enforceActiveBranchCap(const std::string& protectedBranchId);
   void invalidateStaleSnapshotReferences();
   bool evictBranch(const std::string& branchId);
+  bool hasSnapshotReference(const std::string& snapshotId) const;
+  bool loadSnapshot(std::uint64_t snapshotId,
+                    ultra::memory::StateSnapshot& snapshot) const;
+  bool persistSnapshotChain() const;
 
   BranchStore& store_;
   ultra::memory::SnapshotChain* chain_{nullptr};
   ultra::memory::StateGraph* activeGraph_{nullptr};
+  ultra::memory::SnapshotPersistence* snapshotPersistence_{nullptr};
   std::unique_ptr<ultra::memory::SnapshotChain> ownedChain_;
   std::unique_ptr<ultra::memory::StateGraph> ownedGraph_;
   BranchEvictionPolicy evictionPolicy_;

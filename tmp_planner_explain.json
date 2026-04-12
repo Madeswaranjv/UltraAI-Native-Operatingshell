@@ -1,0 +1,16 @@
+{
+  "intent": {
+    "raw_prompt": "Explain how AudioEngine works",
+    "action": "explain",
+    "model_role": "planner",
+    "targets": ["AudioEngine"],
+    "requires_planning": true
+  },
+  "session": {
+    "project_root": "E:\\Projects\\UltraInfinity",
+    "governance": {},
+    "policy": {
+      "strategy_style": "fast"
+    }
+  }
+}

@@ -68,6 +68,12 @@ std::vector<ToolDefinition> defaultToolDefinitions() {
       "Deterministic impact summary for the requested target."});
 
   tools.push_back(ToolDefinition{
+      "simulate_intent",
+      "Simulate intent risk via 'ultra intent simulate ...'.",
+      {"goal"},
+      "Authority risk summary for the requested intent and target."});
+
+  tools.push_back(ToolDefinition{
       "get_context",
       "Fetch contextual graph summary via 'ultra ai_context <query>'.",
       {"query"},

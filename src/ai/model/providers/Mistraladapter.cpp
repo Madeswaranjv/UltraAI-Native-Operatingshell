@@ -118,8 +118,7 @@ bool MistralAdapter::initialize(const nlohmann::ordered_json& config,
 
   config_ = config.is_object() ? config : nlohmann::ordered_json::object();
   info_.providerName = "mistral";
-  info_.modelName =
-      config_.value("model", std::string{"mistral-large-latest"});
+  info_.modelName = defaultConfiguredModelName(config_, "mistral-large-latest");
   info_.supportsStreaming = true;
   info_.supportsToolCalls = true;
   info_.localProvider = false;
@@ -245,7 +244,7 @@ nlohmann::ordered_json MistralAdapter::buildProviderRequest(
   nlohmann::ordered_json payload = nlohmann::ordered_json::object();
   payload["context_payload"] = request.contextPayload;
   payload["messages"] = std::move(messages);
-  payload["model"] = info_.modelName;
+  payload["model"] = configuredModelNameForRequest(config_, request, info_.modelName);
   payload["safe_prompt"] = false;
   payload["temperature"] = request.temperature;
   payload["tools"] = std::move(toolPayload);

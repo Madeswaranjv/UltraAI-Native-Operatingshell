@@ -127,8 +127,7 @@ bool GeminiAdapter::initialize(const nlohmann::ordered_json& config,
 
   config_ = config.is_object() ? config : nlohmann::ordered_json::object();
   info_.providerName = "gemini";
-  info_.modelName =
-      config_.value("model", std::string{"gemini-2.0-flash"});
+  info_.modelName = defaultConfiguredModelName(config_, "gemini-2.0-flash");
   info_.supportsStreaming = true;
   info_.supportsToolCalls = true;
   info_.localProvider = false;
@@ -166,8 +165,10 @@ ModelResponse GeminiAdapter::generate(const ModelRequest& request) {
   const std::string baseUrl =
       config_.value("base_url",
                     std::string{"https://generativelanguage.googleapis.com"});
+  const std::string modelName =
+      configuredModelNameForRequest(config_, request, info_.modelName);
   // Gemini passes the key as a query parameter, not a header.
-  const std::string url = baseUrl + "/v1beta/models/" + info_.modelName +
+  const std::string url = baseUrl + "/v1beta/models/" + modelName +
                           ":generateContent?key=" + apiKey;
 
   const nlohmann::ordered_json payload = buildProviderRequest(request);

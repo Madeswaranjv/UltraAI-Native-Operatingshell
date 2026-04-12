@@ -10,13 +10,13 @@
 namespace ultra::runtime {
 
 struct SnapshotHeader {
-  std::uint32_t formatVersion{1U};
+  std::uint32_t formatVersion{2U};
   std::uint64_t snapshotVersion{0ULL};
 };
 
 class SnapshotSerializer {
  public:
-  static constexpr std::uint32_t kFormatVersion = 1U;
+  static constexpr std::uint32_t kFormatVersion = 2U;
 
   static bool save(const memory::StateSnapshot& snapshot,
                    const std::filesystem::path& path);
@@ -29,4 +29,3 @@ class SnapshotSerializer {
 };
 
 }  // namespace ultra::runtime
-

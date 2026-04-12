@@ -22,6 +22,16 @@ ACTION_KEYWORDS = {
     "optimise": ["optimise", "optimize", "speed up", "performance", "faster"],
 }
 
+ROLE_MAP = {
+    "add": "coder",
+    "fix": "coder",
+    "refactor": "coder",
+    "remove": "coder",
+    "test": "coder",
+    "analyse": "analyzer",
+    "optimise": "planner",
+}
+
 RISK_MAP = {
     "low":    ["explain", "analyse", "analyze", "describe", "what is", "show"],
     "high":   ["delete", "remove", "drop", "refactor", "restructure", "rewrite"],
@@ -38,10 +48,12 @@ class IntentPayload:
     constraints: List[str]              # extracted constraints ("don't break the API")
     risk_level: str                     # low | medium | high
     requires_planning: bool             # true for multi-step tasks
+    model_role: str = "auto"            # always auto for runtime routing
+    requested_role: Optional[str] = None  # classifier hint for UltraLoop / fallback
     context_hint: Optional[str] = None  # extra context to seed the graph query
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "raw_prompt": self.raw_prompt,
             "action": self.action,
             "targets": self.targets,
@@ -49,8 +61,12 @@ class IntentPayload:
             "constraints": self.constraints,
             "risk_level": self.risk_level,
             "requires_planning": self.requires_planning,
+            "model_role": self.model_role,
             "context_hint": self.context_hint,
         }
+        if self.requested_role:
+            payload["requested_role"] = self.requested_role
+        return payload
 
 
 class IntentParser:
@@ -79,6 +95,8 @@ class IntentParser:
             constraints=constraints,
             risk_level=risk,
             requires_planning=requires_planning,
+            model_role="auto",
+            requested_role=ROLE_MAP.get(action, "planner"),
             context_hint=targets[0] if targets else None,
         )
 

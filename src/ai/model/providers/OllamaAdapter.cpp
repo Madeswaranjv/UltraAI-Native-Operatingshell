@@ -127,7 +127,7 @@ bool OllamaAdapter::initialize(const nlohmann::ordered_json& config,
 
   config_ = config.is_object() ? config : nlohmann::ordered_json::object();
   info_.providerName = "ollama";
-  info_.modelName = config_.value("model", std::string{"llama3.2"});
+  info_.modelName = defaultConfiguredModelName(config_, "llama3.2");
   info_.supportsStreaming = true;
   info_.supportsToolCalls = true;
   info_.localProvider = true;
@@ -270,7 +270,7 @@ nlohmann::ordered_json OllamaAdapter::buildProviderRequest(
   }
 
   nlohmann::ordered_json payload = nlohmann::ordered_json::object();
-  payload["model"] = info_.modelName;
+  payload["model"] = configuredModelNameForRequest(config_, request, info_.modelName);
   payload["options"] = {{"num_predict", request.maxTokens},
                         {"temperature", request.temperature}};
   payload["prompt"] = request.prompt;

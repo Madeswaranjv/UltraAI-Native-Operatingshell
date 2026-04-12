@@ -15,7 +15,8 @@ std::size_t estimateSnapshotSizeBytes(const StateSnapshot& snapshot) {
   std::size_t total =
       sizeof(snapshot.id) + sizeof(snapshot.nodeCount) +
       sizeof(snapshot.edgeCount) + snapshot.snapshotId.size() +
-      snapshot.graphHash.size();
+      snapshot.graphHash.size() + sizeof(snapshot.createdAt) +
+      snapshot.branchId.size();
 
   for (const StateNode& node : snapshot.nodes) {
     total += sizeof(node.nodeType) + sizeof(node.version) + node.nodeId.size() +
@@ -280,6 +281,7 @@ StateSnapshot StateGraph::snapshot(const std::uint64_t snapshotId) const {
   StateSnapshot snapshot;
   snapshot.id = snapshotId;
   snapshot.snapshotId = std::to_string(snapshotId);
+  snapshot.createdAt = ultra::types::Timestamp::now();
   snapshot.nodeCount = nodes.size();
   snapshot.edgeCount = edges.size();
   snapshot.graphHash = computeHash(nodes, edges);

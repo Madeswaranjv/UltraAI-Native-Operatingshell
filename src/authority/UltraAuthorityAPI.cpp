@@ -6,9 +6,11 @@
 #include "RiskEvaluator.h"
 
 #include "../api/CognitiveKernelAPI.h"
+#include "../core/state_manager.h"
 #include "../intelligence/BranchLifecycle.h"
 #include "../intelligence/BranchPersistence.h"
 #include "../intelligence/BranchStore.h"
+#include "../memory/SnapshotPersistence.h"
 #include "../metrics/PerformanceMetrics.h"
 
 #include <algorithm>
@@ -102,7 +104,27 @@ std::string UltraAuthorityAPI::createBranch(
   intelligence::BranchPersistence persistence(projectRoot_ / ".ultra");
   (void)persistence.load(store);
 
-  intelligence::BranchLifecycle lifecycle(store);
+  core::StateManager stateManager(projectRoot_);
+  std::string loadError;
+  if (!stateManager.loadPersistedGraph(loadError)) {
+    throw std::runtime_error(
+        "Branch creation failed: unable to load current graph: " + loadError);
+  }
+
+  const runtime::GraphSnapshot runtimeSnapshot = stateManager.getSnapshot();
+  if (!runtimeSnapshot.graph) {
+    throw std::runtime_error(
+        "Branch creation failed: runtime graph is unavailable.");
+  }
+
+  memory::SnapshotPersistence snapshotPersistence(projectRoot_ / ".ultra" /
+                                                  "memory");
+  memory::SnapshotChain chain;
+  (void)snapshotPersistence.loadChain(chain);
+  memory::StateGraph activeGraph = *runtimeSnapshot.graph;
+
+  intelligence::BranchLifecycle lifecycle(store, chain, activeGraph,
+                                          snapshotPersistence);
   const intelligence::Branch created =
       request.parentBranchId.empty()
           ? lifecycle.create(request.reason)

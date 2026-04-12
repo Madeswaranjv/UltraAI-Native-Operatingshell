@@ -958,12 +958,24 @@ bool ToolRouter::is_excluded_directory(const std::filesystem::path& path) {
 std::optional<std::string> ToolRouter::build_command(
     const std::string& tool,
     const std::map<std::string, std::string>& args) const {
+  const auto wrap_with_cwd = [&args](std::string command)
+      -> std::optional<std::string> {
+    if (command.empty()) {
+      return std::nullopt;
+    }
+    if (const std::optional<std::string> cwd = find_argument(args, "cwd");
+        cwd.has_value()) {
+      return commandWithWorkingDirectory(std::filesystem::path(*cwd), command);
+    }
+    return command;
+  };
+
   if (tool == "query_symbol") {
     const auto target = find_argument(args, "target");
     if (!target.has_value()) {
       return std::nullopt;
     }
-    return "ultra ai_query " + quote_argument(*target);
+    return wrap_with_cwd("ultra ai_query " + quote_argument(*target));
   }
 
   if (tool == "read_source") {
@@ -971,7 +983,7 @@ std::optional<std::string> ToolRouter::build_command(
     if (!file.has_value()) {
       return std::nullopt;
     }
-    return "ultra ai_source " + quote_argument(*file);
+    return wrap_with_cwd("ultra ai_source " + quote_argument(*file));
   }
 
   if (tool == "impact_analysis") {
@@ -979,7 +991,29 @@ std::optional<std::string> ToolRouter::build_command(
     if (!target.has_value()) {
       return std::nullopt;
     }
-    return "ultra ai_impact " + quote_argument(*target);
+    return wrap_with_cwd("ultra ai_impact " + quote_argument(*target));
+  }
+
+  if (tool == "simulate_intent") {
+    const auto goal = find_argument(args, "goal");
+    if (!goal.has_value()) {
+      return std::nullopt;
+    }
+    std::string command = "ultra intent simulate " + quote_argument(*goal);
+    if (const auto target = find_argument(args, "target"); target.has_value()) {
+      command += " --target " + quote_argument(*target);
+    }
+    if (const auto budget = find_argument(args, "budget"); budget.has_value()) {
+      command += " --budget " + quote_argument(*budget);
+    }
+    if (const auto depth = find_argument(args, "depth"); depth.has_value()) {
+      command += " --depth " + quote_argument(*depth);
+    }
+    if (const auto threshold = find_argument(args, "threshold");
+        threshold.has_value()) {
+      command += " --threshold " + quote_argument(*threshold);
+    }
+    return wrap_with_cwd(std::move(command));
   }
 
   if (tool == "get_context") {
@@ -987,11 +1021,29 @@ std::optional<std::string> ToolRouter::build_command(
     if (!query.has_value()) {
       return std::nullopt;
     }
-    return "ultra ai_context " + quote_argument(*query);
+    return wrap_with_cwd("ultra ai_context " + quote_argument(*query));
+  }
+
+  if (tool == "query_context") {
+    const auto query = find_argument(args, "query");
+    if (!query.has_value()) {
+      return std::nullopt;
+    }
+    return wrap_with_cwd("ultra context --query " + quote_argument(*query));
+  }
+
+  if (tool == "ast_context") {
+    const std::string target =
+        find_argument(args, "path").value_or(std::string{"."});
+    return wrap_with_cwd("ultra context --ast " + quote_argument(target));
+  }
+
+  if (tool == "verify_index") {
+    return wrap_with_cwd("ultra ai_verify");
   }
 
   if (tool == "get_status") {
-    return std::string("ultra ai_status --verbose");
+    return wrap_with_cwd("ultra ai_status --verbose");
   }
 
   return std::nullopt;

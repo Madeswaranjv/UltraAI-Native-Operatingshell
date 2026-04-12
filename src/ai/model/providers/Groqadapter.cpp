@@ -119,8 +119,7 @@ bool GroqAdapter::initialize(const nlohmann::ordered_json& config,
   config_ = config.is_object() ? config : nlohmann::ordered_json::object();
   info_.providerName = "groq";
   // Default to llama-3.3-70b — Groq's fastest high-quality model.
-  info_.modelName =
-      config_.value("model", std::string{"llama-3.3-70b-versatile"});
+  info_.modelName = defaultConfiguredModelName(config_, "llama-3.3-70b-versatile");
   info_.supportsStreaming = true;
   info_.supportsToolCalls = true;
   info_.localProvider = false;
@@ -242,7 +241,7 @@ nlohmann::ordered_json GroqAdapter::buildProviderRequest(
   nlohmann::ordered_json payload = nlohmann::ordered_json::object();
   payload["context_payload"] = request.contextPayload;
   payload["messages"] = std::move(messages);
-  payload["model"] = info_.modelName;
+  payload["model"] = configuredModelNameForRequest(config_, request, info_.modelName);
   payload["temperature"] = request.temperature;
   payload["tools"] = std::move(toolPayload);
   if (request.maxTokens > 0U) {

@@ -116,6 +116,11 @@ nlohmann::ordered_json expandEnvTokens(const nlohmann::ordered_json& value) {
   return expanded;
 }
 
+void sortAndDedupe(std::vector<std::string>& values) {
+  std::sort(values.begin(), values.end());
+  values.erase(std::unique(values.begin(), values.end()), values.end());
+}
+
 }  // namespace
 
 ModelAdapterRegistry::ModelAdapterRegistry(std::filesystem::path projectRoot)
@@ -172,9 +177,25 @@ nlohmann::ordered_json ModelAdapterRegistry::providerConfiguration(
   return it.value();
 }
 
+std::vector<std::string> ModelAdapterRegistry::getRoleProviders(
+    const std::string& role) const {
+  const auto it = roleMap_.find(normalizeRoleName(role));
+  if (it == roleMap_.end()) {
+    return {};
+  }
+  return it->second;
+}
+
+std::string ModelAdapterRegistry::primaryProviderForRole(
+    const std::string& role) const {
+  const std::vector<std::string> providers = getRoleProviders(role);
+  return providers.empty() ? std::string{} : providers.front();
+}
+
 bool ModelAdapterRegistry::reloadConfiguration(std::string& error) {
   configuration_ = nlohmann::ordered_json::object();
   configuration_["providers"] = nlohmann::ordered_json::object();
+  roleMap_.clear();
 
   if (!std::filesystem::exists(configPath_)) {
     error.clear();
@@ -217,6 +238,37 @@ bool ModelAdapterRegistry::reloadConfiguration(std::string& error) {
   }
 
   configuration_ = sortJsonKeys(expandEnvTokens(parsed));
+  const nlohmann::ordered_json& providers = configuration_.at("providers");
+  for (auto providerIt = providers.begin(); providerIt != providers.end();
+       ++providerIt) {
+    if (!providerIt.value().is_object()) {
+      continue;
+    }
+
+    const std::string providerName = normalizeProviderName(providerIt.key());
+    const nlohmann::ordered_json& providerConfig = providerIt.value();
+    const nlohmann::ordered_json roleConfig =
+        providerConfig.contains("models") && providerConfig.at("models").is_object()
+            ? providerConfig.at("models")
+            : (providerConfig.contains("roles") &&
+                       providerConfig.at("roles").is_object()
+                   ? providerConfig.at("roles")
+                   : nlohmann::ordered_json::object());
+    for (auto roleIt = roleConfig.begin(); roleIt != roleConfig.end(); ++roleIt) {
+      if (!roleIt.value().is_string()) {
+        continue;
+      }
+      const std::string roleName = normalizeRoleName(roleIt.key());
+      if (roleName.empty()) {
+        continue;
+      }
+      roleMap_[roleName].push_back(providerName);
+    }
+  }
+  for (auto& [role, providersForRole] : roleMap_) {
+    (void)role;
+    sortAndDedupe(providersForRole);
+  }
   error.clear();
   return true;
 }
@@ -257,6 +309,10 @@ std::string ModelAdapterRegistry::normalizeProviderName(std::string value) {
                    return static_cast<char>(std::tolower(ch));
                  });
   return value;
+}
+
+std::string ModelAdapterRegistry::normalizeRoleName(std::string value) {
+  return normalizeProviderName(std::move(value));
 }
 
 void ModelAdapterRegistry::registerBuiltIns() {

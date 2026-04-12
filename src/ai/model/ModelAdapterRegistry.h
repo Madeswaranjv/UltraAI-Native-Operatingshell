@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ultra::ai::model {
@@ -27,6 +28,10 @@ class ModelAdapterRegistry {
   [[nodiscard]] const std::filesystem::path& configPath() const noexcept;
   [[nodiscard]] nlohmann::ordered_json providerConfiguration(
       const std::string& providerName) const;
+  [[nodiscard]] std::vector<std::string> getRoleProviders(
+      const std::string& role) const;
+  [[nodiscard]] std::string primaryProviderForRole(
+      const std::string& role) const;
 
   bool reloadConfiguration(std::string& error);
   [[nodiscard]] std::unique_ptr<IModelAdapter> create(
@@ -38,12 +43,14 @@ class ModelAdapterRegistry {
 
  private:
   static std::string normalizeProviderName(std::string value);
+  static std::string normalizeRoleName(std::string value);
   void registerBuiltIns();
 
   std::filesystem::path projectRoot_;
   std::filesystem::path configPath_;
   std::map<std::string, AdapterFactory> factories_;
   nlohmann::ordered_json configuration_ = nlohmann::ordered_json::object();
+  std::unordered_map<std::string, std::vector<std::string>> roleMap_;
 };
 
 }  // namespace ultra::ai::model

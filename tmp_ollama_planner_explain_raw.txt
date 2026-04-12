@@ -1,0 +1,28 @@
+```json
+{
+  "intent": "explain",
+  "steps": [
+    {
+      "tool": "query_symbol",
+      "args": {"symbol": "AudioEngine"},
+      "purpose": "Retrieve high-level information about the AudioEngine symbol."
+    },
+    {
+      "tool": "read_source",
+      "args": {"symbol": "AudioEngine"},
+      "purpose": "Examine the source code of AudioEngine to understand its implementation details."
+    },
+    {
+      "tool": "get_context",
+      "args": {"symbol": "AudioEngine"},
+      "purpose": "Identify the context and dependencies related to AudioEngine within the project."
+    },
+    {
+      "tool": "simulate_intent",
+      "args": {"intent": "explain", "target": "AudioEngine"},
+      "purpose": "Determine how AudioEngine behaves under different scenarios for explanatory purposes."
+    }
+  ],
+  "requires_code": false
+}
+```

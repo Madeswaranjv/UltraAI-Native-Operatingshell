@@ -24,6 +24,7 @@
 #include "../runtime/ContextExtractor.h"
 #include "../runtime/change_queue.h"
 #include "../runtime/cognitive/CognitiveRuntime.h"
+#include "../runtime/cognitive/MultiStageCognitivePipeline.h"
 #include "../runtime/governance/Policy.h"
 #include "../runtime/intent/IntentRuntime.h"
 #include "../runtime/precision_invalidation.h"
@@ -3733,6 +3734,10 @@ void CLIEngine::registerHandlers() {
           intentPayload.value("goal_summary", std::string{});
       const std::string intentRisk =
           intentPayload.value("risk_level", std::string{});
+      const std::string modelRole =
+          toLowerAscii(intentPayload.value("model_role", std::string{}));
+      const std::string requestedRole =
+          toLowerAscii(intentPayload.value("requested_role", modelRole));
       const bool requiresPlanning =
           parseJsonBool(intentPayload.value("requires_planning", nlohmann::json{}),
                         true);
@@ -3885,9 +3890,28 @@ void CLIEngine::registerHandlers() {
         return;
       }
 
-      ultra::runtime::CognitiveRuntime runtime(stateManager);
-      const ultra::runtime::CognitiveLoopResult loopResult =
-          runtime.run(resolvedIntent, policy);
+      ultra::runtime::CognitiveLoopResult loopResult;
+      if (modelRole == "auto") {
+        std::cout << "[ROUTING] Using CognitiveRuntime (UltraLoop)" << std::endl;
+        ultra::runtime::CognitiveRuntime runtime(stateManager);
+        loopResult = runtime.run(resolvedIntent, policy);
+      } else {
+        std::cout << "[ROUTING] Using MultiStagePipeline (fallback)" << std::endl;
+        ultra::runtime::cognitive::MultiStagePipelineRequest pipelineRequest;
+        pipelineRequest.rawPrompt = intentInput;
+        pipelineRequest.actionLabel = actionLabel;
+        pipelineRequest.requestedRole = requestedRole;
+        pipelineRequest.targets = targets;
+        pipelineRequest.constraints = constraints;
+        pipelineRequest.requiresPlanning = requiresPlanning;
+        pipelineRequest.autoCommit = autoCommit;
+        pipelineRequest.resolvedIntent = resolvedIntent;
+        pipelineRequest.policy = policy;
+
+        ultra::runtime::cognitive::MultiStageCognitivePipeline pipeline(
+            stateManager);
+        loopResult = pipeline.run(pipelineRequest);
+      }
 
       nlohmann::json response = nlohmann::json::object();
       response["status"] = loopResult.ok ? "ok" : "error";

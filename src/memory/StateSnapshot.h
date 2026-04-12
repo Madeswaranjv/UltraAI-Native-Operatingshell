@@ -2,6 +2,7 @@
 
 #include "StateNode.h"
 #include "StateEdge.h"
+#include "../types/Timestamp.h"
 
 #include <string>
 #include <vector>
@@ -15,6 +16,10 @@ struct StateSnapshot {
 
   // String ID for compatibility with existing tests
   std::string snapshotId;
+
+  // Snapshot metadata persisted alongside the graph payload
+  ultra::types::Timestamp createdAt;
+  std::string branchId;
 
   // Metadata
   std::size_t nodeCount{0};

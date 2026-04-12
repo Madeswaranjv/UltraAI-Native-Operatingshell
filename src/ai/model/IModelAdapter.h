@@ -6,6 +6,7 @@
 #include <external/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <functional>
 #include <string>
@@ -55,6 +56,67 @@ inline nlohmann::ordered_json toJson(const ModelInfo& info) {
 
 inline std::string providerSchemaToolName(std::string tool) {
   return tool;
+}
+
+inline std::string lowerAscii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char ch) {
+                   return static_cast<char>(std::tolower(ch));
+                 });
+  return value;
+}
+
+inline std::string modelRoleFromRequest(const ModelRequest& request) {
+  if (!request.contextPayload.is_object() ||
+      !request.contextPayload.contains("model_role") ||
+      !request.contextPayload.at("model_role").is_string()) {
+    return {};
+  }
+  return lowerAscii(request.contextPayload.at("model_role").get<std::string>());
+}
+
+inline nlohmann::ordered_json configuredModelRoles(
+    const nlohmann::ordered_json& config) {
+  if (config.is_object()) {
+    if (config.contains("models") && config.at("models").is_object()) {
+      return config.at("models");
+    }
+    if (config.contains("roles") && config.at("roles").is_object()) {
+      return config.at("roles");
+    }
+  }
+  return nlohmann::ordered_json::object();
+}
+
+inline std::string defaultConfiguredModelName(const nlohmann::ordered_json& config,
+                                              std::string fallback) {
+  if (config.is_object() && config.contains("model") &&
+      config.at("model").is_string()) {
+    return config.at("model").get<std::string>();
+  }
+
+  const nlohmann::ordered_json roles = configuredModelRoles(config);
+  if (roles.contains("default") && roles.at("default").is_string()) {
+    return roles.at("default").get<std::string>();
+  }
+  for (auto it = roles.begin(); it != roles.end(); ++it) {
+    if (it.value().is_string()) {
+      return it.value().get<std::string>();
+    }
+  }
+  return fallback;
+}
+
+inline std::string configuredModelNameForRequest(
+    const nlohmann::ordered_json& config,
+    const ModelRequest& request,
+    std::string fallback) {
+  const nlohmann::ordered_json roles = configuredModelRoles(config);
+  const std::string role = modelRoleFromRequest(request);
+  if (!role.empty() && roles.contains(role) && roles.at(role).is_string()) {
+    return roles.at(role).get<std::string>();
+  }
+  return defaultConfiguredModelName(config, std::move(fallback));
 }
 
 inline std::vector<std::string> providerSchemaToolNames(

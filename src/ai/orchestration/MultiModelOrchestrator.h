@@ -50,6 +50,7 @@ class MultiModelOrchestrator final : public IMultiModelOrchestrator {
       const std::vector<std::string>& availableProviders) const;
   [[nodiscard]] bool isLocalProvider(const std::string& providerName) const;
   [[nodiscard]] static std::string normalizeProviderName(std::string value);
+  [[nodiscard]] static std::string normalizeRoleName(std::string value);
 
   std::filesystem::path projectRoot_;
   std::filesystem::path configPath_;

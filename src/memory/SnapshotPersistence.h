@@ -16,7 +16,10 @@ class SnapshotPersistence {
   explicit SnapshotPersistence(const std::filesystem::path& baseDir);
 
   bool saveGraph(uint64_t snapshotId, const StateGraph& graph);
+  bool saveGraph(const StateSnapshot& snapshot);
   bool loadGraph(uint64_t snapshotId, StateGraph& graph) const;
+  bool loadSnapshot(uint64_t snapshotId, StateSnapshot& snapshotOut) const;
+  [[nodiscard]] bool hasGraph(uint64_t snapshotId) const;
 
   bool saveChain(const SnapshotChain& chain);
   bool loadChain(SnapshotChain& chain) const;
@@ -26,6 +29,8 @@ class SnapshotPersistence {
                         std::size_t maxChunks = 0U) const;
 
  private:
+  [[nodiscard]] std::filesystem::path graphPath(uint64_t snapshotId) const;
+
   std::filesystem::path baseDir_;
   std::filesystem::path objectsDir_;
   std::filesystem::path chainFile_;

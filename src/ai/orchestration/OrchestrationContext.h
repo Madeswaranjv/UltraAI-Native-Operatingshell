@@ -95,6 +95,7 @@ struct OrchestrationContext {
   TaskPriority priority{TaskPriority::Standard};
   std::uint64_t latencyBudgetMs{0U};
   std::size_t tokenBudget{0U};
+  std::string modelRoleHint;
   std::vector<std::string> availableModels;
 };
 
@@ -122,6 +123,7 @@ inline nlohmann::ordered_json toJson(const OrchestrationContext& context) {
   payload["available_models"] = std::move(models);
   payload["complexity"] = toString(context.complexity);
   payload["latency_budget_ms"] = context.latencyBudgetMs;
+  payload["model_role_hint"] = context.modelRoleHint;
   payload["priority"] = toString(context.priority);
   payload["task_type"] = toString(context.taskType);
   payload["token_budget"] = context.tokenBudget;

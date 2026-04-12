@@ -5,6 +5,9 @@
 #include "../intelligence/BranchLifecycle.h"
 #include "../intelligence/BranchPersistence.h"
 #include "../intelligence/BranchStore.h"
+#include "../memory/SnapshotChain.h"
+#include "../memory/SnapshotPersistence.h"
+#include "../memory/StateGraph.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -93,7 +96,18 @@ bool CommitCoordinator::commit(const AuthorityCommitRequest& request,
     return false;
   }
 
-  intelligence::BranchLifecycle lifecycle(store);
+  memory::SnapshotPersistence snapshotPersistence(projectRoot_ / ".ultra" /
+                                                  "memory");
+  memory::SnapshotChain chain;
+  (void)snapshotPersistence.loadChain(chain);
+  memory::StateGraph activeGraph;
+  if (!snapshotPersistence.loadGraph(targetSnapshotId, activeGraph)) {
+    error = "Commit rejected: target branch snapshot graph is unavailable.";
+    return false;
+  }
+
+  intelligence::BranchLifecycle lifecycle(store, chain, activeGraph,
+                                          snapshotPersistence);
   if (!lifecycle.merge(request.sourceBranchId, request.targetBranchId)) {
     error = "Commit rejected: BranchLifecycle::merge() failed.";
     return false;

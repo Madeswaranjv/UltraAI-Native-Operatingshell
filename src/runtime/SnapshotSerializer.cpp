@@ -86,6 +86,12 @@ bool SnapshotSerializer::save(const memory::StateSnapshot& snapshot,
     return false;
   }
 
+  const std::int64_t createdAtMs = snapshot.createdAt.epochMs();
+  if (!writePod(output, createdAtMs) ||
+      !writeString(output, snapshot.branchId)) {
+    return false;
+  }
+
   std::vector<memory::StateNode> nodes = snapshot.nodes;
   std::sort(nodes.begin(), nodes.end(), lessNodeById);
 
@@ -144,7 +150,7 @@ bool SnapshotSerializer::load(const std::filesystem::path& path,
       !readPod(input, header.snapshotVersion)) {
     return false;
   }
-  if (header.formatVersion != kFormatVersion) {
+  if (header.formatVersion == 0U || header.formatVersion > kFormatVersion) {
     return false;
   }
 
@@ -153,6 +159,15 @@ bool SnapshotSerializer::load(const std::filesystem::path& path,
   if (!readString(input, snapshotId) ||
       !readString(input, graphHash)) {
     return false;
+  }
+
+  std::int64_t createdAtMs = 0LL;
+  std::string branchId;
+  if (header.formatVersion >= 2U) {
+    if (!readPod(input, createdAtMs) ||
+        !readString(input, branchId)) {
+      return false;
+    }
   }
 
   std::uint64_t nodeCount = 0ULL;
@@ -223,6 +238,8 @@ bool SnapshotSerializer::load(const std::filesystem::path& path,
   snapshotOut.id = header.snapshotVersion;
   snapshotOut.snapshotId =
       snapshotId.empty() ? std::to_string(header.snapshotVersion) : snapshotId;
+  snapshotOut.createdAt = ultra::types::Timestamp::fromEpochMs(createdAtMs);
+  snapshotOut.branchId = std::move(branchId);
   snapshotOut.graphHash = std::move(graphHash);
   snapshotOut.nodes = std::move(nodes);
   snapshotOut.edges = std::move(edges);
@@ -260,4 +277,3 @@ bool SnapshotSerializer::readString(std::istream& input,
 }
 
 }  // namespace ultra::runtime
-

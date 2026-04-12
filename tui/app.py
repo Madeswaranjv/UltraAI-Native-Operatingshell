@@ -24,6 +24,7 @@ class UltraInfinityApp(App):
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit", show=False),
         Binding("ctrl+s", "toggle_mode", "Switch Mode", show=False),
+        Binding("ctrl+v", "toggle_verbose", "Verbose", show=False),
         Binding("escape", "cancel", "Cancel", show=False),
     ]
 
@@ -44,6 +45,7 @@ class UltraInfinityApp(App):
         self._active_worker = None
         self.state_manager.add_listener(self._on_state_changed)
         self._on_state_changed(self.state_manager.current_state)
+        self.output_panel.set_verbose(self.state_manager.verbose_stream)
 
         # Start in session setup — hide output, show setup panel
         self.query_one("#main-output").display = False
@@ -144,6 +146,13 @@ class UltraInfinityApp(App):
             else:
                 self.output_panel.add_system_message("Task cancelled.")
                 self.state_manager.set_state(AppState.IDLE)
+
+    def action_toggle_verbose(self) -> None:
+        enabled = not self.state_manager.verbose_stream
+        self.state_manager.set_verbose_stream(enabled)
+        self.output_panel.set_verbose(enabled)
+        label = "enabled" if enabled else "disabled"
+        self.output_panel.add_system_message(f"Verbose cognitive logs {label}.")
 
 
 if __name__ == "__main__":
