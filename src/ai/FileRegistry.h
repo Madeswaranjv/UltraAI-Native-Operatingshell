@@ -48,6 +48,12 @@ class FileRegistry {
   static std::vector<DiscoveredFile> discoverProjectFiles(
       const std::filesystem::path& projectRoot);
 
+  static bool shouldIgnoreDirectory(const std::filesystem::path& path);
+
+  static bool shouldIgnoreFile(const std::filesystem::path& path);
+
+  static bool isSupportedSourceFile(const std::filesystem::path& path);
+
   static std::vector<FileRecord> deriveRecords(
       const std::vector<DiscoveredFile>& discoveredFiles);
 

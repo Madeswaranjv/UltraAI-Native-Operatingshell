@@ -1,5 +1,6 @@
 #include "ToolRouter.h"
 
+#include "../../../ai/FileRegistry.h"
 #include "../../../core/Logger.h"
 #include "../../../platform/UnixProcessExecutor.h"
 #include "../../../platform/WindowsProcessExecutor.h"
@@ -508,20 +509,23 @@ std::string ToolRouter::execute_list_dir(
     std::filesystem::recursive_directory_iterator end;
     while (!ec && it != end) {
       const std::filesystem::path entryPath = it->path();
-      if (it->is_directory(ec) && is_excluded_directory(entryPath)) {
+      std::error_code relError;
+      const std::filesystem::path relative =
+          std::filesystem::relative(entryPath, root, relError);
+      const std::filesystem::path policyPath =
+          relError ? entryPath.filename() : relative;
+
+      if (it->is_directory(ec) && is_excluded_directory(policyPath)) {
         it.disable_recursion_pending();
         ++it;
         continue;
       }
-      if (is_excluded_directory(entryPath)) {
+      if (is_excluded_directory(policyPath)) {
         ++it;
         continue;
       }
 
       nlohmann::ordered_json item;
-      std::error_code relError;
-      const std::filesystem::path relative =
-          std::filesystem::relative(entryPath, root, relError);
       item["name"] = relError ? entryPath.generic_string() : relative.generic_string();
       item["type"] = it->is_directory(ec) ? "dir" : "file";
       item["size_bytes"] =
@@ -534,7 +538,7 @@ std::string ToolRouter::execute_list_dir(
       if (ec) {
         break;
       }
-      if (is_excluded_directory(entry.path())) {
+      if (is_excluded_directory(entry.path().filename())) {
         continue;
       }
       nlohmann::ordered_json item;
@@ -598,12 +602,18 @@ std::string ToolRouter::execute_search_files(
   while (!ec && it != end && totalMatches < kMaxSearchMatches) {
     const auto& entry = *it;
     const std::filesystem::path entryPath = entry.path();
-    if (entry.is_directory(ec) && is_excluded_directory(entryPath)) {
+    std::error_code relError;
+    const std::filesystem::path relative =
+        std::filesystem::relative(entryPath, root, relError);
+    const std::filesystem::path policyPath =
+        relError ? entryPath.filename() : relative;
+
+    if (entry.is_directory(ec) && is_excluded_directory(policyPath)) {
       it.disable_recursion_pending();
       ++it;
       continue;
     }
-    if (!entry.is_regular_file(ec) || is_excluded_directory(entryPath)) {
+    if (!entry.is_regular_file(ec) || is_excluded_directory(policyPath)) {
       ++it;
       continue;
     }
@@ -624,9 +634,6 @@ std::string ToolRouter::execute_search_files(
       }
 
       nlohmann::ordered_json match;
-      std::error_code relError;
-      const std::filesystem::path relative =
-          std::filesystem::relative(entryPath, root, relError);
       match["file"] = relError ? entryPath.generic_string() : relative.generic_string();
       match["line"] = lineNumber;
       match["content"] = line;
@@ -937,22 +944,7 @@ std::string ToolRouter::limit_output(std::string text,
 }
 
 bool ToolRouter::is_excluded_directory(const std::filesystem::path& path) {
-  static const std::vector<std::string> kExcluded = {
-      ".ultra",
-      ".ultra_daemon",
-      ".git",
-      "node_modules",
-      "__pycache__",
-      "build",
-  };
-
-  for (const auto& part : path) {
-    const std::string name = lowerAscii(part.generic_string());
-    if (std::find(kExcluded.begin(), kExcluded.end(), name) != kExcluded.end()) {
-      return true;
-    }
-  }
-  return false;
+  return ultra::ai::FileRegistry::shouldIgnoreDirectory(path);
 }
 
 std::optional<std::string> ToolRouter::build_command(

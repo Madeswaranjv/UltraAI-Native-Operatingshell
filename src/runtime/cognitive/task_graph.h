@@ -55,6 +55,7 @@ struct TaskGraphSnapshot {
 struct TaskGraphRepairMetadata {
   std::string overlayId;
   std::vector<std::string> affectedNodes;
+  std::vector<std::string> repairNodes;
   bool verified{false};
 };
 
@@ -117,6 +118,7 @@ class TaskGraph {
                                            const std::string& to) const;
   [[nodiscard]] bool has_path(const std::string& from,
                               const std::string& to) const;
+  void rebuild_adjacency();
   void refresh_ready_states();
 
   std::map<std::string, TaskNode> nodes_;

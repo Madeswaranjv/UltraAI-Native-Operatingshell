@@ -43,6 +43,9 @@ class Scanner {
 
   [[nodiscard]] std::size_t countFiles() const;
 
+  bool fullScanParallel(const std::vector<ai::DiscoveredFile>& discoveredFiles,
+                        ScanOutput& output,
+                        std::string& error) const;
   bool fullScanParallel(ScanOutput& output, std::string& error) const;
   bool incrementalAdd(ai::RuntimeState& state,
                       const std::string& path,

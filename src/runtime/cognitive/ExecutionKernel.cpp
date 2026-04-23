@@ -1307,6 +1307,11 @@ ai::model::ModelRequest buildModelRequestForStrategyAction(
     const intent::Action& strategyAction,
     const CognitiveState& state) {
   ai::model::ModelRequest request;
+  const std::string defaultRole =
+      taskTypeForStrategyAction(strategyAction) ==
+              ai::orchestration::TaskType::Coding
+          ? "coder"
+          : "analyzer";
   request.systemPrompt =
       "You are UltraInfinity deterministic execution. Return only real "
       "filesystem tool calls. Do not simulate, explain, or describe edits.";
@@ -1342,17 +1347,10 @@ ai::model::ModelRequest buildModelRequestForStrategyAction(
       {"estimated_files_changed", strategyAction.estimatedFilesChanged},
       {"estimated_dependency_depth", strategyAction.estimatedDependencyDepth},
       {"branch", state.snapshot.branch.toString()},
-      {"model_role",
-       taskTypeForStrategyAction(strategyAction) ==
-               ai::orchestration::TaskType::Coding
-           ? "coder"
-           : "analyzer"},
+      {"model_role", defaultRole},
+      {"requested_role", defaultRole},
       {"snapshot_version", state.snapshot.version},
-      {"stage",
-       taskTypeForStrategyAction(strategyAction) ==
-               ai::orchestration::TaskType::Coding
-           ? "coder"
-           : "analyzer"},
+      {"stage", defaultRole},
       {"tool_required", "apply_patch"},
   };
   return request;
@@ -1426,7 +1424,773 @@ ai::orchestration::OrchestrationContext buildOrchestrationContext(
   return context;
 }
 
+std::string canonicalRoleName(std::string value) {
+  value = lowerAscii(trimAscii(std::move(value)));
+  if (value.empty() || value == "auto") {
+    return {};
+  }
+  if (value == "plan" || value == "planner" || value == "planning") {
+    return "planner";
+  }
+  if (value == "verify" || value == "verifier" || value == "verification" ||
+      value == "validate" || value == "validation") {
+    return "verifier";
+  }
+  if (value == "code" || value == "coder" || value == "coding" ||
+      value == "implement" || value == "implementation") {
+    return "coder";
+  }
+  if (value == "analysis" || value == "analyzer" || value == "analyse" ||
+      value == "analyze" || value == "understand" || value == "explain") {
+    return "analyzer";
+  }
+  return {};
+}
+
+std::string defaultRoleForTaskType(
+    const ai::orchestration::TaskType taskType) {
+  switch (taskType) {
+    case ai::orchestration::TaskType::Planning:
+      return "planner";
+    case ai::orchestration::TaskType::Coding:
+      return "coder";
+    case ai::orchestration::TaskType::Analysis:
+      return "analyzer";
+    case ai::orchestration::TaskType::Reasoning:
+      return {};
+  }
+  return {};
+}
+
+std::string payloadStringValue(const nlohmann::ordered_json& payload,
+                               const char* key) {
+  if (!payload.is_object() || !payload.contains(key) ||
+      !payload.at(key).is_string()) {
+    return {};
+  }
+  return trimAscii(payload.at(key).get<std::string>());
+}
+
+bool payloadContainsKey(const nlohmann::ordered_json& payload, const char* key) {
+  return payload.is_object() && payload.contains(key);
+}
+
+bool looksLikeSourceTarget(const std::string& value) {
+  const std::string trimmed = trimAscii(value);
+  if (trimmed.empty()) {
+    return false;
+  }
+  if (trimmed.find('/') != std::string::npos ||
+      trimmed.find('\\') != std::string::npos) {
+    return true;
+  }
+
+  const std::string extension =
+      lowerAscii(std::filesystem::path(trimmed).extension().string());
+  return extension == ".c" || extension == ".cc" || extension == ".cpp" ||
+         extension == ".cxx" || extension == ".h" || extension == ".hh" ||
+         extension == ".hpp" || extension == ".ipp" || extension == ".inl" ||
+         extension == ".py" || extension == ".js" || extension == ".ts" ||
+         extension == ".tsx" || extension == ".json" || extension == ".cmake";
+}
+
+bool containsAnyKeyword(const std::string& text,
+                        const std::initializer_list<std::string_view> keywords) {
+  for (const std::string_view keyword : keywords) {
+    if (text.find(keyword) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool hasToolAvailable(const ai::model::ModelRequest& request,
+                      const std::string_view toolName) {
+  return std::any_of(request.toolsAvailable.begin(),
+                     request.toolsAvailable.end(),
+                     [&](const std::string& tool) {
+                       return lowerAscii(trimAscii(tool)) == toolName;
+                     });
+}
+
+std::string buildRoutingSignalText(const Action& action,
+                                   const ai::model::ModelRequest& request) {
+  std::ostringstream stream;
+  stream << action.id << '\n' << action.target << '\n' << request.prompt << '\n'
+         << request.systemPrompt;
+
+  if (!request.contextPayload.is_object()) {
+    return lowerAscii(stream.str());
+  }
+
+  const auto& payload = request.contextPayload;
+  const char* const keys[] = {
+      "action_kind",    "coder_message", "details",        "error",
+      "failure_reason", "failure_type",  "model_role",     "original_task",
+      "requested_role", "stage",         "target",         "task_id",
+      "tool_required",
+  };
+  for (const char* key : keys) {
+    const std::string value = payloadStringValue(payload, key);
+    if (!value.empty()) {
+      stream << '\n' << value;
+    }
+  }
+
+  if (payloadContainsKey(payload, "apply_patch_retry")) {
+    stream << '\n' << payload.at("apply_patch_retry").dump();
+  }
+  if (payloadContainsKey(payload, "coder_payload")) {
+    stream << '\n' << payload.at("coder_payload").dump();
+  }
+  if (payloadContainsKey(payload, "intent")) {
+    stream << '\n' << payload.at("intent").dump();
+  }
+  if (payloadContainsKey(payload, "resolved_intent")) {
+    stream << '\n' << payload.at("resolved_intent").dump();
+  }
+
+  return lowerAscii(stream.str());
+}
+
+bool hasSourceCodeSignal(const Action& action,
+                         const ai::model::ModelRequest& request) {
+  if (!request.contextPayload.is_object()) {
+    return looksLikeSourceTarget(action.target) ||
+           request.prompt.find("```") != std::string::npos;
+  }
+
+  const auto& payload = request.contextPayload;
+  if (looksLikeSourceTarget(action.target) ||
+      looksLikeSourceTarget(payloadStringValue(payload, "target")) ||
+      looksLikeSourceTarget(payloadStringValue(payload, "source_file")) ||
+      looksLikeSourceTarget(payloadStringValue(payload, "file")) ||
+      payloadContainsKey(payload, "file_targets") ||
+      payloadContainsKey(payload, "source_file") ||
+      hasToolAvailable(request, "apply_patch")) {
+    return true;
+  }
+
+  const std::string prompt = lowerAscii(request.prompt);
+  return prompt.find("```") != std::string::npos ||
+         prompt.find("#include") != std::string::npos ||
+         prompt.find("class ") != std::string::npos ||
+         prompt.find("struct ") != std::string::npos ||
+         prompt.find("namespace ") != std::string::npos;
+}
+
+struct RoleRoutingDecision {
+  std::string taskId;
+  std::string stage;
+  std::string requestedRole;
+  std::string resolvedRole;
+};
+
+RoleRoutingDecision resolveModelRole(
+    const Action& action,
+    const ai::model::ModelRequest& request,
+    const ai::orchestration::OrchestrationContext& context) {
+  const nlohmann::ordered_json payload =
+      request.contextPayload.is_object() ? request.contextPayload
+                                         : nlohmann::ordered_json::object();
+  const std::string requestedRole =
+      canonicalRoleName(payloadStringValue(payload, "requested_role"));
+  const std::string modelRoleHint = [&]() {
+    const std::string payloadRole =
+        canonicalRoleName(payloadStringValue(payload, "model_role"));
+    if (!payloadRole.empty()) {
+      return payloadRole;
+    }
+    return canonicalRoleName(context.modelRoleHint);
+  }();
+  const std::string stage = [&]() {
+    const std::string payloadStage = trimAscii(payloadStringValue(payload, "stage"));
+    if (!payloadStage.empty()) {
+      return payloadStage;
+    }
+    return ai::orchestration::toString(context.taskType);
+  }();
+  const std::string taskId = [&]() {
+    const std::string payloadTaskId =
+        trimAscii(payloadStringValue(payload, "task_id"));
+    if (!payloadTaskId.empty()) {
+      return payloadTaskId;
+    }
+    return action.id;
+  }();
+  const std::string stageRole = canonicalRoleName(stage);
+
+  RoleRoutingDecision decision;
+  decision.taskId = taskId;
+  decision.stage = stage;
+  decision.requestedRole = requestedRole;
+
+  const bool repairTaskLocked =
+      payloadContainsKey(payload, "repair_task") &&
+      payload.at("repair_task").is_boolean() &&
+      payload.at("repair_task").get<bool>();
+  if (repairTaskLocked) {
+    if (!requestedRole.empty()) {
+      decision.resolvedRole = requestedRole;
+      return decision;
+    }
+    if (!modelRoleHint.empty()) {
+      decision.resolvedRole = modelRoleHint;
+      return decision;
+    }
+  }
+
+  if (stageRole == "planner" || stageRole == "verifier") {
+    decision.resolvedRole = stageRole;
+    return decision;
+  }
+
+  struct RoleScores {
+    int planner{0};
+    int analyzer{0};
+    int coder{0};
+    int verifier{0};
+  } scores;
+  const auto addScore = [&](const std::string& role, const int value) {
+    if (role == "planner") {
+      scores.planner += value;
+    } else if (role == "analyzer") {
+      scores.analyzer += value;
+    } else if (role == "coder") {
+      scores.coder += value;
+    } else if (role == "verifier") {
+      scores.verifier += value;
+    }
+  };
+  const auto scoreForRole = [&](const std::string& role) {
+    if (role == "planner") {
+      return scores.planner;
+    }
+    if (role == "analyzer") {
+      return scores.analyzer;
+    }
+    if (role == "coder") {
+      return scores.coder;
+    }
+    if (role == "verifier") {
+      return scores.verifier;
+    }
+    return 0;
+  };
+
+  if (!stageRole.empty()) {
+    addScore(stageRole, 2);
+  }
+  if (!modelRoleHint.empty()) {
+    addScore(modelRoleHint, 1);
+  }
+
+  const std::string signalText = buildRoutingSignalText(action, request);
+  const bool patchGenerationRequested =
+      lowerAscii(payloadStringValue(payload, "tool_required")) == "apply_patch" ||
+      hasToolAvailable(request, "apply_patch");
+  const bool patchRetrySignal = payloadContainsKey(payload, "apply_patch_retry");
+  const bool compileFailureSignal =
+      containsAnyKeyword(signalText,
+                         {"compile error", "compiler error", "build failed",
+                          "build error", "compilation failed",
+                          "failed to compile", "linker error", "link error",
+                          "undefined reference", "undefined symbol",
+                          "syntax error"});
+  const bool logicFailureSignal =
+      containsAnyKeyword(signalText,
+                         {"logic failure", "logic bug", "wrong result",
+                          "incorrect result", "unexpected result", "mismatch",
+                          "regression", "root cause", "assertion failed"});
+  const bool sourceCodeSignal = hasSourceCodeSignal(action, request);
+
+  if (patchGenerationRequested) {
+    scores.coder += 6;
+  }
+  if (patchRetrySignal) {
+    scores.coder += 7;
+  }
+  if (compileFailureSignal) {
+    scores.coder += 5;
+  }
+  if (logicFailureSignal) {
+    scores.analyzer += patchGenerationRequested ? 2 : 5;
+  }
+  if (sourceCodeSignal) {
+    scores.coder += 2;
+    scores.analyzer += 1;
+  }
+
+  if (containsAnyKeyword(signalText,
+                         {"plan ", "planner", "planning", "strategy",
+                          "roadmap", "step-by-step", "outline", "design"})) {
+    scores.planner += 4;
+  }
+  if (containsAnyKeyword(signalText,
+                         {"verify", "verification", "verifier", "validate",
+                          "validation", "confirm", "pass/fail"})) {
+    scores.verifier += 4;
+  }
+  if (containsAnyKeyword(signalText,
+                         {"modify", "write", "implement", "fix", "patch",
+                          "edit", "refactor", "rename", "add ", "remove",
+                          "update", "change "})) {
+    scores.coder += 4;
+  }
+  if (containsAnyKeyword(signalText,
+                         {"analyse", "analyze", "analysis", "explain",
+                          "understand", "investigate", "inspect",
+                          "summarize", "summary", "why "})) {
+    scores.analyzer += 4;
+  }
+
+  const std::string loweredTaskId = lowerAscii(taskId);
+  if (containsAnyKeyword(loweredTaskId, {"planner", "plan"})) {
+    scores.planner += 3;
+  }
+  if (containsAnyKeyword(loweredTaskId, {"verifier", "verify"})) {
+    scores.verifier += 3;
+  }
+  if (containsAnyKeyword(loweredTaskId, {"coder", "patch", "edit", "refactor"})) {
+    scores.coder += 3;
+  }
+  if (containsAnyKeyword(loweredTaskId,
+                         {"analyzer", "analysis", "analyse", "analyze",
+                          "explain"})) {
+    scores.analyzer += 3;
+  }
+
+  const int maxScore = std::max({scores.planner, scores.analyzer, scores.coder,
+                                 scores.verifier});
+  if (maxScore > 0) {
+    if (!stageRole.empty() && scoreForRole(stageRole) == maxScore) {
+      decision.resolvedRole = stageRole;
+    } else if (!modelRoleHint.empty() &&
+               scoreForRole(modelRoleHint) == maxScore) {
+      decision.resolvedRole = modelRoleHint;
+    } else if (scores.verifier == maxScore) {
+      decision.resolvedRole = "verifier";
+    } else if (scores.coder == maxScore) {
+      decision.resolvedRole = "coder";
+    } else if (scores.analyzer == maxScore) {
+      decision.resolvedRole = "analyzer";
+    } else if (scores.planner == maxScore) {
+      decision.resolvedRole = "planner";
+    }
+  }
+
+  if (decision.resolvedRole.empty()) {
+    decision.resolvedRole = requestedRole;
+  }
+  if (decision.resolvedRole.empty()) {
+    decision.resolvedRole = modelRoleHint;
+  }
+  if (decision.resolvedRole.empty()) {
+    decision.resolvedRole = defaultRoleForTaskType(context.taskType);
+  }
+  if (decision.resolvedRole.empty()) {
+    decision.resolvedRole = "analyzer";
+  }
+  return decision;
+}
+
+ai::orchestration::OrchestrationContext withResolvedRole(
+    ai::orchestration::OrchestrationContext context,
+    const std::string& resolvedRole) {
+  if (!resolvedRole.empty()) {
+    context.modelRoleHint = resolvedRole;
+  }
+  return context;
+}
+
+bool endsWithRepairSuffix(const std::string_view value) {
+  constexpr std::string_view kRepairSuffix = "_repair";
+  return value.size() >= kRepairSuffix.size() &&
+         value.substr(value.size() - kRepairSuffix.size()) == kRepairSuffix;
+}
+
+std::string repairTaskIdFor(const std::string& originalTaskId) {
+  if (originalTaskId.empty() || endsWithRepairSuffix(originalTaskId)) {
+    return originalTaskId;
+  }
+  return originalTaskId + "_repair";
+}
+
+std::mutex& failureIntelligenceMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::map<std::string, FailureIntelligence>& failureIntelligenceStore() {
+  static std::map<std::string, FailureIntelligence> store;
+  return store;
+}
+
+void appendFailureText(std::string& block, const std::string& value) {
+  const std::string trimmed = trimAscii(value);
+  if (trimmed.empty()) {
+    return;
+  }
+  if (!block.empty()) {
+    block += '\n';
+  }
+  block += trimmed;
+}
+
+void appendFailureJsonString(std::string& block,
+                             const nlohmann::ordered_json& payload,
+                             const char* key) {
+  const std::string value = payloadStringValue(payload, key);
+  if (!value.empty()) {
+    appendFailureText(block, value);
+  }
+}
+
+void appendFailureToolResultText(std::string& block,
+                                 const nlohmann::ordered_json& value) {
+  if (!value.is_object()) {
+    return;
+  }
+
+  appendFailureJsonString(block, value, "message");
+  appendFailureJsonString(block, value, "text_output");
+  appendFailureJsonString(block, value, "tool");
+  if (value.contains("payload") && value.at("payload").is_object()) {
+    const auto& payload = value.at("payload");
+    appendFailureJsonString(block, payload, "error");
+    appendFailureJsonString(block, payload, "message");
+    appendFailureJsonString(block, payload, "output");
+  }
+}
+
+std::string extractPreviousOutput(const Result& result) {
+  if (!trimAscii(result.text_output).empty()) {
+    return trimAscii(result.text_output);
+  }
+  if (!result.payload.is_object()) {
+    return {};
+  }
+  if (const std::string modelOutput =
+          payloadStringValue(result.payload, "model_text_output");
+      !modelOutput.empty()) {
+    return modelOutput;
+  }
+  if (result.payload.contains("response") && result.payload.at("response").is_object()) {
+    if (const std::string responseOutput =
+            payloadStringValue(result.payload.at("response"), "text_output");
+        !responseOutput.empty()) {
+      return responseOutput;
+    }
+  }
+  return {};
+}
+
+std::string collectFailureText(const Result& result) {
+  std::string block;
+  appendFailureText(block, result.message);
+  appendFailureText(block, result.text_output);
+  appendFailureText(block, extractPreviousOutput(result));
+
+  if (!result.payload.is_object()) {
+    return block;
+  }
+
+  appendFailureJsonString(block, result.payload, "error");
+  appendFailureJsonString(block, result.payload, "output");
+  appendFailureJsonString(block, result.payload, "tool");
+  appendFailureJsonString(block, result.payload, "tool_execution_summary");
+  appendFailureJsonString(block, result.payload, "model_text_output");
+
+  if (result.payload.contains("tool_execution") &&
+      result.payload.at("tool_execution").is_object()) {
+    const auto& toolExecution = result.payload.at("tool_execution");
+    appendFailureJsonString(block, toolExecution, "tool");
+    appendFailureJsonString(block, toolExecution, "error");
+    appendFailureJsonString(block, toolExecution, "output");
+  }
+
+  if (result.payload.contains("response") && result.payload.at("response").is_object()) {
+    const auto& response = result.payload.at("response");
+    appendFailureJsonString(block, response, "error_message");
+    appendFailureJsonString(block, response, "finish_reason");
+    appendFailureJsonString(block, response, "text_output");
+  }
+
+  if (result.payload.contains("tool_results") &&
+      result.payload.at("tool_results").is_array()) {
+    for (const auto& toolResult : result.payload.at("tool_results")) {
+      appendFailureToolResultText(block, toolResult);
+    }
+  }
+
+  return block;
+}
+
+bool hasNonZeroExitCode(const nlohmann::ordered_json& value) {
+  if (value.is_object()) {
+    for (auto it = value.begin(); it != value.end(); ++it) {
+      const std::string key = lowerAscii(it.key());
+      if ((key.find("exit_code") != std::string::npos || key == "returncode" ||
+           key == "status_code") &&
+          it.value().is_number()) {
+        const double exitCode = it.value().get<double>();
+        if (exitCode != 0.0) {
+          return true;
+        }
+      }
+      if (hasNonZeroExitCode(it.value())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (!value.is_array()) {
+    return false;
+  }
+
+  for (const auto& item : value) {
+    if (hasNonZeroExitCode(item)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool hasCompileFailureSignal(const Result& result, const std::string& loweredText) {
+  if (containsAnyKeyword(loweredText,
+                         {"compile error", "compiler error", "build failed",
+                          "build error", "compilation failed",
+                          "failed to compile", "linker error", "link error",
+                          "undefined reference", "undefined symbol",
+                          "syntax error", "fatal error", "ninja: build stopped",
+                          "ld returned"})) {
+    return true;
+  }
+
+  if (!result.payload.is_object()) {
+    return false;
+  }
+
+  if (result.payload.contains("output_json") && result.payload.at("output_json").is_object()) {
+    const auto& outputJson = result.payload.at("output_json");
+    if ((outputJson.contains("build_exit_code") &&
+         outputJson.at("build_exit_code").is_number() &&
+         outputJson.at("build_exit_code").get<double>() != 0.0) ||
+        (outputJson.contains("compile_exit_code") &&
+         outputJson.at("compile_exit_code").is_number() &&
+         outputJson.at("compile_exit_code").get<double>() != 0.0)) {
+      return true;
+    }
+  }
+
+  return hasNonZeroExitCode(result.payload) &&
+         containsAnyKeyword(loweredText,
+                            {"build", "compile", "compiler", "link", "cmake",
+                             "ninja", "make", "msbuild"});
+}
+
+bool hasVerificationFailureSignal(const Result& result,
+                                  const std::string& loweredText) {
+  if (containsAnyKeyword(loweredText,
+                         {"test fail", "tests fail", "failed tests",
+                          "failing test", "ctest", "ai_verify",
+                          "verification failed", "verify failed",
+                          "verification mismatch", "assertion failed"})) {
+    return true;
+  }
+
+  if (!result.payload.is_object()) {
+    return false;
+  }
+
+  if (result.payload.contains("output_json") && result.payload.at("output_json").is_object()) {
+    const auto& outputJson = result.payload.at("output_json");
+    if ((outputJson.contains("test_exit_code") &&
+         outputJson.at("test_exit_code").is_number() &&
+         outputJson.at("test_exit_code").get<double>() != 0.0) ||
+        (outputJson.contains("verify_exit_code") &&
+         outputJson.at("verify_exit_code").is_number() &&
+         outputJson.at("verify_exit_code").get<double>() != 0.0)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool hasToolFailureSignal(const Result& result, const std::string& loweredText) {
+  if (loweredText.find("no executable tool calls") != std::string::npos) {
+    return false;
+  }
+
+  if (result.type == ActionType::ToolExecution) {
+    return true;
+  }
+
+  if (containsAnyKeyword(loweredText,
+                         {"apply_patch", "tool execution", "tool router",
+                          "not registered", "exit code"})) {
+    return true;
+  }
+
+  if (!result.payload.is_object()) {
+    return false;
+  }
+
+  return payloadContainsKey(result.payload, "tool") ||
+         payloadContainsKey(result.payload, "tool_execution") ||
+         payloadContainsKey(result.payload, "tool_results") ||
+         hasNonZeroExitCode(result.payload);
+}
+
+bool hasLogicFailureSignal(const Result& result, const std::string& loweredText) {
+  if (containsAnyKeyword(loweredText,
+                         {"logic failure", "logic bug", "wrong result",
+                          "incorrect result", "unexpected result", "mismatch",
+                          "contradict", "contradiction", "regression",
+                          "inconsistent", "failed expected", "empty output",
+                          "no executable tool calls"})) {
+    return true;
+  }
+
+  if (result.type != ActionType::ModelGenerate) {
+    return false;
+  }
+
+  const bool hasAnyToolResults =
+      result.payload.is_object() && payloadContainsKey(result.payload, "tool_results");
+  return trimAscii(extractPreviousOutput(result)).empty() && !hasAnyToolResults;
+}
+
+std::string actionSourceFileHint(const Action& action) {
+  if (!action.modelRequest.has_value() ||
+      !action.modelRequest->contextPayload.is_object()) {
+    return looksLikeSourceTarget(action.target) ? action.target : std::string{};
+  }
+
+  const auto& payload = action.modelRequest->contextPayload;
+  if (const std::string sourceFile = payloadStringValue(payload, "source_file");
+      !sourceFile.empty()) {
+    return sourceFile;
+  }
+  if (const std::string file = payloadStringValue(payload, "file"); !file.empty()) {
+    return file;
+  }
+  if (looksLikeSourceTarget(action.target)) {
+    return action.target;
+  }
+  return {};
+}
+
+std::string actionOriginalTaskId(const Action& action) {
+  if (action.modelRequest.has_value() &&
+      action.modelRequest->contextPayload.is_object()) {
+    if (const std::string originalTask =
+            payloadStringValue(action.modelRequest->contextPayload, "original_task");
+        !originalTask.empty()) {
+      return originalTask;
+    }
+  }
+  return action.id;
+}
+
+void clearFailureIntelligence(const std::string& taskId) {
+  if (taskId.empty()) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(failureIntelligenceMutex());
+  failureIntelligenceStore().erase(taskId);
+}
+
+void rememberFailureIntelligence(const FailureIntelligence& intelligence) {
+  if (intelligence.taskId.empty()) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(failureIntelligenceMutex());
+  failureIntelligenceStore()[intelligence.taskId] = intelligence;
+}
+
+void updateFailureIntelligenceForAction(const Action& action, Result& result) {
+  clearFailureIntelligence(action.id);
+  result.failureType = ExecutionKernel::classifyFailure(result);
+  result.repairRole = ExecutionKernel::routeFailureRole(result.failureType);
+
+  if (result.ok && !result.rolledBack) {
+    return;
+  }
+
+  if (result.failureType == FailureType::NONE) {
+    return;
+  }
+
+  const std::string originalTaskId = actionOriginalTaskId(action);
+  FailureIntelligence intelligence;
+  intelligence.type = result.failureType;
+  intelligence.taskId = action.id;
+  intelligence.originalTaskId = originalTaskId;
+  intelligence.repairTaskId = repairTaskIdFor(originalTaskId);
+  intelligence.target = action.target;
+  intelligence.sourceFile = actionSourceFileHint(action);
+  intelligence.routedRole = result.repairRole;
+  intelligence.previousOutput =
+      truncateForRetryPreview(extractPreviousOutput(result), 1200U);
+  intelligence.errorLogs =
+      truncateForRetryPreview(collectFailureText(result), 2400U);
+  intelligence.repairContext = {
+      {"context",
+       {{"error_logs", intelligence.errorLogs},
+        {"previous_output", intelligence.previousOutput}}},
+      {"failure_type", toString(intelligence.type)},
+      {"original_task", intelligence.originalTaskId},
+      {"target", intelligence.target},
+      {"task_id", intelligence.repairTaskId},
+      {"type", "repair"},
+  };
+  if (!intelligence.sourceFile.empty()) {
+    intelligence.repairContext["source_file"] = intelligence.sourceFile;
+  }
+  rememberFailureIntelligence(intelligence);
+
+  if (!result.payload.is_object()) {
+    result.payload = nlohmann::ordered_json::object();
+  }
+  result.payload["failure"] = {
+      {"original_task", intelligence.originalTaskId},
+      {"repair_task", intelligence.repairTaskId},
+      {"routed_role", intelligence.routedRole},
+      {"target", intelligence.target},
+      {"type", toString(intelligence.type)},
+  };
+  if (!intelligence.sourceFile.empty()) {
+    result.payload["failure"]["source_file"] = intelligence.sourceFile;
+  }
+  result.payload["repair_context"] = intelligence.repairContext;
+
+  std::cout << "[FAILURE] task=" << intelligence.originalTaskId
+            << " type=" << toString(intelligence.type) << std::endl;
+  std::cout << "[REPAIR] routing_to=" << intelligence.routedRole << std::endl;
+}
+
 }  // namespace
+
+const char* toString(const FailureType type) noexcept {
+  switch (type) {
+    case FailureType::NONE:
+      return "NONE";
+    case FailureType::COMPILE_ERROR:
+      return "COMPILE_ERROR";
+    case FailureType::LOGIC_ERROR:
+      return "LOGIC_ERROR";
+    case FailureType::TEST_FAIL:
+      return "TEST_FAIL";
+    case FailureType::TOOL_ERROR:
+      return "TOOL_ERROR";
+  }
+  return "NONE";
+}
 
 ExecutionKernel::ExecutionKernel(
     core::StateManager& stateManager,
@@ -1436,6 +2200,53 @@ ExecutionKernel::ExecutionKernel(
                              ? std::move(modelOrchestrator)
                              : ai::orchestration::MultiModelOrchestrator::
                                    createDefault(stateManager.projectRoot())) {}
+
+FailureType ExecutionKernel::classifyFailure(const ExecutionResult& result) {
+  if (result.ok && !result.rolledBack) {
+    return FailureType::NONE;
+  }
+
+  const std::string loweredText = lowerAscii(collectFailureText(result));
+  if (hasCompileFailureSignal(result, loweredText)) {
+    return FailureType::COMPILE_ERROR;
+  }
+  if (hasVerificationFailureSignal(result, loweredText)) {
+    return FailureType::TEST_FAIL;
+  }
+  if (hasToolFailureSignal(result, loweredText)) {
+    return FailureType::TOOL_ERROR;
+  }
+  if (hasLogicFailureSignal(result, loweredText)) {
+    return FailureType::LOGIC_ERROR;
+  }
+  return FailureType::NONE;
+}
+
+std::string ExecutionKernel::routeFailureRole(const FailureType failureType) {
+  switch (failureType) {
+    case FailureType::COMPILE_ERROR:
+      return "coder";
+    case FailureType::LOGIC_ERROR:
+      return "analyzer";
+    case FailureType::TEST_FAIL:
+      return "verifier";
+    case FailureType::TOOL_ERROR:
+      return "coder";
+    case FailureType::NONE:
+      return {};
+  }
+  return {};
+}
+
+std::optional<FailureIntelligence> ExecutionKernel::failureIntelligenceForTask(
+    const std::string& taskId) {
+  std::lock_guard<std::mutex> lock(failureIntelligenceMutex());
+  const auto it = failureIntelligenceStore().find(taskId);
+  if (it == failureIntelligenceStore().end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
 
 Action ExecutionKernel::buildActionFromStrategy(
     const intent::Action& strategyAction,
@@ -1897,7 +2708,7 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
     }
 
     case ActionType::ModelGenerate: {
-      const ai::orchestration::OrchestrationContext orchestrationContext =
+      const ai::orchestration::OrchestrationContext baseOrchestrationContext =
           buildOrchestrationContext(action);
 
       std::cerr << "[ULTRA-DEBUG] ModelGenerate entered."
@@ -1927,20 +2738,28 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
       }
       if (!currentRequest.contextPayload.contains("stage")) {
         currentRequest.contextPayload["stage"] =
-            orchestrationContext.taskType == ai::orchestration::TaskType::Coding
+            baseOrchestrationContext.taskType ==
+                    ai::orchestration::TaskType::Coding
                 ? "coder"
-                : ai::orchestration::toString(orchestrationContext.taskType);
+                : ai::orchestration::toString(baseOrchestrationContext.taskType);
       }
       nlohmann::ordered_json applyPatchRetryHistory =
           nlohmann::ordered_json::array();
       std::size_t applyPatchRetryCount = 0U;
       bool applyPatchRetryExhausted = false;
+      RoleRoutingDecision routingDecision =
+          resolveModelRole(action, currentRequest, baseOrchestrationContext);
+      ai::orchestration::OrchestrationContext routedContext =
+          withResolvedRole(baseOrchestrationContext, routingDecision.resolvedRole);
+      if (!routingDecision.resolvedRole.empty()) {
+        currentRequest.contextPayload["model_role"] = routingDecision.resolvedRole;
+      }
       if (modelOrchestrator_ == nullptr) {
         ai::model::ModelResponse response;
         response.ok = false;
         response.errorCode = ai::model::ModelErrorCode::ProviderUnavailable;
         response.errorMessage = "Model orchestrator is unavailable.";
-        result.payload = buildModelExecutionJson(orchestrationContext,
+        result.payload = buildModelExecutionJson(routedContext,
                                                  action.modelProvider,
                                                  currentRequest, response);
         result.normalizedPaths = collectNormalizedPaths(result.payload);
@@ -1960,8 +2779,27 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
         result.ok = false;
         result.risk = RiskLevel::Low;
 
+        routingDecision =
+            resolveModelRole(action, currentRequest, baseOrchestrationContext);
+        routedContext =
+            withResolvedRole(baseOrchestrationContext, routingDecision.resolvedRole);
+        if (!routingDecision.resolvedRole.empty()) {
+          currentRequest.contextPayload["model_role"] =
+              routingDecision.resolvedRole;
+        }
+        std::cout << "[ROUTER] task="
+                  << (routingDecision.taskId.empty() ? "unknown"
+                                                     : routingDecision.taskId)
+                  << " stage="
+                  << (routingDecision.stage.empty() ? "unknown"
+                                                    : routingDecision.stage)
+                  << " requested="
+                  << (routingDecision.requestedRole.empty()
+                          ? "auto"
+                          : routingDecision.requestedRole)
+                  << " resolved=" << routingDecision.resolvedRole << std::endl;
         const ai::model::ModelResponse response =
-            modelOrchestrator_->generate(currentRequest, orchestrationContext);
+            modelOrchestrator_->generate(currentRequest, routedContext);
         std::string selectedProvider = action.modelProvider;
         std::vector<std::string> attemptedProviders;
         if (const auto* orchestrator =
@@ -1996,7 +2834,7 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
           std::cerr << "\n";
         }
 
-        result.payload = buildModelExecutionJson(orchestrationContext,
+        result.payload = buildModelExecutionJson(routedContext,
                                                  action.modelProvider,
                                                  currentRequest, response);
         if (!selectedProvider.empty()) {
@@ -2400,6 +3238,7 @@ Result ExecutionKernel::execute(const Action& action,
     result.message = "Execution failed with an unknown error.";
   }
 
+  updateFailureIntelligenceForAction(action, result);
   sortOutputs(result);
   lastResult_ = result;
   hasLastResult_ = true;

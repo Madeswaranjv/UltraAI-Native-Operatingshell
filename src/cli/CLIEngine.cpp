@@ -11,7 +11,6 @@
 #include "../ai/FileRegistry.h"
 #include "../ai/Hashing.h"
 #include "../ai/IntegrityManager.h"
-#include "../ai/SemanticExtractor.h"
 #include "../ai/SymbolTable.h"
 #include "../core/state_manager.h"
 #include "../engine/query/SymbolQueryEngine.h"
@@ -63,21 +62,6 @@ namespace ultra::cli {
 namespace {
 
 const char* kVersion = "0.1.0";
-
-std::string normalizePathString(const std::filesystem::path& path) {
-  const auto u8 = path.generic_u8string();
-  std::string out;
-  out.reserve(u8.size());
-  for (const auto ch : u8) {
-    out.push_back(static_cast<char>(ch));
-  }
-  return out;
-}
-
-bool endsWith(const std::string& value, const std::string& suffix) {
-  return value.size() >= suffix.size() &&
-         value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
 
 nlohmann::json buildMetaCognitivePayload(
     const ultra::metacognition::QueryMetrics& metrics) {
@@ -185,97 +169,6 @@ nlohmann::json buildRiskReportPayload(
   payload["within_threshold"] = report.withinThreshold;
   payload["diff_report"] = buildBranchDiffPayload(report.diffReport);
   return payload;
-}
-
-std::vector<std::string> dependencyCandidatesForReference(
-    const std::string& reference,
-    const std::string& currentFilePath) {
-  static const std::vector<std::string> kCodeExtensions{
-      "",            ".h",        ".hpp",      ".hh",   ".hxx",
-      ".c",          ".cc",       ".cpp",      ".cxx",  ".js",
-      ".jsx",        ".mjs",      ".cjs",      ".ts",   ".tsx",
-      ".py",         "/index.js", "/index.ts", "/index.tsx",
-      "/__init__.py"};
-
-  std::vector<std::string> out;
-  out.reserve(kCodeExtensions.size() * 2U);
-
-  const std::filesystem::path currentParent =
-      std::filesystem::path(currentFilePath).parent_path();
-
-  const auto addVariants = [&](const std::filesystem::path& basePath) {
-    for (const std::string& ext : kCodeExtensions) {
-      if (ext.empty()) {
-        out.push_back(normalizePathString(basePath.lexically_normal()));
-      } else if (ext[0] == '/') {
-        out.push_back(
-            normalizePathString((basePath / ext.substr(1)).lexically_normal()));
-      } else {
-        std::filesystem::path variant = basePath;
-        variant += ext;
-        out.push_back(normalizePathString(variant.lexically_normal()));
-      }
-    }
-  };
-
-  if (!reference.empty() && reference[0] == '.') {
-    addVariants((currentParent / reference).lexically_normal());
-  } else {
-    addVariants(std::filesystem::path(reference));
-    addVariants((currentParent / reference).lexically_normal());
-    if (reference.find('.') != std::string::npos &&
-        reference.find('/') == std::string::npos) {
-      std::string pythonModule = reference;
-      std::replace(pythonModule.begin(), pythonModule.end(), '.', '/');
-      addVariants(std::filesystem::path(pythonModule));
-    }
-  }
-
-  std::sort(out.begin(), out.end());
-  out.erase(std::unique(out.begin(), out.end()), out.end());
-  return out;
-}
-
-bool resolveDependencyReference(
-    const std::string& currentFilePath,
-    const std::string& reference,
-    const std::map<std::string, ultra::ai::FileRecord>& currentFilesByPath,
-    std::string& resolvedPath) {
-  if (reference.empty()) {
-    return false;
-  }
-
-  if (currentFilesByPath.find(reference) != currentFilesByPath.end()) {
-    resolvedPath = reference;
-    return true;
-  }
-
-  const std::vector<std::string> candidates =
-      dependencyCandidatesForReference(reference, currentFilePath);
-  for (const std::string& candidate : candidates) {
-    const auto exactIt = currentFilesByPath.find(candidate);
-    if (exactIt != currentFilesByPath.end()) {
-      resolvedPath = exactIt->first;
-      return true;
-    }
-  }
-
-  std::vector<std::string> suffixMatches;
-  suffixMatches.reserve(currentFilesByPath.size());
-  for (const auto& [path, file] : currentFilesByPath) {
-    (void)file;
-    if (path == reference || endsWith(path, "/" + reference) ||
-        endsWith(path, reference)) {
-      suffixMatches.push_back(path);
-    }
-  }
-  if (suffixMatches.empty()) {
-    return false;
-  }
-
-  std::sort(suffixMatches.begin(), suffixMatches.end());
-  resolvedPath = suffixMatches.front();
-  return true;
 }
 
 bool isDefinitionSymbol(const ultra::ai::SymbolRecord& symbol) {
@@ -477,10 +370,127 @@ struct DaemonRuntimeDispatcher {
     stateManager.setStructuralEventBus(&changeQueue);
   }
 
+ private:
+
+  [[nodiscard]] bool hasPersistedSemanticIndex() const {
+    return std::filesystem::exists(aiDirectory / "core.idx") &&
+           std::filesystem::exists(aiDirectory / "files.tbl") &&
+           std::filesystem::exists(aiDirectory / "symbols.tbl") &&
+           std::filesystem::exists(aiDirectory / "deps.tbl");
+  }
+
+  bool loadPersistedFileRecords(std::vector<ultra::ai::FileRecord>& filesOut,
+                                std::string& error) const {
+    filesOut.clear();
+    ultra::ai::CoreIndex core;
+    if (!ultra::ai::BinaryIndexReader::readCoreIndex(aiDirectory / "core.idx",
+                                                     core, error)) {
+      return false;
+    }
+    return ultra::ai::BinaryIndexReader::readFilesTable(
+        aiDirectory / "files.tbl", core.schemaVersion, filesOut, error);
+  }
+
+  [[nodiscard]] std::vector<ultra::ai::DiscoveredFile> currentIndexableFiles()
+      const {
+    return ultra::ai::FileRegistry::discoverProjectFiles(projectRoot);
+  }
+
+  bool isIndexStale(const std::vector<ultra::ai::FileRecord>& indexedFiles,
+                    std::string& reason) const {
+    reason.clear();
+    const std::vector<ultra::ai::DiscoveredFile> current = currentIndexableFiles();
+
+    if (current.size() != indexedFiles.size()) {
+      reason = "file count changed (indexed=" +
+               std::to_string(indexedFiles.size()) + ", current=" +
+               std::to_string(current.size()) + ")";
+      return true;
+    }
+
+    for (std::size_t i = 0; i < current.size(); ++i) {
+      const ultra::ai::DiscoveredFile& currentFile = current[i];
+      const ultra::ai::FileRecord& indexedFile = indexedFiles[i];
+      if (currentFile.relativePath != indexedFile.path) {
+        reason = "path changed at slot " + std::to_string(i) + " (indexed=" +
+                 indexedFile.path + ", current=" + currentFile.relativePath + ")";
+        return true;
+      }
+      if (currentFile.language != indexedFile.language) {
+        reason = "language changed for " + currentFile.relativePath + " (indexed=" +
+                 ultra::ai::FileRegistry::languageToString(indexedFile.language) +
+                 ", current=" +
+                 ultra::ai::FileRegistry::languageToString(currentFile.language) +
+                 ")";
+        return true;
+      }
+      if (currentFile.lastModified != indexedFile.lastModified) {
+        reason = "timestamp changed for " + currentFile.relativePath;
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  bool tryLoadPersistedIndex(std::string& error) {
+    error.clear();
+    if (!hasPersistedSemanticIndex()) {
+      return false;
+    }
+
+    nlohmann::json verifyPayload;
+    std::string verifyError;
+    if (!verifyIntegrity(verifyPayload, verifyError)) {
+      error = verifyError;
+      return false;
+    }
+
+    ultra::ai::RuntimeState loaded;
+    if (!ultra::ai::BinaryIndexReader::readCoreIndex(aiDirectory / "core.idx",
+                                                     loaded.core, error)) {
+      return false;
+    }
+    if (!ultra::ai::BinaryIndexReader::readFilesTable(
+            aiDirectory / "files.tbl", loaded.core.schemaVersion, loaded.files,
+            error)) {
+      return false;
+    }
+    if (!ultra::ai::BinaryIndexReader::readSymbolsTable(
+            aiDirectory / "symbols.tbl", loaded.core.schemaVersion,
+            loaded.symbols, error)) {
+      return false;
+    }
+    if (!ultra::ai::BinaryIndexReader::readDependenciesTable(
+            aiDirectory / "deps.tbl", loaded.core.schemaVersion, loaded.deps,
+            error)) {
+      return false;
+    }
+
+    ultra::ai::SymbolTable::sortDeterministic(loaded.symbols);
+    ultra::ai::DependencyTable::sortAndDedupe(loaded.deps);
+    // deps.tbl already contains the persisted symbol edges. Recomputing them
+    // here would drop semantic edges because semanticSymbolDepsByFileId is not
+    // serialized with the binary index.
+    loaded.symbolIndex = buildSymbolIndex(loaded.files, loaded.symbols,
+                                          loaded.deps);
+    previousState = runtimeState();
+    runtimeState() = std::move(loaded);
+    stateManager.replaceState(runtimeState());
+    symbolQueryEngine().rebuild(runtimeState(), ++runtimeVersion());
+    ultra::core::Logger::info(
+        ultra::core::LogCategory::Scan,
+        "[INDEX] Loaded persisted semantic index from " + aiDirectory.string());
+    return true;
+  }
+
+ public:
   nlohmann::json handle(const std::string& type, const nlohmann::json& payload) {
     if (type == "ai_status") {
       std::string error;
-      (void)ensureIndexAvailable(error);  // lazy build on first status check
+      if (!ensureIndexAvailable(error)) {
+        return makeError(error);
+      }
       const bool verbose = payload.value("verbose", false);
       (void)verbose;
       return makeOk(buildStatusPayload(), 0);
@@ -973,8 +983,36 @@ struct DaemonRuntimeDispatcher {
   }
 
   bool ensureIndexAvailable(std::string& error) {
+    std::string staleReason;
     if (!runtimeState().files.empty()) {
-      return true;
+      if (!isIndexStale(runtimeState().files, staleReason)) {
+        return true;
+      }
+      ultra::core::Logger::info(
+          ultra::core::LogCategory::Scan,
+          "[INDEX] In-memory semantic index is stale: " + staleReason +
+              ". Rebuilding.");
+    } else if (hasPersistedSemanticIndex()) {
+      std::vector<ultra::ai::FileRecord> persistedFiles;
+      std::string persistedError;
+      if (loadPersistedFileRecords(persistedFiles, persistedError) &&
+          !isIndexStale(persistedFiles, staleReason)) {
+        if (tryLoadPersistedIndex(error)) {
+          return true;
+        }
+        ultra::core::Logger::warning(
+            ultra::core::LogCategory::Scan,
+            "[INDEX] Failed to load persisted semantic index: " + error +
+                ". Rebuilding.");
+        error.clear();
+      } else {
+        const std::string detail =
+            !staleReason.empty() ? staleReason : persistedError;
+        ultra::core::Logger::info(
+            ultra::core::LogCategory::Scan,
+            "[INDEX] Persisted semantic index is stale: " + detail +
+                ". Rebuilding.");
+      }
     }
     // Lazy first-use build: the index has not been populated yet (startup
     // rebuild was deliberately deferred so the IPC server could start and
@@ -1022,87 +1060,20 @@ struct DaemonRuntimeDispatcher {
     ultra::ai::RuntimeState next;
     std::vector<ultra::ai::DiscoveredFile> discovered =
         ultra::ai::FileRegistry::discoverProjectFiles(projectRoot);
-
-    // Filter out directories that are not part of the project's own source:
-    // build artefacts, vendored grammars/deps, and VCS metadata.
-    // Without this, symbols like `main` resolve to googletest and tree-sitter
-    // test files instead of the project's own src/main.cpp.
-    static const std::vector<std::string> kExcludedPrefixes{
-        "build/", "build\\",
-        "third_party/", "third_party\\",
-        "_deps/", "_deps\\",
-        ".git/", ".git\\",
-        ".ultra_daemon/",
-    };
-    discovered.erase(
-        std::remove_if(
-            discovered.begin(), discovered.end(),
-            [](const ultra::ai::DiscoveredFile& file) {
-              for (const std::string& prefix : kExcludedPrefixes) {
-                if (file.relativePath.size() >= prefix.size() &&
-                    file.relativePath.compare(0, prefix.size(), prefix) == 0) {
-                  return true;
-                }
-              }
-              return false;
-            }),
-        discovered.end());
-
-    std::vector<ultra::ai::FileRecord> records =
-        ultra::ai::FileRegistry::deriveRecords(discovered);
-
-    for (std::size_t i = 0; i < records.size(); ++i) {
-      if (!ultra::ai::sha256OfFile(discovered[i].absolutePath,
-                                   records[i].hash, error)) {
-        return false;
-      }
+    ultra::core::Logger::info(
+        ultra::core::LogCategory::Scan,
+        "[INDEX] Rebuild start | Files: " + std::to_string(discovered.size()));
+    ultra::engine::Scanner scanner(projectRoot);
+    ultra::engine::ScanOutput scanOutput;
+    if (!scanner.fullScanParallel(discovered, scanOutput, error)) {
+      return false;
     }
 
-    const std::map<std::string, ultra::ai::FileRecord> filesByPath =
-        ultra::ai::FileRegistry::mapByPath(records);
-
-    std::vector<ultra::ai::SymbolRecord> symbols;
-    ultra::ai::DependencyTableData deps;
-    std::map<std::uint32_t, std::vector<ultra::ai::SemanticSymbolDependency>>
-        semanticDepsByFileId;
-
-    for (const auto& file : discovered) {
-      ultra::ai::SemanticParseResult semantic;
-      if (!ultra::ai::SemanticExtractor::extract(file.absolutePath, file.language,
-                                                 semantic, error)) {
-        return false;
-      }
-
-      std::vector<ultra::ai::SymbolRecord> fileSymbols;
-      if (!ultra::ai::SymbolTable::buildFromExtracted(
-              file.fileId, semantic.symbols, fileSymbols, error)) {
-        return false;
-      }
-      symbols.insert(symbols.end(), fileSymbols.begin(), fileSymbols.end());
-      semanticDepsByFileId[file.fileId] = semantic.symbolDependencies;
-
-      const std::string currentPath = file.relativePath;
-      for (const std::string& reference : semantic.dependencyReferences) {
-        std::string resolvedPath;
-        if (!resolveDependencyReference(currentPath, reference, filesByPath,
-                                        resolvedPath)) {
-          continue;
-        }
-        const auto targetIt = filesByPath.find(resolvedPath);
-        if (targetIt == filesByPath.end()) {
-          continue;
-        }
-        ultra::ai::FileDependencyEdge edge;
-        edge.fromFileId = file.fileId;
-        edge.toFileId = targetIt->second.fileId;
-        deps.fileEdges.push_back(edge);
-      }
-    }
-
-    next.files = std::move(records);
-    next.symbols = std::move(symbols);
-    next.deps = std::move(deps);
-    next.semanticSymbolDepsByFileId = std::move(semanticDepsByFileId);
+    next.files = std::move(scanOutput.files);
+    next.symbols = std::move(scanOutput.symbols);
+    next.deps = std::move(scanOutput.deps);
+    next.semanticSymbolDepsByFileId =
+        std::move(scanOutput.semanticSymbolDepsByFileId);
     rebuildSymbolEdges(next);
 
     std::error_code ec;
@@ -1170,6 +1141,14 @@ struct DaemonRuntimeDispatcher {
     runtimeState() = std::move(next);
     stateManager.replaceState(runtimeState());
     symbolQueryEngine().rebuild(runtimeState(), ++runtimeVersion());
+    ultra::core::Logger::info(
+        ultra::core::LogCategory::Scan,
+        "[INDEX] Rebuild complete | Files: " +
+            std::to_string(runtimeState().files.size()) + " | Symbols: " +
+            std::to_string(runtimeState().symbols.size()) + " | FileDeps: " +
+            std::to_string(runtimeState().deps.fileEdges.size()) +
+            " | SymbolDeps: " +
+            std::to_string(runtimeState().deps.symbolEdges.size()));
 
     payloadOut["message"] = "semantic_index_built";
     payloadOut["runtime_active"] = runtimeState().core.runtimeActive == 1U;

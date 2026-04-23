@@ -44,7 +44,7 @@ ultra context --ast .
 
 Additionally:
 
-* Read `.ultra.context` file at root
+* Read `.ultra.context.json` file at root
 * This provides **full project structural + semantic understanding**
 
 ---

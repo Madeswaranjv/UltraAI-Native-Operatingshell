@@ -131,7 +131,7 @@ bool BinaryIndexWriter::writeFilesTable(const std::filesystem::path& tablePath,
                                         const std::uint32_t schemaVersion,
                                         const std::vector<FileRecord>& files,
                                         std::string& error) {
-  return writeAtomic(tablePath, [&](std::ofstream& output) {
+  if (!writeAtomic(tablePath, [&](std::ofstream& output) {
     if (!writeTableHeader(output, kFilesMagic, schemaVersion,
                           static_cast<std::uint32_t>(files.size()))) {
       return false;
@@ -149,6 +149,21 @@ bool BinaryIndexWriter::writeFilesTable(const std::filesystem::path& tablePath,
       if (schemaVersion <= 1U) {
         writeUint64(output, record.lastModified);
       }
+    }
+    return static_cast<bool>(output);
+  }, error)) {
+    return false;
+  }
+
+  if (schemaVersion < 2U) {
+    return true;
+  }
+
+  const std::filesystem::path metaPath = tablePath.parent_path() / "files.meta";
+  return writeAtomic(metaPath, [&](std::ofstream& output) {
+    for (const FileRecord& record : files) {
+      writeUint32(output, record.fileId);
+      writeUint64(output, record.lastModified);
     }
     return static_cast<bool>(output);
   }, error);

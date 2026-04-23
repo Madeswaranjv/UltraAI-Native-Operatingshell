@@ -1,4 +1,5 @@
 #include "ProjectScanner.h"
+#include "../ai/FileRegistry.h"
 #include "../core/ConfigManager.h"
 #include "utils/FileClassifier.h"
 
@@ -62,6 +63,10 @@ bool ProjectScanner::shouldIgnore(const std::filesystem::path& path) const {
   if (!path.has_filename())
     return false;
 
+  if (ultra::ai::FileRegistry::shouldIgnoreDirectory(path)) {
+    return true;
+  }
+
   const std::string name = path.filename().string();
   const auto& ignore = m_config.ignoreDirs();
 
@@ -86,34 +91,9 @@ std::vector<FileInfo> ProjectScanner::scan(const std::filesystem::path& root) {
 
       // ---- Skip heavy directories ----
       if (it->is_directory()) {
-
-        const std::string name = path.filename().string();
-
-        if (name == ".git" ||
-      name == "node_modules" ||
-      name == "build" ||
-      name == "dist" ||
-      name == ".next" ||
-      name == "out" ||
-      name == "coverage" ||
-      name == "target" ||
-      name == ".cache" ||
-      name == "venv" ||
-      name == ".venv" ||
-      name == "__pycache__" ||
-      name == ".eggs" ||
-      name == ".mypy_cache" ||
-      name == ".pytest_cache" ||
-      name == ".tox" ||
-      name == ".idea" ||
-      name == ".vscode") {
-
-          it.disable_recursion_pending();
-          continue;
-        }
-
         if (shouldIgnore(path.filename())) {
           it.disable_recursion_pending();
+          continue;
         }
 
         continue;

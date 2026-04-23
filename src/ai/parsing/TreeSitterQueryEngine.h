@@ -47,6 +47,7 @@ struct SemanticSymbol {
 
 class TreeSitterQueryEngine {
  public:
+  static bool hasPatterns(Language language);
   static std::vector<SemanticSymbol> execute(const TSNode& root,
                                              const std::string& source,
                                              Language language);

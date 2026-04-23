@@ -45,6 +45,34 @@ std::string lowerAscii(std::string value) {
   return value;
 }
 
+std::string canonicalRoleName(std::string value) {
+  const auto first = value.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos) {
+    return {};
+  }
+  const auto last = value.find_last_not_of(" \t\r\n");
+  value = lowerAscii(value.substr(first, last - first + 1U));
+  if (value.empty() || value == "auto") {
+    return {};
+  }
+  if (value == "plan" || value == "planner" || value == "planning") {
+    return "planner";
+  }
+  if (value == "verify" || value == "verifier" || value == "verification" ||
+      value == "validate" || value == "validation") {
+    return "verifier";
+  }
+  if (value == "code" || value == "coder" || value == "coding" ||
+      value == "code_generation") {
+    return "coder";
+  }
+  if (value == "analysis" || value == "analyzer" || value == "analyse" ||
+      value == "analyze") {
+    return "analyzer";
+  }
+  return {};
+}
+
 void pushUnique(std::vector<std::string>& values, const std::string& value) {
   if (value.empty()) {
     return;
@@ -61,8 +89,8 @@ bool containsValue(const std::vector<std::string>& values,
 
 std::string roleForTaskType(const OrchestrationContext& context) {
   if (!context.modelRoleHint.empty()) {
-    const std::string explicitRole = lowerAscii(context.modelRoleHint);
-    if (explicitRole != "auto") {
+    const std::string explicitRole = canonicalRoleName(context.modelRoleHint);
+    if (!explicitRole.empty()) {
       return explicitRole;
     }
   }
@@ -77,6 +105,15 @@ std::string roleForTaskType(const OrchestrationContext& context) {
       return {};
   }
   return {};
+}
+
+std::string requestResolvedRole(const model::ModelRequest& request) {
+  if (!request.contextPayload.is_object() ||
+      !request.contextPayload.contains("model_role") ||
+      !request.contextPayload.at("model_role").is_string()) {
+    return {};
+  }
+  return canonicalRoleName(request.contextPayload.at("model_role").get<std::string>());
 }
 
 nlohmann::ordered_json sortJsonKeys(const nlohmann::ordered_json& value) {
@@ -220,7 +257,7 @@ bool looksLikeFilePath(const std::string_view value) {
 }
 
 std::string contextTypeLabel(const std::string& role, const TaskType taskType) {
-  const std::string normalizedRole = lowerAscii(role);
+  const std::string normalizedRole = canonicalRoleName(role);
   if (normalizedRole == "planner") {
     return "planning";
   }
@@ -681,13 +718,19 @@ model::ModelResponse MultiModelOrchestrator::generate(
     const model::ModelRequest& request,
     const OrchestrationContext& context) {
   lastDecision_ = OrchestrationDecision{};
-  const std::string routedRole = roleForTaskType(context);
+  OrchestrationContext effectiveContext = context;
+  const std::string requestRole = requestResolvedRole(request);
+  if (!requestRole.empty()) {
+    effectiveContext.modelRoleHint = requestRole;
+  }
+  const std::string routedRole = roleForTaskType(effectiveContext);
   const bool tracePlannerRouting =
-      routedRole == "planner" || lowerAscii(context.modelRoleHint) == "planner" ||
-      context.taskType == TaskType::Planning;
+      routedRole == "planner" ||
+      canonicalRoleName(effectiveContext.modelRoleHint) == "planner" ||
+      effectiveContext.taskType == TaskType::Planning;
   lastDecision_.routingKey =
-      routedRole.empty() ? toString(context.taskType) : routedRole;
-  lastDecision_.attemptedProviders = buildCandidateProviders(context);
+      routedRole.empty() ? toString(effectiveContext.taskType) : routedRole;
+  lastDecision_.attemptedProviders = buildCandidateProviders(effectiveContext);
   if (tracePlannerRouting) {
     std::ostringstream attemptedProviders;
     for (std::size_t index = 0U; index < lastDecision_.attemptedProviders.size();
@@ -697,17 +740,20 @@ model::ModelResponse MultiModelOrchestrator::generate(
       }
       attemptedProviders << lastDecision_.attemptedProviders[index];
     }
-    std::cout << "[ROLE HINT] " << context.modelRoleHint << std::endl;
+    std::cout << "[ROLE HINT] " << effectiveContext.modelRoleHint << std::endl;
     std::cout << "[ROUTED ROLE] " << routedRole << std::endl;
     std::cout << "[ATTEMPTED PROVIDERS] " << attemptedProviders.str()
               << std::endl;
   }
 
   UltraContextBundle ultraContext =
-      buildUltraContext(request, context, projectRoot_, routedRole);
+      buildUltraContext(request, effectiveContext, projectRoot_, routedRole);
   model::ModelRequest enrichedRequest = request;
   if (!enrichedRequest.contextPayload.is_object()) {
     enrichedRequest.contextPayload = nlohmann::ordered_json::object();
+  }
+  if (!routedRole.empty()) {
+    enrichedRequest.contextPayload["model_role"] = routedRole;
   }
   if (!ultraContext.taskId.empty()) {
     enrichedRequest.contextPayload["task_id"] = ultraContext.taskId;
@@ -779,7 +825,8 @@ model::ModelResponse MultiModelOrchestrator::generate(
       std::cout << "[SELECTED MODEL] " << selectedModel << std::endl;
     }
     std::cout << "[LLM] invoking "
-              << (routedRole.empty() ? toString(context.taskType) : routedRole)
+              << (routedRole.empty() ? toString(effectiveContext.taskType)
+                                     : routedRole)
               << std::endl;
     model::ModelResponse response = adapter->generate(routedRequest);
     adapter->shutdown();
@@ -1033,7 +1080,7 @@ std::string MultiModelOrchestrator::normalizeProviderName(std::string value) {
 }
 
 std::string MultiModelOrchestrator::normalizeRoleName(std::string value) {
-  return lowerAscii(std::move(value));
+  return canonicalRoleName(std::move(value));
 }
 
 }  // namespace ultra::ai::orchestration

@@ -32,6 +32,10 @@ class ParallelScanner {
  public:
   explicit ParallelScanner(std::filesystem::path projectRoot);
 
+  bool runFullScan(const std::vector<ai::DiscoveredFile>& discoveredFiles,
+                   const DependencyResolver& dependencyResolver,
+                   ParallelScanResult& output,
+                   std::string& error) const;
   bool runFullScan(const DependencyResolver& dependencyResolver,
                    ParallelScanResult& output,
                    std::string& error) const;

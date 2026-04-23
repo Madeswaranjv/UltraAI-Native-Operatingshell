@@ -56,6 +56,16 @@ enum class RiskLevel : std::uint8_t {
   Critical = 3U
 };
 
+enum class FailureType : std::uint8_t {
+  NONE = 0U,
+  COMPILE_ERROR = 1U,
+  LOGIC_ERROR = 2U,
+  TEST_FAIL = 3U,
+  TOOL_ERROR = 4U
+};
+
+[[nodiscard]] const char* toString(FailureType type) noexcept;
+
 struct GovernanceDecision {
   bool allowed{false};
   RiskLevel risk{RiskLevel::Critical};
@@ -90,6 +100,7 @@ struct Result {
   bool applied{false};
   bool rolledBack{false};
   ActionType type{ActionType::Mutation};
+  FailureType failureType{FailureType::NONE};
   RiskLevel risk{RiskLevel::Low};
   std::uint64_t queueOrder{0U};
   std::uint64_t previousVersion{0U};
@@ -100,7 +111,23 @@ struct Result {
   std::string previousHash;
   std::string resultingHash;
   std::string message;
+  std::string repairRole;
   std::string text_output;
+};
+
+using ExecutionResult = Result;
+
+struct FailureIntelligence {
+  FailureType type{FailureType::NONE};
+  std::string taskId;
+  std::string originalTaskId;
+  std::string repairTaskId;
+  std::string target;
+  std::string sourceFile;
+  std::string routedRole;
+  std::string previousOutput;
+  std::string errorLogs;
+  nlohmann::ordered_json repairContext = nlohmann::ordered_json::object();
 };
 
 class ExecutionKernel {
@@ -113,6 +140,11 @@ class ExecutionKernel {
   [[nodiscard]] static Action buildActionFromStrategy(
       const intent::Action& strategyAction,
       const CognitiveState& state);
+  [[nodiscard]] static FailureType classifyFailure(
+      const ExecutionResult& result);
+  [[nodiscard]] static std::string routeFailureRole(FailureType failureType);
+  [[nodiscard]] static std::optional<FailureIntelligence>
+  failureIntelligenceForTask(const std::string& taskId);
   Result execute(const Action& action, const CognitiveState& state);
   Result executeIntent(const intent::Intent& intent,
                        const CognitiveState& state,

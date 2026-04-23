@@ -10,6 +10,8 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <iostream>
+#include <chrono>
 
 namespace ultra::engine::parallel {
 
@@ -55,6 +57,8 @@ struct ThreadLocalBuffer {
   std::vector<ai::FileDependencyEdge> fileEdges;
   std::vector<std::pair<std::uint32_t, std::vector<ai::SemanticSymbolDependency>>>
       semanticDepsByFileId;
+  std::size_t parsedCount{0U};
+  std::size_t nodeModulesParsed{0U};
 };
 
 bool semanticDependencyLess(const ai::SemanticSymbolDependency& left,
@@ -78,14 +82,23 @@ ParallelScanner::ParallelScanner(std::filesystem::path projectRoot)
 bool ParallelScanner::runFullScan(const DependencyResolver& dependencyResolver,
                                   ParallelScanResult& output,
                                   std::string& error) const {
+  const std::vector<ai::DiscoveredFile> discovered =
+      ai::FileRegistry::discoverProjectFiles(projectRoot_);
+  return runFullScan(discovered, dependencyResolver, output, error);
+}
+
+bool ParallelScanner::runFullScan(
+    const std::vector<ai::DiscoveredFile>& discovered,
+    const DependencyResolver& dependencyResolver,
+    ParallelScanResult& output,
+    std::string& error) const {
   output = ParallelScanResult{};
   if (!dependencyResolver) {
     error = "Dependency resolver is required for parallel semantic scan.";
     return false;
   }
 
-  const std::vector<ai::DiscoveredFile> discovered =
-      ai::FileRegistry::discoverProjectFiles(projectRoot_);
+  auto scanStartTime = std::chrono::steady_clock::now();
   output.files = ai::FileRegistry::deriveRecords(discovered);
   if (output.files.empty()) {
     return true;
@@ -100,6 +113,7 @@ bool ParallelScanner::runFullScan(const DependencyResolver& dependencyResolver,
       ai::FileRegistry::mapByPath(output.files);
 
   FileTaskQueue queue;
+  std::size_t nodeModulesFound = 0;
   for (std::size_t index = 0U; index < output.files.size(); ++index) {
     const ai::FileRecord& record = output.files[index];
     const auto discoveredIt = discoveredByPath.find(record.path);
@@ -110,8 +124,17 @@ bool ParallelScanner::runFullScan(const DependencyResolver& dependencyResolver,
     task.index = index;
     task.record = record;
     task.absolutePath = discoveredIt->second.absolutePath;
+
+    if (record.path.find("node_modules") != std::string::npos) {
+      nodeModulesFound++;
+    }
+
+    std::cout << "[QUEUE] Adding file: " << record.path << " | Lang: " << static_cast<int>(record.language) << "\n";
     queue.push(std::move(task));
   }
+
+  std::size_t totalQueued = queue.size();
+  std::cout << "[QUEUE] Total tasks: " << totalQueued << "\n";
 
   if (queue.size() == 0U) {
     return true;
@@ -145,50 +168,81 @@ bool ParallelScanner::runFullScan(const DependencyResolver& dependencyResolver,
       ThreadLocalBuffer& local = threadLocal[workerIndex];
       FileTask task;
       while (!hasError.load(std::memory_order_relaxed) && queue.pop(task)) {
-        ai::Sha256Hash hash{};
-        std::string localError;
-        if (!ai::sha256OfFile(task.absolutePath, hash, localError)) {
-          reportError(localError);
-          return;
-        }
+  ai::Sha256Hash hash{};
+  std::string localError;
 
-        ai::SemanticParseResult semantic;
-        if (!ai::SemanticExtractor::extract(task.absolutePath,
-                                            task.record.language, semantic,
-                                            localError)) {
-          reportError(localError);
-          return;
-        }
+  auto startTime = std::chrono::steady_clock::now();
+  auto startMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      startTime.time_since_epoch()).count();
+  std::cout << "[START][" << startMs << "] " << task.record.path << std::endl;
 
-        std::vector<ai::SymbolRecord> fileSymbols;
-        if (!ai::SymbolTable::buildFromExtracted(task.record.fileId,
-                                                 semantic.symbols,
-                                                 fileSymbols,
-                                                 localError)) {
-          reportError(localError);
-          return;
-        }
+  if (!ai::sha256OfFile(task.absolutePath, hash, localError)) {
+    reportError(localError);
+    return;
+  }
 
-        local.hashesByIndex.push_back({task.index, hash});
-        local.symbols.insert(local.symbols.end(), fileSymbols.begin(), fileSymbols.end());
-        local.semanticDepsByFileId.push_back(
-            {task.record.fileId, std::move(semantic.symbolDependencies)});
+  ai::SemanticParseResult semantic;
 
-        for (const std::string& reference : semantic.dependencyReferences) {
-          std::string resolvedPath;
-          if (!dependencyResolver(task.record.path, reference, filesByPath, resolvedPath)) {
-            continue;
-          }
-          const auto targetIt = filesByPath.find(resolvedPath);
-          if (targetIt == filesByPath.end()) {
-            continue;
-          }
-          ai::FileDependencyEdge edge;
-          edge.fromFileId = task.record.fileId;
-          edge.toFileId = targetIt->second.fileId;
-          local.fileEdges.push_back(edge);
-        }
-      }
+  if (!ai::SemanticExtractor::extract(task.absolutePath,
+                                      task.record.language,
+                                      semantic,
+                                      localError)) {
+
+    std::cout << "[REBUILD_AI][FAILED] "
+              << task.record.path
+              << " | Error: " << localError
+              << std::endl;
+
+    reportError(localError);
+    return;
+  }
+
+  auto endTime = std::chrono::steady_clock::now();
+  auto endMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      endTime.time_since_epoch()).count();
+  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
+
+  std::cout << "[SUCCESS][" << endMs << "] " << task.record.path 
+            << " | duration: " << duration << "ms" << std::endl;
+
+  if (duration > 50) {
+    std::cout << "[SLOW_PARSE] " << task.record.path << " | duration: " << duration << "ms" << std::endl;
+  }
+  
+  local.parsedCount++;
+  if (task.record.path.find("node_modules") != std::string::npos) {
+    local.nodeModulesParsed++;
+  }
+
+  std::vector<ai::SymbolRecord> fileSymbols;
+  if (!ai::SymbolTable::buildFromExtracted(task.record.fileId,
+                                           semantic.symbols,
+                                           fileSymbols,
+                                           localError)) {
+    reportError(localError);
+    return;
+  }
+
+  local.hashesByIndex.push_back({task.index, hash});
+  local.symbols.insert(local.symbols.end(), fileSymbols.begin(), fileSymbols.end());
+  local.semanticDepsByFileId.push_back(
+      {task.record.fileId, std::move(semantic.symbolDependencies)});
+
+  for (const std::string& reference : semantic.dependencyReferences) {
+    std::string resolvedPath;
+    if (!dependencyResolver(task.record.path, reference, filesByPath, resolvedPath)) {
+      continue;
+    }
+    const auto targetIt = filesByPath.find(resolvedPath);
+    if (targetIt == filesByPath.end()) {
+      continue;
+    }
+    ai::FileDependencyEdge edge;
+    edge.fromFileId = task.record.fileId;
+    edge.toFileId = targetIt->second.fileId;
+    local.fileEdges.push_back(edge);
+  }
+}
     });
   }
 
@@ -269,6 +323,25 @@ bool ParallelScanner::runFullScan(const DependencyResolver& dependencyResolver,
                                  fromSemanticEdges.begin(),
                                  fromSemanticEdges.end());
   ai::DependencyTable::sortAndDedupe(output.deps);
+  auto scanEndTime = std::chrono::steady_clock::now();
+  auto totalScanTime = std::chrono::duration_cast<std::chrono::milliseconds>(scanEndTime - scanStartTime).count();
+
+  std::size_t totalParsed = 0;
+  std::size_t totalNodeModulesParsed = 0;
+  for (const ThreadLocalBuffer& local : threadLocal) {
+    totalParsed += local.parsedCount;
+    totalNodeModulesParsed += local.nodeModulesParsed;
+  }
+
+  std::cout << "\n[node_modules] count: " << nodeModulesFound << "\n";
+  std::cout << "[node_modules] parsed: " << totalNodeModulesParsed << "\n";
+  
+  std::cout << "\n[SUMMARY]\n"
+            << "Total discovered files: " << discovered.size() << "\n"
+            << "Total queued files: " << totalQueued << "\n"
+            << "Total parsed files: " << totalParsed << "\n"
+            << "Total time: " << totalScanTime << " ms\n"
+            << std::endl;
 
   return true;
 }

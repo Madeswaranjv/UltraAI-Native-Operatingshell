@@ -835,9 +835,12 @@ struct RuntimeDispatcher {
       return false;
     }
 
-    // Step 4 — rebuild in-memory symbol index and edges
-    // (identical to what rebuildIndex() does after a full scan)
-    rebuildSymbolEdges(state);
+    // Step 4 — restore the persisted index without regenerating deps.symbolEdges.
+    // deps.tbl already carries persisted symbol edges; recomputing them from the
+    // loaded state would drop semantic edges because semanticSymbolDepsByFileId
+    // is not serialized.
+    ultra::ai::SymbolTable::sortDeterministic(state.symbols);
+    ultra::ai::DependencyTable::sortAndDedupe(state.deps);
     state.symbolIndex = buildSymbolIndex(state.files, state.symbols, state.deps);
 
     // Step 5 — load into stateManager, same call path as after a full rebuild

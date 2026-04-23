@@ -6,7 +6,7 @@
 #include "../ai/SymbolTable.h"
 #include "parallel/ParallelScanner.h"
 #include "../runtime/CPUGovernor.h"
-
+#include<iostream>
 #include <algorithm>
 #include <chrono>
 #include <map>
@@ -271,6 +271,15 @@ std::size_t Scanner::countFiles() const {
 }
 
 bool Scanner::fullScanParallel(ScanOutput& output, std::string& error) const {
+  const std::vector<ai::DiscoveredFile> discovered =
+      ai::FileRegistry::discoverProjectFiles(projectRoot_);
+  return fullScanParallel(discovered, output, error);
+}
+
+bool Scanner::fullScanParallel(
+    const std::vector<ai::DiscoveredFile>& discoveredFiles,
+    ScanOutput& output,
+    std::string& error) const {
   output = ScanOutput{};
   struct ScopedWorkloadTimer {
     runtime::CPUGovernor& governor;
@@ -307,13 +316,21 @@ bool Scanner::fullScanParallel(ScanOutput& output, std::string& error) const {
                                           currentFilesByPath, resolvedPath);
       };
 
-  if (!parallelScanner.runFullScan(dependencyResolver, parallelResult, error)) {
+  if (!parallelScanner.runFullScan(discoveredFiles, dependencyResolver,
+                                   parallelResult, error)) {
     return false;
   }
 
   output.files = std::move(parallelResult.files);
   output.symbols = std::move(parallelResult.symbols);
   output.deps = std::move(parallelResult.deps);
+  for (const auto& file : output.files) {
+  std::cout << "[REBUILD_AI] Parsed file: "
+            << file.path
+            << " | Lang: "
+            << static_cast<int>(file.language)
+            << std::endl;
+}
   output.semanticSymbolDepsByFileId =
       std::move(parallelResult.semanticSymbolDepsByFileId);
 

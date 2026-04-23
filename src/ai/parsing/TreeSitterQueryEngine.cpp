@@ -561,6 +561,10 @@ TSQuery* getQuery(const TSLanguage* language,
 
 }  // namespace
 
+bool TreeSitterQueryEngine::hasPatterns(const Language language) {
+  return !patternsForLanguage(language).empty();
+}
+
 std::vector<SemanticSymbol> TreeSitterQueryEngine::execute(
     const TSNode& root,
     const std::string& source,
@@ -718,6 +722,10 @@ std::vector<SemanticSymbol> TreeSitterQueryEngine::execute(
 }
 
 #else
+
+bool TreeSitterQueryEngine::hasPatterns(const Language /*language*/) {
+  return false;
+}
 
 std::vector<SemanticSymbol> TreeSitterQueryEngine::execute(
     const TSNode& /*root*/,
