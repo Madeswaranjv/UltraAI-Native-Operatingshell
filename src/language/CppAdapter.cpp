@@ -477,7 +477,7 @@
     lastPatchOutcome_["applied"] = true;
 
     const bool buildRequired =
-        ultra::build::BuildExecutor::projectHasBuildSystem(root);
+        ultra::build::BuildEngine::projectHasBuildSystem(root);
     lastPatchOutcome_["build_required"] = buildRequired;
     if (!buildRequired) {
       lastBuildExitCode_ = 0;

@@ -1,4 +1,4 @@
-#include "CLIEngine.h"
+﻿#include "CLIEngine.h"
 #include "CommandOptionsParser.h"
 #include "CommandRouter.h"
 #include "../authority/UltraAuthorityAPI.h"
@@ -37,6 +37,7 @@
 #include "../incremental/IncrementalAnalyzer.h"
 #include "../language/AdapterFactory.h"
 #include "../language/ILanguageAdapter.h"
+#include "../patch/UnifiedPatchService.h"
 #include "../scanner/FileInfo.h"
 #include "../utils/PathUtils.h"
 #include "external/json.hpp"
@@ -2871,57 +2872,82 @@ void CLIEngine::registerHandlers() {
                            });
   m_router.registerCommand("apply_patch",
                            [this](const std::vector<std::string>& args) {
-                              try {
-                                const std::string& projectPathStr = args.at(0);
-                                const std::string& diffPathStr = args.at(1);
+                             try {
+                               if (args.size() < 2) {
+                                 ultra::core::Logger::error(
+                                     "Command 'apply_patch' requires project path and diff file.");
+                                 m_lastExitCode = 1;
+                                 return;
+                               }
+                               const std::string& projectPathStr = args.at(0);
+                               const std::string& diffPathStr    = args.at(1);
+
+                               bool noBuild = false;
+                               for (std::size_t i = 2; i < args.size(); ++i) {
+                                 if (args[i] == "--no-build") noBuild = true;
+                               }
+
                                std::filesystem::path projectPath =
                                    ultra::utils::resolvePath(projectPathStr);
                                std::filesystem::path diffPath =
                                    ultra::utils::resolvePath(diffPathStr);
+
                                if (!ultra::utils::pathExists(projectPath)) {
                                  ultra::core::Logger::error(
-                                     "Invalid project path: " +
-                                     projectPath.string());
+                                     "Invalid project path: " + projectPath.string());
                                  m_lastExitCode = 1;
                                  return;
                                }
                                if (!ultra::utils::isDirectory(projectPath)) {
                                  ultra::core::Logger::error(
-                                     "Project path is not a directory: " +
-                                     projectPath.string());
+                                     "Project path is not a directory: " + projectPath.string());
                                  m_lastExitCode = 1;
                                  return;
                                }
                                if (!std::filesystem::exists(diffPath) ||
                                    !std::filesystem::is_regular_file(diffPath)) {
                                  ultra::core::Logger::error(
-                                     "Diff file not found or not a file: " +
-                                     diffPath.string());
+                                     "Diff file not found or not a file: " + diffPath.string());
                                  m_lastExitCode = 1;
                                  return;
                                }
-                                std::unique_ptr<
-                                    ultra::language::ILanguageAdapter>
-                                    adapter =
-                                        ultra::language::AdapterFactory::create(
-                                            projectPath);
-                                bool ok =
-                                    adapter->applyPatch(projectPath, diffPath);
-                                std::cout << adapter->lastPatchOutcome().dump() << '\n';
-                                const int patchExitCode = adapter->getLastBuildExitCode();
-                                m_lastExitCode =
-                                    ok ? 0 : (patchExitCode == 0 ? 1 : patchExitCode);
-                              } catch (const std::exception& e) {
-                                ultra::core::Logger::error(std::string(
-                                    "Apply patch failed: ") + e.what());
+
+                               std::ifstream fin(diffPath, std::ios::binary);
+                               if (!fin.is_open()) {
+                                 ultra::core::Logger::error(
+                                     "Cannot read diff file: " + diffPath.string());
+                                 m_lastExitCode = 1;
+                                 return;
+                               }
+                               const std::string diffText(
+                                   (std::istreambuf_iterator<char>(fin)),
+                                   std::istreambuf_iterator<char>());
+
+                               ultra::patch::UnifiedPatchRequest req;
+                               req.projectPath = projectPath;
+                               req.diffText    = diffText;
+                               req.source      = ultra::patch::PatchSource::CLI;
+                               req.noBuild     = noBuild;
+
+                               ultra::patch::UnifiedPatchService svc;
+                               const ultra::patch::UnifiedPatchResult result = svc.apply(req);
+
+                               std::cout << ultra::patch::patchResultToJson(result) << '\n';
+                               m_lastExitCode = result.ok ? 0 : 1;
+
+                             } catch (const std::out_of_range&) {
+                               ultra::core::Logger::error(
+                                   "Command 'apply_patch' requires project path and diff file.");
+                               m_lastExitCode = 1;
+                             } catch (const std::exception& e) {
+                               ultra::core::Logger::error(
+                                   std::string("Apply patch failed: ") + e.what());
                                m_lastExitCode = 1;
                              } catch (...) {
-                               ultra::core::Logger::error(
-                                   "Apply patch failed: unknown error.");
+                               ultra::core::Logger::error("Apply patch failed: unknown error.");
                                m_lastExitCode = 1;
-                              }
-                            });
-  m_router.registerCommand("memory", [this](const std::vector<std::string>& args) {
+                             }
+                           });  m_router.registerCommand("memory", [this](const std::vector<std::string>& args) {
     const std::string& subcmd = args.at(0);
     // Temporary scaffolding that logs the memory commands. Full implementation
     // will link with SnapshotChain & SnapshotPersistence.

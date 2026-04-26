@@ -1,0 +1,5 @@
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ULTRA">
+  <rect x="10" y="10" width="108" height="108" rx="20" fill="#0f172a"/>
+  <path d="M34 38v34c0 13 7 20 20 20s20-7 20-20V38h-10v34c0 7-3 11-10 11s-10-4-10-11V38H34z" fill="#38bdf8"/>
+  <path d="M82 38h12l10 22 10-22h10l-16 34v20h-10V72L82 38z" fill="#22d3ee"/>
+</svg>

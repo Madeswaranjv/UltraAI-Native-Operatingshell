@@ -1,0 +1,193 @@
+{
+  "name": "ultra-vscode",
+  "displayName": "ULTRA",
+  "description": "ULTRA developer copilot for explain/fix/refactor workflows with safe patch review and rollback.",
+  "version": "0.1.0",
+  "publisher": "ultra-infinity",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other",
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:ultra.sidebar",
+    "onCommand:ultra.openPanel",
+    "onCommand:ultra.runHealthCheck",
+    "onCommand:ultra.rollbackLast",
+    "onCommand:ultra.openSettings",
+    "onCommand:ultra.openLastPatchDebug",
+    "onCommand:ultra.task.fixBug",
+    "onCommand:ultra.task.explain",
+    "onCommand:ultra.task.refactor",
+    "onCommand:ultra.task.addTests",
+    "onCommand:ultra.task.optimize",
+    "onCommand:ultra.task.architecture",
+    "onCommand:ultra.task.heavy"
+  ],
+  "main": "./src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "ultra.openPanel",
+        "title": "ULTRA: Open Panel"
+      },
+      {
+        "command": "ultra.runHealthCheck",
+        "title": "ULTRA: Health Check"
+      },
+      {
+        "command": "ultra.rollbackLast",
+        "title": "ULTRA: Rollback Last"
+      },
+      {
+        "command": "ultra.openSettings",
+        "title": "ULTRA: Open Settings"
+      },
+      {
+        "command": "ultra.openLastPatchDebug",
+        "title": "ULTRA: Open Last Patch Debug Report"
+      },
+      {
+        "command": "ultra.task.fixBug",
+        "title": "ULTRA: Fix Bug"
+      },
+      {
+        "command": "ultra.task.explain",
+        "title": "ULTRA: Explain Code"
+      },
+      {
+        "command": "ultra.task.refactor",
+        "title": "ULTRA: Refactor"
+      },
+      {
+        "command": "ultra.task.addTests",
+        "title": "ULTRA: Add Tests"
+      },
+      {
+        "command": "ultra.task.optimize",
+        "title": "ULTRA: Optimize"
+      },
+      {
+        "command": "ultra.task.architecture",
+        "title": "ULTRA: Architecture"
+      },
+      {
+        "command": "ultra.task.heavy",
+        "title": "ULTRA: Heavy Reasoning"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ultra",
+          "title": "ULTRA",
+          "icon": "resources/ultra.svg"
+        }
+      ]
+    },
+    "views": {
+      "ultra": [
+        {
+          "id": "ultra.sidebar",
+          "type": "webview",
+          "name": "Ask ULTRA"
+        }
+      ]
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "ultra.openPanel"
+        },
+        {
+          "command": "ultra.runHealthCheck"
+        },
+        {
+          "command": "ultra.rollbackLast"
+        },
+        {
+          "command": "ultra.openSettings"
+        },
+        {
+          "command": "ultra.openLastPatchDebug"
+        },
+        {
+          "command": "ultra.task.fixBug"
+        },
+        {
+          "command": "ultra.task.explain"
+        },
+        {
+          "command": "ultra.task.refactor"
+        },
+        {
+          "command": "ultra.task.addTests"
+        },
+        {
+          "command": "ultra.task.optimize"
+        },
+        {
+          "command": "ultra.task.architecture"
+        },
+        {
+          "command": "ultra.task.heavy"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "ultra.runHealthCheck",
+          "when": "view == ultra.sidebar",
+          "group": "navigation"
+        },
+        {
+          "command": "ultra.rollbackLast",
+          "when": "view == ultra.sidebar",
+          "group": "navigation@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "ULTRA",
+      "properties": {
+        "ultra.validationCommand": {
+          "type": "string",
+          "default": "ctest --test-dir build -C Release --output-on-failure",
+          "markdownDescription": "Command run after patch apply for validation."
+        },
+        "ultra.maxContextFileChars": {
+          "type": "number",
+          "default": 12000,
+          "minimum": 1000,
+          "maximum": 100000,
+          "markdownDescription": "Maximum characters loaded per context file."
+        },
+        "ultra.autoWakeDaemon": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Automatically start ULTRA daemon when needed."
+        },
+        "ultra.enableAnalytics": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Enable privacy-safe local analytics (no code content)."
+        },
+        "ultra.additionalContextFiles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Always-include relative file paths for task context."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "check": "node --check src/extension.js"
+  },
+  "devDependencies": {}
+}
