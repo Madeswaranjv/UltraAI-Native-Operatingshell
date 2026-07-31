@@ -45,6 +45,20 @@ std::string quoteForShell(const std::string& raw) {
   return escaped;
 }
 
+std::string astContextTargetForPath(const std::string& rawTarget) {
+  const std::filesystem::path raw(rawTarget);
+  std::error_code ec;
+  if (std::filesystem::is_regular_file(raw, ec)) {
+    const std::filesystem::path parent = raw.parent_path();
+    return parent.empty() ? "." : parent.string();
+  }
+  if (raw.has_extension()) {
+    const std::filesystem::path parent = raw.parent_path();
+    return parent.empty() ? "." : parent.string();
+  }
+  return rawTarget.empty() ? "." : rawTarget;
+}
+
 std::string commandWithWorkingDirectory(const std::filesystem::path& cwd,
                                         const std::string& command) {
 #if defined(_WIN32)
@@ -957,7 +971,8 @@ std::optional<std::string> ToolRouter::build_command(
   if (tool == "ast_context") {
     const std::string target =
         find_argument(args, "path").value_or(std::string{"."});
-    return wrap_with_cwd("ultra context --ast " + quote_argument(target));
+    return wrap_with_cwd("ultra context --ast " +
+                         quote_argument(astContextTargetForPath(target)));
   }
 
   if (tool == "verify_index") {

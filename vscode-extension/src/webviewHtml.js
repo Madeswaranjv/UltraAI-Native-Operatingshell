@@ -179,23 +179,42 @@ function getWebviewHtml(webview) {
 <body>
   <div class="block">
     <div class="title">Ask ULTRA</div>
-    <div class="row">
-      <button class="mode active" data-mode="fixBug">Fix Bug</button>
-      <button class="mode secondary" data-mode="explain">Explain</button>
-      <button class="mode secondary" data-mode="refactor">Refactor</button>
-      <button class="mode secondary" data-mode="addTests">Add Tests</button>
-      <button class="mode secondary" data-mode="optimize">Optimize</button>
-      <button class="mode secondary" data-mode="architecture">Architecture</button>
-      <button class="mode secondary" data-mode="heavy">Heavy Reasoning</button>
-    </div>
     <textarea id="taskInput" placeholder="Describe what ULTRA should do..."></textarea>
-    <div class="row" style="margin-top:8px;">
+    
+    <div style="margin-top: 8px; font-size: 11px;">
+      <span class="muted">Examples:</span>
+      <span class="example-prompt" style="cursor:pointer; color:var(--vscode-textLink-foreground); margin-right: 6px;">Fix compile error in scanner.cpp</span>
+      <span class="example-prompt" style="cursor:pointer; color:var(--vscode-textLink-foreground); margin-right: 6px;">Explain this module</span>
+      <span class="example-prompt" style="cursor:pointer; color:var(--vscode-textLink-foreground);">Add tests for auth service</span>
+    </div>
+
+    <div class="row" style="margin-top:8px; align-items: center;">
       <button id="runTask">Run Task</button>
+      <select id="executionMode" style="background: var(--input-bg); color: var(--input-fg); border: 1px solid var(--input-border); border-radius: 4px; padding: 4px; font-size: 11px;">
+        <option value="auto">Auto Mode</option>
+        <option value="safe">Safe Mode</option>
+        <option value="fast">Fast Mode</option>
+        <option value="deep">Deep Mode</option>
+      </select>
       <button id="healthCheck" class="secondary">Health Check</button>
       <button id="rollback" class="secondary">Rollback</button>
       <button id="settings" class="secondary">Settings</button>
     </div>
     <div class="muted">Context: selected text, current file, current symbol, workspace.</div>
+
+    <details style="margin-top: 8px;">
+      <summary class="muted" style="cursor: pointer; font-size: 11px;">Debug / Manual Modes</summary>
+      <div class="row" style="margin-top: 6px;">
+        <button class="mode active" data-mode="auto">Auto</button>
+        <button class="mode secondary" data-mode="fixBug">Fix Bug</button>
+        <button class="mode secondary" data-mode="explain">Explain</button>
+        <button class="mode secondary" data-mode="refactor">Refactor</button>
+        <button class="mode secondary" data-mode="addTests">Add Tests</button>
+        <button class="mode secondary" data-mode="optimize">Optimize</button>
+        <button class="mode secondary" data-mode="architecture">Architecture</button>
+        <button class="mode secondary" data-mode="heavy">Heavy Reasoning</button>
+      </div>
+    </details>
   </div>
 
   <div class="block" id="modelsControlBlock" style="display:none;">
@@ -230,7 +249,7 @@ function getWebviewHtml(webview) {
 
   <script nonce="${scriptNonce}">
     const vscode = acquireVsCodeApi();
-    let currentMode = "fixBug";
+    let currentMode = "auto";
     let currentRequestId = null;
     let currentReviewFiles = [];
 
@@ -326,11 +345,13 @@ function getWebviewHtml(webview) {
         appendStatus("Provide a task prompt first.");
         return;
       }
+      const executionMode = document.getElementById("executionMode").value;
       clearResult();
       appendStatus("Task queued...");
       vscode.postMessage({
         type: "runTask",
         mode: currentMode,
+        executionMode: executionMode,
         prompt
       });
     }
@@ -375,6 +396,13 @@ function getWebviewHtml(webview) {
 
     document.querySelectorAll("button.mode").forEach((button) => {
       button.addEventListener("click", () => setMode(button.getAttribute("data-mode")));
+    });
+
+    document.querySelectorAll(".example-prompt").forEach((span) => {
+      span.addEventListener("click", () => {
+        taskInput.value = span.textContent;
+        runTask();
+      });
     });
     
     // Request models data on load

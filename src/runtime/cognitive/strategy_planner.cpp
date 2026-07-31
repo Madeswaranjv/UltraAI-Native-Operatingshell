@@ -567,17 +567,42 @@ model::ModelRequest buildModelRequest(const intent::Intent& intentValue) {
   request.intentReference =
       intent::toString(intentValue.goal.type) + ":" + intentValue.goal.target;
 
-  request.prompt =
+  const std::string baseInstruction =
       "Generate one strategy step for UltraInfinity. Return either structured "
       "JSON fields or key-value lines with keys: name, action_kind, target, "
       "details, estimated_files_changed, estimated_dependency_depth, "
       "public_api_surface.";
+
+  std::string intentGuidance;
+  if (!intentValue.rawPrompt.empty()) {
+    const std::string lp = intentValue.rawPrompt;
+    if (lp.find("fix") != std::string::npos || lp.find("bug") != std::string::npos || lp.find("error") != std::string::npos || lp.find("crash") != std::string::npos) {
+      intentGuidance = "Strategy type: bugfix. Flow: gather diagnostics, read active file, check build errors, generate targeted patch, verify fix, retry if same error.";
+    } else if (lp.find("explain") != std::string::npos || lp.find("why") != std::string::npos) {
+      intentGuidance = "Strategy type: analysis. Flow: gather source and symbol graph, produce explanation only. Do NOT generate patches.";
+    } else if (lp.find("test") != std::string::npos || lp.find("assert") != std::string::npos) {
+      intentGuidance = "Strategy type: testing. Flow: discover test framework, generate test files, run tests if possible.";
+    } else if (lp.find("refactor") != std::string::npos || lp.find("clean") != std::string::npos) {
+      intentGuidance = "Strategy type: refactor. Flow: analyze dependencies, apply safe structural edits, preserve behavior, run tests if available.";
+    } else if (lp.find("optimize") != std::string::npos || lp.find("performance") != std::string::npos || lp.find("faster") != std::string::npos) {
+      intentGuidance = "Strategy type: optimization. Flow: identify hot paths, propose improvements, benchmark if possible.";
+    } else if (lp.find("architecture") != std::string::npos || lp.find("design") != std::string::npos) {
+      intentGuidance = "Strategy type: architecture. Flow: analyze module graph, produce architecture explanation. Do NOT generate patches.";
+    } else {
+      intentGuidance = "Strategy type: implementation. Flow: plan files to create or modify, generate code, patch files, verify.";
+    }
+    std::cerr << "[ULTRA-PLANNER] " << intentGuidance << std::endl;
+    request.prompt = "User Intent: " + intentValue.rawPrompt + "\n" + intentGuidance + "\n\n" + baseInstruction;
+  } else {
+    request.prompt = baseInstruction;
+  }
 
   request.context = {
       {"goal", { {"type", intent::toString(intentValue.goal.type)},
                   {"target", intentValue.goal.target} }},
       {"risk_tolerance", intent::toString(intentValue.risk)},
       {"branch_scope", intentValue.constraints.branchScope},
+      {"raw_prompt", intentValue.rawPrompt},
       {"memory", {
           {"query_key", intentValue.memory.queryKey},
           {"successful_patterns", intentValue.memory.successfulPatterns},
@@ -932,12 +957,19 @@ StageResult StrategyPlanningStage::run(UltraLoopFrame& frame) {
   StageResult result;
 
   const intent::Intent planningIntent = planningIntentFromFrame(frame);
+  std::cerr << "[ULTRA-PLANNER] Strategy=" << intent::toString(planningIntent.goal.type)
+            << " target=" << planningIntent.goal.target
+            << " rawPrompt=" << (planningIntent.rawPrompt.empty() ? "<none>" : planningIntent.rawPrompt.substr(0, 80))
+            << std::endl;
   const intent::Strategy strategy = planner_.generate(planningIntent);
 
   frame.strategyId = strategy.name.empty()
                          ? "strategy_" + std::to_string(frame.iteration)
                          : strategy.name;
   frame.microTaskPayloads = payloadsFromStrategy(strategy, planningIntent);
+
+  std::cerr << "[ULTRA-PLANNER] Generated strategy=" << frame.strategyId
+            << " actions=" << frame.microTaskPayloads.size() << std::endl;
 
   if (frame.microTaskPayloads.empty()) {
     result.success = false;

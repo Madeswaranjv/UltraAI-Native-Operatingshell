@@ -3,6 +3,7 @@
 const { spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const { safeLog } = require("./logging");
 
 function tail(text, maxChars) {
   const value = String(text || "");
@@ -54,9 +55,7 @@ class UltraBridge {
   }
 
   _log(message) {
-    if (this.output) {
-      this.output.appendLine(`[bridge] ${message}`);
-    }
+    safeLog(this.output, `[bridge] ${message}`, "[bridge]");
   }
 
   _runCommand(executable, args, options) {
@@ -287,6 +286,126 @@ class UltraBridge {
       symbolInfo,
       files
     };
+  }
+
+  async executeUltraBrain(payload, progress, onLlmRequest) {
+    if (typeof progress === "function") {
+      progress("starting", "Launching ULTRA Brain...");
+    }
+
+    const tmpDir = path.join(this.workspaceRoot, ".ultra");
+    await fs.mkdir(tmpDir, { recursive: true });
+    const tmpFile = path.join(tmpDir, "tmp_cognitive_run_" + Date.now() + ".json");
+    await fs.writeFile(tmpFile, JSON.stringify(payload), "utf8");
+    
+    return new Promise((resolve, reject) => {
+      const env = Object.assign({}, process.env, { ULTRA_JS_BRIDGE: "1" });
+      const child = spawn("ultra", ["cognitive_run", "--file", tmpFile], {
+        cwd: this.workspaceRoot || process.cwd(),
+        shell: false,
+        env: env,
+        windowsHide: true
+      });
+
+      let stdout = "";
+      let stderr = "";
+      let stdoutLineBuffer = "";
+
+      const onStdout = (chunk) => {
+        const text = chunk.toString();
+        stdout += text;
+        stdoutLineBuffer += text;
+        const parts = stdoutLineBuffer.split(/\r?\n/);
+        stdoutLineBuffer = parts.pop() || "";
+        
+        for (const line of parts) {
+          if (!line.trim()) continue;
+          try {
+            const event = JSON.parse(line);
+            if (event.type === "status" && typeof progress === "function") {
+              progress("brain", event.message);
+            } else if (event.type === "llm_request" && typeof onLlmRequest === "function") {
+              onLlmRequest(event).then(response => {
+                child.stdin.write(JSON.stringify({ type: "llm_response", content: response.content }) + "\n");
+              }).catch(err => {
+                child.stdin.write(JSON.stringify({ type: "llm_error", message: err.message }) + "\n");
+              });
+            } else if (event.status === "ok" || event.status === "error") {
+              // Final payload detected
+            } else if (typeof progress === "function" && event.type !== "llm_response") {
+              progress("brain", `[Event] ${line}`);
+            }
+          } catch (e) {
+            // Not JSON, ignore or log
+            this._log(`[CORE] ${line}`);
+          }
+        }
+      };
+
+      const onStderr = (chunk) => {
+        const text = chunk.toString();
+        stderr += text;
+        this._log(`[CORE STDERR] ${text.trim()}`);
+      };
+
+      child.stdout.on("data", onStdout);
+      child.stderr.on("data", onStderr);
+
+      child.on("error", (error) => {
+        fs.unlink(tmpFile).catch(() => {});
+        reject(error);
+      });
+
+      child.on("close", (code) => {
+        fs.unlink(tmpFile).catch(() => {});
+        if (stdoutLineBuffer.trim()) {
+           try {
+             const event = JSON.parse(stdoutLineBuffer);
+             if (event.type === "status" && typeof progress === "function") {
+               progress("brain", event.message);
+             }
+           } catch(e) {}
+        }
+
+        try {
+          // Parse the final JSON response from stdout
+          const lines = stdout.split(/\r?\n/);
+          let finalResponse = null;
+          for (let i = lines.length - 1; i >= 0; i--) {
+            const line = lines[i].trim();
+            if (!line) continue;
+            try {
+              const parsed = JSON.parse(line);
+              if (parsed.status) {
+                finalResponse = parsed;
+                break;
+              }
+            } catch (e) {}
+          }
+
+          if (finalResponse) {
+            if (finalResponse.status === "error") {
+               reject(new Error(finalResponse.error || "ULTRA Brain failed without specific error message."));
+               return;
+            }
+            resolve({
+               diff: finalResponse.output || finalResponse.text_output || "",
+               summary: finalResponse.execution_summary || "ULTRA Brain execution complete.",
+               rawResponse: finalResponse
+            });
+          } else {
+             // Fallback if no final structured JSON was found
+             resolve({
+                diff: "",
+                summary: "ULTRA Brain executed but returned no structured output.",
+                rawResponse: null
+             });
+          }
+        } catch (e) {
+          reject(new Error(`Failed to parse ULTRA Brain response: ${e.message}\nStderr: ${stderr}`));
+        }
+      });
+    });
   }
 
   async runValidation(validationCommand, progress) {

@@ -1366,11 +1366,14 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
   auto transitionTo = [&](const UltraLoopState nextState, std::string reason) {
     const UltraLoopState currentState = state;
     const std::string logReason = reason;
-    std::cerr << "[UltraLoop][Transition] from=" << toString(currentState)
-              << " to=" << toString(nextState)
+    std::cerr << "[ULTRA-LOOP] State=" << toString(nextState)
+              << " from=" << toString(currentState)
               << " reason=" << logReason << "\n";
     report.transitions.push_back({currentState, nextState, std::move(reason)});
     state = nextState;
+    if (config_.statusHook) {
+      config_.statusHook(state, logReason);
+    }
   };
 
   auto notifyFailure = [&](const StageResult& result) {
@@ -1576,6 +1579,21 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
         }
         if (action.branch.empty()) {
           action.branch = stateRef.snapshot.branch.toString();
+        }
+        if (!frame.externalContextPayload.empty() &&
+            action.modelRequest.has_value()) {
+          if (!action.modelRequest->contextPayload.is_object()) {
+            action.modelRequest->contextPayload =
+                nlohmann::ordered_json::object();
+          }
+          nlohmann::ordered_json& payload = action.modelRequest->contextPayload;
+          for (auto it = frame.externalContextPayload.begin();
+               it != frame.externalContextPayload.end();
+               ++it) {
+            if (!payload.contains(it.key())) {
+              payload[it.key()] = it.value();
+            }
+          }
         }
 
         const ::ultra::runtime::contracts::ScopedTaskGraphAuthorization
@@ -1795,6 +1813,7 @@ UltraLoopReport UltraLoop::run(const UltraLoopBindings& bindings) const {
         frame.intentRiskThreshold = 0.66;
         frame.hasStructuredIntent = false;
         frame.structuredIntent = {};
+        frame.externalContextPayload = nlohmann::ordered_json::object();
 
         frame.intentId.clear();
         frame.strategyId.clear();

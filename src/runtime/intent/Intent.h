@@ -93,6 +93,7 @@ struct Intent {
   RiskTolerance risk{RiskTolerance::MEDIUM};
   StrategyOptions options;
   IntentMemoryContext memory;
+  std::string rawPrompt;
 };
 
 [[nodiscard]] std::string toString(GoalType type);

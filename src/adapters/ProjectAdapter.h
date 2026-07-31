@@ -13,6 +13,7 @@ class ProjectAdapter {
   virtual void run(const ultra::cli::CommandOptions& options) = 0;
   virtual void clean(const ultra::cli::CommandOptions& options) = 0;
   virtual int lastExitCode() const noexcept = 0;
+  virtual std::string lastOutput() const noexcept = 0;
   virtual ~ProjectAdapter() = default;
 };
 

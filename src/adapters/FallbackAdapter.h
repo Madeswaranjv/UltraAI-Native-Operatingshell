@@ -19,6 +19,7 @@ class FallbackAdapter final : public ProjectAdapter {
   void run(const ultra::cli::CommandOptions& options) override;
   void clean(const ultra::cli::CommandOptions& options) override;
   int lastExitCode() const noexcept override;
+  std::string lastOutput() const noexcept override { return m_lastOutput; }
 
  private:
   enum class Action { Install, Dev, Build, Test, Run, Clean };
@@ -34,6 +35,7 @@ class FallbackAdapter final : public ProjectAdapter {
   std::filesystem::path m_rootPath;
   ultra::core::ProjectType m_projectType;
   int m_lastExitCode{0};
+  std::string m_lastOutput;
 };
 
 }  // namespace ultra::adapters

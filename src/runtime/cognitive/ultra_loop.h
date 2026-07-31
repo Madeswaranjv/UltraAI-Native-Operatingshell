@@ -144,6 +144,8 @@ struct UltraLoopFrame {
   ::ultra::runtime::intent::Intent structuredIntent{};
   bool hasOriginalStructuredIntent{false};
   ::ultra::runtime::intent::Intent originalStructuredIntent{};
+  nlohmann::ordered_json externalContextPayload =
+      nlohmann::ordered_json::object();
 
   std::vector<TaskPayload> microTaskPayloads;
   bool hasTaskGraph{false};
@@ -295,6 +297,7 @@ struct UltraLoopConfig {
                      const StageResult&,
                      const UltraLoopFrame&)>
       failureHook;
+  std::function<void(UltraLoopState, const std::string&)> statusHook;
 };
 
 struct UltraLoopReport {

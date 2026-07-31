@@ -153,7 +153,7 @@ int RustAdapter::execute(const std::string& command,
   if (!ensureCargoAvailable(options)) {
     return 1;
   }
-  return runCommand(m_rootPath, command, options);
+  return runCommand(m_rootPath, command, options, &m_lastOutput);
 }
 
 }  // namespace ultra::adapters

@@ -79,10 +79,12 @@ namespace {
 }
 
 [[nodiscard]] Intent buildStructuredIntent(
+    const std::string& input,
     const ::ultra::authority::AuthorityIntentRequest& request,
     const ::ultra::authority::SimulatedIntentResult& simulation,
     const std::size_t fallbackTokenBudget) {
   Intent intent;
+  intent.rawPrompt = input;
   intent.goal.type = classifyIntentGoal(request, simulation);
   intent.goal.target = request.target.empty() ? request.goal : request.target;
   intent.constraints.maxImpactDepth = std::max<std::size_t>(1U, request.impactDepth);
@@ -162,6 +164,7 @@ namespace {
 
 Intent IntentRuntime::process_input(const std::string& input) const {
   Intent intent;
+  intent.rawPrompt = input;
   intent.goal.type = GoalType::ModifySymbol;
   intent.goal.target = input;
   return normalizeIntent(intent, 4096U);
@@ -201,7 +204,7 @@ Intent IntentRuntime::resolve_structured_intent(const std::string& input,
   const std::size_t fallbackTokenBudget =
       request.tokenBudget == 0U ? 4096U : request.tokenBudget;
   return applyMemoryContext(
-      buildStructuredIntent(request, simulation, fallbackTokenBudget),
+      buildStructuredIntent(input, request, simulation, fallbackTokenBudget),
       frame.memory,
       fallbackTokenBudget);
 }

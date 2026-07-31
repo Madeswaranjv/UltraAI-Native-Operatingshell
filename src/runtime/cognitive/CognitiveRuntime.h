@@ -76,7 +76,10 @@ class CognitiveRuntime {
   [[nodiscard]] GovernanceSignal currentGovernanceSignal() const;
   [[nodiscard]] CognitiveLoopResult run(
       const intent::Intent& intentValue,
-      const governance::Policy& policy);
+      const governance::Policy& policy,
+      std::function<void(const std::string&)> statusHook = nullptr,
+      nlohmann::ordered_json externalContextPayload =
+          nlohmann::ordered_json::object());
 
  private:
   core::StateManager& stateManager_;

@@ -1,4 +1,4 @@
-﻿#include "CLIEngine.h"
+#include "CLIEngine.h"
 #include "CommandOptionsParser.h"
 #include "CommandRouter.h"
 #include "../authority/UltraAuthorityAPI.h"
@@ -2097,6 +2097,64 @@ std::vector<std::string> parseStringArray(const nlohmann::json& value) {
   }
   return result;
 }
+
+std::string normalizePayloadPath(const std::string& value) {
+  if (value.empty()) {
+    return {};
+  }
+
+  std::string normalized = value;
+  std::replace(normalized.begin(), normalized.end(), '\\', '/');
+  normalized =
+      std::filesystem::path(normalized).lexically_normal().generic_string();
+  if (normalized == ".") {
+    return {};
+  }
+  if (normalized.size() >= 2U && normalized[0] == '.' && normalized[1] == '/') {
+    normalized.erase(0, 2U);
+  }
+  return normalized;
+}
+
+std::string truncateContextText(std::string value, const std::size_t maxChars) {
+  if (value.size() <= maxChars) {
+    return value;
+  }
+  value.resize(maxChars);
+  value += "\n... [truncated]";
+  return value;
+}
+
+nlohmann::ordered_json parseInlineFiles(const nlohmann::json& value) {
+  nlohmann::ordered_json result = nlohmann::ordered_json::array();
+  if (!value.is_array()) {
+    return result;
+  }
+
+  constexpr std::size_t kMaxInlineFiles = 8U;
+  constexpr std::size_t kMaxCharsPerFile = 12000U;
+  for (const nlohmann::json& item : value) {
+    if (!item.is_object()) {
+      continue;
+    }
+
+    const std::string path = normalizePayloadPath(
+        item.value("path", std::string{}));
+    const std::string content =
+        truncateContextText(item.value("content", std::string{}),
+                            kMaxCharsPerFile);
+    if (path.empty() || content.empty()) {
+      continue;
+    }
+
+    result.push_back({{"path", path}, {"content", content}});
+    if (result.size() >= kMaxInlineFiles) {
+      break;
+    }
+  }
+  return result;
+}
+
 void printHelp() {
   std::cout << "Ultra CLI\n\n";
   std::cout << "Usage:\n";
@@ -3726,15 +3784,43 @@ void CLIEngine::registerHandlers() {
           payload.value("intent", nlohmann::json::object());
       const nlohmann::json sessionPayload =
           payload.value("session", nlohmann::json::object());
+      const nlohmann::json contextPayload =
+          payload.value("context", nlohmann::json::object());
       const nlohmann::json governancePayload =
-          sessionPayload.value("governance", nlohmann::json::object());
+          sessionPayload.contains("governance")
+              ? sessionPayload.value("governance", nlohmann::json::object())
+              : payload.value("governance", nlohmann::json::object());
       const nlohmann::json policyPayload =
-          sessionPayload.value("policy", nlohmann::json::object());
+          sessionPayload.contains("policy")
+              ? sessionPayload.value("policy", nlohmann::json::object())
+              : payload.value("policy", nlohmann::json::object());
 
       const std::string rawPrompt =
           intentPayload.value("raw_prompt", std::string{});
-      const std::string actionLabel =
+      std::string actionLabel =
           toLowerAscii(intentPayload.value("action", std::string{}));
+
+      if (actionLabel == "auto" && !rawPrompt.empty()) {
+        std::string lowerPrompt = toLowerAscii(rawPrompt);
+        if (lowerPrompt.find("fix") != std::string::npos || lowerPrompt.find("bug") != std::string::npos || lowerPrompt.find("error") != std::string::npos || lowerPrompt.find("crash") != std::string::npos) {
+          actionLabel = "fixbug";
+        } else if (lowerPrompt.find("explain") != std::string::npos || lowerPrompt.find("why") != std::string::npos || lowerPrompt.find("how does") != std::string::npos) {
+          actionLabel = "explain";
+        } else if (lowerPrompt.find("test") != std::string::npos || lowerPrompt.find("assert") != std::string::npos || lowerPrompt.find("coverage") != std::string::npos) {
+          actionLabel = "addtests";
+        } else if (lowerPrompt.find("refactor") != std::string::npos || lowerPrompt.find("clean up") != std::string::npos || lowerPrompt.find("restructure") != std::string::npos) {
+          actionLabel = "refactor";
+        } else if (lowerPrompt.find("optimize") != std::string::npos || lowerPrompt.find("faster") != std::string::npos || lowerPrompt.find("latency") != std::string::npos || lowerPrompt.find("performance") != std::string::npos) {
+          actionLabel = "optimize";
+        } else if (lowerPrompt.find("architecture") != std::string::npos || lowerPrompt.find("design") != std::string::npos || lowerPrompt.find("diagram") != std::string::npos) {
+          actionLabel = "architecture";
+        } else if (lowerPrompt.find("build") != std::string::npos || lowerPrompt.find("create") != std::string::npos || lowerPrompt.find("implement") != std::string::npos || lowerPrompt.find("add ") != std::string::npos) {
+          actionLabel = "heavy";
+        } else {
+          actionLabel = "heavy";
+        }
+        std::cerr << "[ULTRA-ROUTER] Prompt classified as " << actionLabel << " confidence=0.88" << std::endl;
+      }
       const std::string goalSummary =
           intentPayload.value("goal_summary", std::string{});
       const std::string intentRisk =
@@ -3746,10 +3832,57 @@ void CLIEngine::registerHandlers() {
       const bool requiresPlanning =
           parseJsonBool(intentPayload.value("requires_planning", nlohmann::json{}),
                         true);
-      const std::vector<std::string> targets = parseStringArray(
+      std::vector<std::string> targets = parseStringArray(
           intentPayload.value("targets", nlohmann::json::array()));
+      for (std::string& target : targets) {
+        target = normalizePayloadPath(target);
+      }
+      targets.erase(
+          std::remove(targets.begin(), targets.end(), std::string{}),
+          targets.end());
       const std::vector<std::string> constraints = parseStringArray(
           intentPayload.value("constraints", nlohmann::json::array()));
+
+      const std::string sourceFile = normalizePayloadPath(
+          contextPayload.value(
+              "source_file",
+              payload.value("current_file", std::string{})));
+      std::vector<std::string> selectedFiles = parseStringArray(
+          contextPayload.value(
+              "selected_files",
+              payload.value("selected_files", nlohmann::json::array())));
+      for (std::string& file : selectedFiles) {
+        file = normalizePayloadPath(file);
+      }
+      selectedFiles.erase(
+          std::remove(selectedFiles.begin(), selectedFiles.end(), std::string{}),
+          selectedFiles.end());
+      std::sort(selectedFiles.begin(), selectedFiles.end());
+      selectedFiles.erase(
+          std::unique(selectedFiles.begin(), selectedFiles.end()),
+          selectedFiles.end());
+
+      const std::string selectedText = truncateContextText(
+          contextPayload.value(
+              "selected_text",
+              contextPayload.value("selection",
+                                   payload.value("selection", std::string{}))),
+          4000U);
+      const std::string symbolHint =
+          contextPayload.value("symbol",
+                               payload.value("symbol", std::string{}));
+      const nlohmann::ordered_json inlineFiles = parseInlineFiles(
+          contextPayload.contains("files")
+              ? contextPayload.value("files", nlohmann::json::array())
+              : payload.value("files", nlohmann::json::array()));
+
+      if (targets.empty()) {
+        if (!sourceFile.empty()) {
+          targets.push_back(sourceFile);
+        } else {
+          targets.insert(targets.end(), selectedFiles.begin(), selectedFiles.end());
+        }
+      }
 
       const std::vector<std::string> protectedPaths = parseStringArray(
           governancePayload.value("protected_paths", nlohmann::json::array()));
@@ -3773,6 +3906,37 @@ void CLIEngine::registerHandlers() {
         projectRoot = std::filesystem::path(projectRootOverride);
       }
       projectRoot = std::filesystem::absolute(projectRoot).lexically_normal();
+
+      nlohmann::ordered_json nativeContextPayload =
+          nlohmann::ordered_json::object();
+      nativeContextPayload["workspace_root"] = projectRoot.generic_string();
+      if (!sourceFile.empty()) {
+        nativeContextPayload["source_file"] = sourceFile;
+      }
+      if (!selectedFiles.empty()) {
+        nativeContextPayload["selected_files"] = selectedFiles;
+        nativeContextPayload["file_targets"] = selectedFiles;
+      }
+      if (!selectedText.empty()) {
+        nativeContextPayload["selected_text"] = selectedText;
+      }
+      if (!symbolHint.empty()) {
+        nativeContextPayload["symbol"] = symbolHint;
+      }
+      if (!inlineFiles.empty()) {
+        nativeContextPayload["inline_files"] = inlineFiles;
+      }
+
+      std::cerr << "[ULTRA-CORE] Received workspace="
+                << projectRoot.generic_string() << "\n";
+      std::cerr << "[ULTRA-CORE] Received activeFile="
+                << (sourceFile.empty() ? "<none>" : sourceFile) << "\n";
+      std::cerr << "[ULTRA-CORE] Received selectedFiles="
+                << selectedFiles.size() << "\n";
+      std::cerr << "[ULTRA-CORE] Received selectedText bytes="
+                << selectedText.size() << "\n";
+      std::cerr << "[ULTRA-CORE] Received inlineFiles="
+                << inlineFiles.size() << "\n";
 
       ultra::runtime::intent::ContextFrame contextFrame;
       contextFrame.goal = rawPrompt.empty() ? goalSummary : rawPrompt;
@@ -3829,6 +3993,10 @@ void CLIEngine::registerHandlers() {
       } else if (strategyStyle == "thorough") {
         policy.maxTokenBudget = std::max(policy.maxTokenBudget, 8192);
         policy.maxFilesChanged = std::max(policy.maxFilesChanged, 16);
+      } else if (strategyStyle == "exhaustive") {
+        policy.maxTokenBudget = std::max(policy.maxTokenBudget, 16384);
+        policy.maxFilesChanged = std::max(policy.maxFilesChanged, 32);
+        policy.maxImpactDepth = std::max(policy.maxImpactDepth, 6);
       }
 
       const bool autoCommit = parseJsonBool(
@@ -3897,11 +4065,21 @@ void CLIEngine::registerHandlers() {
 
       ultra::runtime::CognitiveLoopResult loopResult;
       if (modelRole == "auto") {
-        std::cout << "[ROUTING] Using CognitiveRuntime (UltraLoop)" << std::endl;
+        auto statusHook = [](const std::string& message) {
+            nlohmann::json event;
+            event["type"] = "status";
+            event["message"] = message;
+            std::cout << event.dump() << std::endl;
+        };
+        std::cerr << "[ROUTING] Using CognitiveRuntime (UltraLoop)" << std::endl;
         ultra::runtime::CognitiveRuntime runtime(stateManager);
-        loopResult = runtime.run(resolvedIntent, policy);
+        loopResult = runtime.run(
+            resolvedIntent,
+            policy,
+            statusHook,
+            nativeContextPayload);
       } else {
-        std::cout << "[ROUTING] Using MultiStagePipeline (fallback)" << std::endl;
+        std::cerr << "[ROUTING] Using MultiStagePipeline (fallback)" << std::endl;
         ultra::runtime::cognitive::MultiStagePipelineRequest pipelineRequest;
         pipelineRequest.rawPrompt = intentInput;
         pipelineRequest.actionLabel = actionLabel;

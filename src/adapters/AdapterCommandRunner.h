@@ -8,7 +8,8 @@ namespace ultra::adapters {
 
 int runCommand(const std::filesystem::path& workingDirectory,
                const std::string& command,
-               const ultra::cli::CommandOptions& options);
+               const ultra::cli::CommandOptions& options,
+               std::string* out_captured_output = nullptr);
 
 bool isToolAvailable(const std::string& toolName);
 

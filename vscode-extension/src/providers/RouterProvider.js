@@ -6,6 +6,7 @@ const { GeminiProvider } = require("./GeminiProvider");
 const { OllamaProvider } = require("./OllamaProvider");
 const { OpenAICompatibleProvider } = require("./OpenAICompatibleProvider");
 const { ModelMetricsStore } = require("../ModelMetricsStore");
+const { safeLog } = require("../logging");
 
 /**
  * Factory: create a provider instance from its type string and config block.
@@ -44,9 +45,7 @@ class RouterProvider {
   }
 
   log(message) {
-    if (this.output) {
-      this.output.appendLine(`[router] ${message}`);
-    }
+    safeLog(this.output, `[router] ${message}`, "[router]");
   }
 
   async resolveRoute(mode) {

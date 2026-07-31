@@ -1,5 +1,7 @@
 "use strict";
 
+const { safeLog } = require("../logging");
+
 function requireFetch() {
   if (typeof fetch !== "function") {
     throw new Error("Global fetch is unavailable in this VS Code runtime.");
@@ -22,9 +24,7 @@ class BaseProvider {
   }
 
   log(message) {
-    if (this.output) {
-      this.output.appendLine(`[provider] ${message}`);
-    }
+    safeLog(this.output, `[provider] ${message}`, "[provider]");
   }
 
   async postJson(url, headers, body, timeoutMs) {

@@ -4,6 +4,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { extractUnifiedDiffFromText } = require("./diffUtils");
 const { ModelConfigLoader } = require("./config/ModelConfigLoader");
+const { safeLog } = require("./logging");
 const { RouterProvider } = require("./providers/RouterProvider");
 
 function parseJsonSafe(text) {
@@ -57,6 +58,10 @@ function toArray(value) {
   return [];
 }
 
+function isPatchMode(mode) {
+  return mode !== "explain" && mode !== "health";
+}
+
 function buildContextBlock(taskContext) {
   const lines = [];
   lines.push(`Workspace: ${taskContext.workspaceRoot || "<none>"}`);
@@ -88,9 +93,7 @@ class ModelProviderClient {
   }
 
   _log(message) {
-    if (this._output) {
-      this._output.appendLine(`[provider-client] ${message}`);
-    }
+    safeLog(this._output, `[provider-client] ${message}`, "[provider-client]");
   }
 
   _ensureRouter(workspaceRoot) {
@@ -256,8 +259,19 @@ ${details.raw}
     }
   }
 
-  async generate(mode, taskContext, onEvent) {
+  async generateRaw(mode, messages, workspaceRoot, onEvent) {
+    this._ensureRouter(workspaceRoot);
+    const result = await this.router.generate(mode, messages, onEvent);
+    return result;
+  }
+
+  async generate(mode, taskContext, settingsOrOnEvent, maybeOnEvent) {
     this._ensureRouter(taskContext.workspaceRoot);
+    const onEvent = typeof maybeOnEvent === "function"
+      ? maybeOnEvent
+      : typeof settingsOrOnEvent === "function"
+        ? settingsOrOnEvent
+        : undefined;
     
     if (mode === "health") {
       this._log(`mode=${mode} - Executing health check via router.`);
@@ -272,7 +286,7 @@ ${details.raw}
     let parsed = this._parseOutput(mode, firstResult.content, filesFallback);
     
     if (parsed) {
-      if (mode === "patch") {
+      if (isPatchMode(mode)) {
         await this._writeDebugLog(taskContext.workspaceRoot, false, {
           mode,
           provider: firstResult.provider,
@@ -290,7 +304,7 @@ ${details.raw}
       return parsed;
     }
 
-    if (mode === "patch") {
+    if (isPatchMode(mode)) {
       if (typeof onEvent === "function") {
         onEvent("retrying", "Retrying with stricter patch format...");
       }

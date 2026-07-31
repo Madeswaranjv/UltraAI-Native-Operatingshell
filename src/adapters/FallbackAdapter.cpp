@@ -119,7 +119,7 @@ void FallbackAdapter::executeAction(Action action,
     return;
   }
 
-  m_lastExitCode = runCommand(m_rootPath, command, options);
+  m_lastExitCode = runCommand(m_rootPath, command, options, &m_lastOutput);
 }
 
 void FallbackAdapter::cleanPythonProject(const ultra::cli::CommandOptions& options) {

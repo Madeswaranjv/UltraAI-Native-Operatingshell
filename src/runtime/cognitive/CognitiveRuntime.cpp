@@ -1,6 +1,10 @@
 #include "CognitiveRuntime.h"
 
 #include "../../core/state_manager.h"
+#include "../../adapters/AdapterFactory.h"
+#include "../../adapters/BuildErrorParser.h"
+#include "../../core/ProjectTypeDetector.h"
+#include "../../cli/CommandOptions.h"
 #include "ExecutionKernel.h"
 #include <external/json.hpp>
 #include "failure_recovery.h"
@@ -328,15 +332,19 @@ class IntentSeedStage final : public ::ultra::runtime::cognitive::IIntentStage {
  public:
   IntentSeedStage(const ::ultra::runtime::intent::Intent& intentValue,
                   const ::ultra::runtime::CognitiveState& state,
-                  std::string prompt)
-      : intent_(intentValue), state_(state), prompt_(std::move(prompt)) {}
+                  std::string prompt,
+                  nlohmann::ordered_json externalContextPayload)
+      : intent_(intentValue),
+        state_(state),
+        prompt_(std::move(prompt)),
+        externalContextPayload_(std::move(externalContextPayload)) {}
 
   ::ultra::runtime::cognitive::StageResult run(
       ::ultra::runtime::cognitive::UltraLoopFrame& frame) override {
     frame.cognitiveState = &state_;
     frame.structuredIntent = intent_;
     frame.hasStructuredIntent = true;
-    frame.intentGoal = intent_.goal.target.empty() ? prompt_ : intent_.goal.target;
+    frame.intentGoal = intent_.rawPrompt.empty() ? (intent_.goal.target.empty() ? prompt_ : intent_.goal.target) : intent_.rawPrompt;
     frame.intentTarget = intent_.goal.target.empty() ? frame.intentGoal
                                                      : intent_.goal.target;
     frame.intentBranchId = intent_.constraints.branchScope;
@@ -363,6 +371,7 @@ class IntentSeedStage final : public ::ultra::runtime::cognitive::IIntentStage {
     frame.originalStructuredIntent = intent_;
     frame.hasOriginalStructuredIntent = true;
     frame.originalIntentId = frame.intentId;
+    frame.externalContextPayload = externalContextPayload_;
 
     return {
         true,
@@ -375,6 +384,8 @@ class IntentSeedStage final : public ::ultra::runtime::cognitive::IIntentStage {
   const ::ultra::runtime::intent::Intent& intent_;
   const ::ultra::runtime::CognitiveState& state_;
   std::string prompt_;
+  nlohmann::ordered_json externalContextPayload_ =
+      nlohmann::ordered_json::object();
 };
 
 class MicroPlanningGateStage final
@@ -551,34 +562,96 @@ class VerificationStageAdapter final
       };
     }
 
-    if (!frame.taskGraph.has_pending_tasks() && frame.hasExecutionResult &&
-        frame.executionResult.ok && !frame.executionResult.rolledBack) {
+    if (frame.taskGraph.has_pending_tasks() || (!frame.taskGraph.failed_tasks().empty() && frame.retryCount < retryLimit_)) {
+        return {
+            true,
+            ::ultra::runtime::cognitive::StageSignal::Retry,
+            "Verification requested retry for failed task graph nodes.",
+        };
+    }
+
+    // --- REAL VERIFICATION ---
+    std::cout << "\n[ULTRA] VERIFY: Running workspace build and test verification...\n";
+
+    std::error_code ec;
+    const std::filesystem::path rootPath = std::filesystem::current_path(ec);
+    
+    const ::ultra::core::ProjectType projectType = 
+        ::ultra::core::ProjectTypeDetector::detect(rootPath);
+    
+    std::unique_ptr<::ultra::adapters::ProjectAdapter> adapter = 
+        ::ultra::adapters::createProjectAdapter(projectType, rootPath);
+
+    ::ultra::cli::CommandOptions options;
+    options.jsonOutput = true; // prevent printing duplicate logs if we capture
+    
+    // 1. Run Build
+    adapter->build(options);
+    const int buildExitCode = adapter->lastExitCode();
+    const std::string buildOutput = adapter->lastOutput();
+
+    if (buildExitCode != 0) {
+      std::cout << "[ULTRA] VERIFY FAILED: Build error detected.\n";
+      frame.hasExecutionResult = true;
+      frame.executionResult.ok = false;
+      frame.executionResult.message = "Build failed with exit code " + std::to_string(buildExitCode) + "\n" + buildOutput;
+      frame.executionResult.text_output = buildOutput;
+      
+      if (frame.retryCount < retryLimit_) {
+        return {
+            false,
+            ::ultra::runtime::cognitive::StageSignal::Retry,
+            "Verification failed during build. Retrying...",
+        };
+      }
       return {
-          true,
-          ::ultra::runtime::cognitive::StageSignal::Continue,
-          "Verification accepted deterministic execution result.",
+          false,
+          ::ultra::runtime::cognitive::StageSignal::Replan,
+          "Verification failed during build.",
       };
     }
 
-    if (!frame.taskGraph.failed_tasks().empty() && frame.retryCount < retryLimit_) {
+    std::cout << "[ULTRA] VERIFY: Build passed. Running tests...\n";
+
+    // 2. Run Tests
+    adapter->test(options);
+    const int testExitCode = adapter->lastExitCode();
+    const std::string testOutput = adapter->lastOutput();
+
+    if (testExitCode != 0) {
+      std::cout << "[ULTRA] VERIFY FAILED: Test error detected.\n";
+      frame.hasExecutionResult = true;
+      frame.executionResult.ok = false;
+      const std::string conciseError = ::ultra::adapters::BuildErrorParser::parse(testOutput);
+      frame.executionResult.message = "Tests failed with exit code " + std::to_string(testExitCode) + "\n" + conciseError;
+      frame.executionResult.text_output = conciseError + "\n\n--- RAW LOGS OMITTED FOR TOKEN EFFICIENCY ---";
+      
+      if (frame.retryCount < retryLimit_) {
+        return {
+            false,
+            ::ultra::runtime::cognitive::StageSignal::Retry,
+            "Verification failed during test. Retrying...",
+        };
+      }
       return {
-          true,
-          ::ultra::runtime::cognitive::StageSignal::Retry,
-          "Verification requested retry for failed task graph nodes.",
+          false,
+          ::ultra::runtime::cognitive::StageSignal::Replan,
+          "Verification failed during test.",
       };
     }
 
-    std::string message = frame.hasExecutionResult
-                              ? frame.executionResult.message
-                              : "Verification stage has no execution result.";
-    if (message.empty()) {
-      message = "Verification requested deterministic replanning.";
-    }
+    std::cout << "[ULTRA] VERIFY PASSED: Build and tests successful.\n";
+    frame.hasExecutionResult = true;
+    frame.executionResult.ok = true;
+    frame.executionResult.rolledBack = false;
+    frame.executionResult.message = "Verification successful.";
+
+    frame.verificationPassed = true;
 
     return {
-        false,
-        ::ultra::runtime::cognitive::StageSignal::Replan,
-        std::move(message),
+        true,
+        ::ultra::runtime::cognitive::StageSignal::Continue,
+        "Verification accepted deterministic execution result.",
     };
   }
 
@@ -718,7 +791,9 @@ GovernanceSignal CognitiveRuntime::currentGovernanceSignal() const {
 
 CognitiveLoopResult CognitiveRuntime::run(
     const intent::Intent& intentValue,
-    const governance::Policy& policy) {
+    const governance::Policy& policy,
+    std::function<void(const std::string&)> statusHook,
+    nlohmann::ordered_json externalContextPayload) {
   CognitiveLoopResult result;
   const auto executionStartWall = std::chrono::system_clock::now();
   const auto executionStartMonotonic = std::chrono::steady_clock::now();
@@ -755,11 +830,14 @@ CognitiveLoopResult CognitiveRuntime::run(
     cognitive::StrategyPlanningStage strategyStage;
     governance::GovernanceEngine governanceEngine(&stateManager_.cognitiveMemory());
 
-    const std::string prompt = normalizedIntent.goal.target.empty()
-                                   ? intent::toString(normalizedIntent.goal.type)
-                                   : normalizedIntent.goal.target;
+    const std::string prompt = normalizedIntent.rawPrompt.empty() ? (normalizedIntent.goal.target.empty() ? intent::toString(normalizedIntent.goal.type) : normalizedIntent.goal.target) : normalizedIntent.rawPrompt;
 
-    IntentSeedStage intentStage(normalizedIntent, state, prompt);
+
+
+    IntentSeedStage intentStage(normalizedIntent,
+                                state,
+                                prompt,
+                                std::move(externalContextPayload));
     MicroPlanningGateStage microPlanningStage;
     GovernanceStageAdapter governanceStage(governanceEngine);
     governanceStage.setPolicy(policy);
@@ -809,6 +887,12 @@ CognitiveLoopResult CognitiveRuntime::run(
                 << " error_type=" << collapseFailureText(trace.errorType, true)
                 << " root_cause=" << collapseFailureText(trace.rootCause, false)
                 << "\n";
+    };
+    config.statusHook = [statusHook](const cognitive::UltraLoopState /*state*/,
+                                     const std::string& message) {
+      if (statusHook) {
+        statusHook(message);
+      }
     };
 
     cognitive::UltraLoop loop(config);

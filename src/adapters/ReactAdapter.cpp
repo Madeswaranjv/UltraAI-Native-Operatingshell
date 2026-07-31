@@ -243,7 +243,7 @@ int ReactAdapter::execute(const std::string& command,
   if (!ensureNpmAvailable(options)) {
     return 1;
   }
-  return runCommand(m_rootPath, command, options);
+  return runCommand(m_rootPath, command, options, &m_lastOutput);
 }
 
 }  // namespace ultra::adapters

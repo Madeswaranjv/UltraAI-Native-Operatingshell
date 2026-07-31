@@ -12,6 +12,8 @@
 #include "../../core/state_manager.h"
 #include "../../diff/DiffEngine.h"
 #include "../../engine/impact/ImpactPredictionEngine.h"
+#include "../../cli/CommandOptions.h"
+#include "../../adapters/AdapterCommandRunner.h"
 #include "../CPUGovernor.h"
 
 #include <algorithm>
@@ -61,6 +63,38 @@ std::string normalizePathToken(const std::string& value) {
   if (normalized.size() >= 2U && normalized[0] == '.' && normalized[1] == '/') {
     normalized.erase(0, 2U);
   }
+  return normalized;
+}
+
+std::string astContextTargetForPath(const std::filesystem::path& projectRoot,
+                                    const std::string& value) {
+  const std::string normalized = normalizePathToken(value);
+  if (normalized.empty()) {
+    return ".";
+  }
+
+  std::filesystem::path raw(normalized);
+  std::filesystem::path absolute =
+      raw.is_absolute() ? raw.lexically_normal()
+                        : (projectRoot / raw).lexically_normal();
+  std::error_code ec;
+  if (std::filesystem::is_regular_file(absolute, ec)) {
+    const std::filesystem::path parent = absolute.parent_path();
+    if (parent.empty()) {
+      return ".";
+    }
+    const std::filesystem::path relative = parent.lexically_relative(projectRoot);
+    if (!relative.empty()) {
+      return relative.generic_string();
+    }
+    return parent.generic_string();
+  }
+
+  if (raw.has_extension()) {
+    const std::filesystem::path parent = raw.parent_path();
+    return parent.empty() ? "." : parent.generic_string();
+  }
+
   return normalized;
 }
 
@@ -1300,7 +1334,7 @@ ai::orchestration::TaskType taskTypeForStrategyAction(
 
 std::string selectProviderForAction(const intent::Action& strategyAction) {
   (void)strategyAction;
-  return "ollama";
+  return "auto";
 }
 
 ai::model::ModelRequest buildModelRequestForStrategyAction(
@@ -1469,6 +1503,28 @@ std::string payloadStringValue(const nlohmann::ordered_json& payload,
     return {};
   }
   return trimAscii(payload.at(key).get<std::string>());
+}
+
+std::vector<std::string> payloadStringArrayValue(
+    const nlohmann::ordered_json& payload,
+    const char* key) {
+  std::vector<std::string> values;
+  if (!payload.is_object() || !payload.contains(key) ||
+      !payload.at(key).is_array()) {
+    return values;
+  }
+
+  for (const auto& item : payload.at(key)) {
+    if (!item.is_string()) {
+      continue;
+    }
+    const std::string normalized = normalizePathToken(trimAscii(item.get<std::string>()));
+    if (!normalized.empty()) {
+      values.push_back(normalized);
+    }
+  }
+  sortAndDedupe(values);
+  return values;
 }
 
 bool payloadContainsKey(const nlohmann::ordered_json& payload, const char* key) {
@@ -2076,6 +2132,16 @@ std::string actionSourceFileHint(const Action& action) {
   }
   if (const std::string file = payloadStringValue(payload, "file"); !file.empty()) {
     return file;
+  }
+  if (const std::vector<std::string> selectedFiles =
+          payloadStringArrayValue(payload, "selected_files");
+      !selectedFiles.empty()) {
+    return selectedFiles.front();
+  }
+  if (const std::vector<std::string> fileTargets =
+          payloadStringArrayValue(payload, "file_targets");
+      !fileTargets.empty()) {
+    return fileTargets.front();
   }
   if (looksLikeSourceTarget(action.target)) {
     return action.target;
@@ -2798,24 +2864,331 @@ Result ExecutionKernel::executeActionLocked(const Action& action,
                           ? "auto"
                           : routingDecision.requestedRole)
                   << " resolved=" << routingDecision.resolvedRole << std::endl;
-        const ai::model::ModelResponse response =
-            modelOrchestrator_->generate(currentRequest, routedContext);
-        std::string selectedProvider = action.modelProvider;
-        std::vector<std::string> attemptedProviders;
-        if (const auto* orchestrator =
-                dynamic_cast<const ai::orchestration::MultiModelOrchestrator*>(
-                    modelOrchestrator_.get());
-            orchestrator != nullptr) {
-          const ai::orchestration::OrchestrationDecision& decision =
-              orchestrator->lastDecision();
-          if (!decision.selectedProvider.empty()) {
-            selectedProvider = decision.selectedProvider;
+        // HYBRID BRAIN INTEGRATION: C++ manages logic, JS handles LLM network calls
+        std::string extraContext;
+        
+        // 1. Analyze Task
+        const std::string promptLower = lowerAscii(currentRequest.prompt);
+        const bool isRetry = currentRequest.contextPayload.contains("apply_patch_retry") || promptLower.find("previous apply_patch attempt") != std::string::npos;
+        const bool isArchitecture = promptLower.find("architecture") != std::string::npos || promptLower.find("refactor") != std::string::npos;
+        const nlohmann::ordered_json payload =
+            currentRequest.contextPayload.is_object()
+                ? currentRequest.contextPayload
+                : nlohmann::ordered_json::object();
+        const std::string fileHint = actionSourceFileHint(action);
+        const std::string workspaceHint =
+            payloadStringValue(payload, "workspace_root");
+        const std::string selectedText =
+            payloadStringValue(payload, "selected_text");
+        const std::string symbolHint =
+            payloadStringValue(payload, "symbol");
+        const std::vector<std::string> selectedFiles =
+            payloadStringArrayValue(payload, "selected_files");
+        const std::vector<std::string> fileTargets =
+            payloadStringArrayValue(payload, "file_targets");
+        
+        std::cerr << "[ULTRA-CORE] ContextStrategy=" << (isRetry ? "RetryPatch" : (isArchitecture ? "Architecture" : "Standard")) << "\n";
+        std::cerr << "[ULTRA-CORE] Received workspace="
+                  << (workspaceHint.empty() ? stateManager_.projectRoot().generic_string()
+                                            : workspaceHint)
+                  << "\n";
+        std::cerr << "[ULTRA-CORE] Received activeFile="
+                  << (fileHint.empty() ? "<none>" : fileHint) << "\n";
+        std::cerr << "[ULTRA-CORE] Received selectedFiles="
+                  << selectedFiles.size() << "\n";
+        std::cerr << "[ULTRA-CORE] Received selectedText bytes="
+                  << selectedText.size() << "\n";
+        
+        ultra::cli::CommandOptions dummyOptions;
+        dummyOptions.jsonOutput = true;
+        std::size_t totalContextBytes = 0;
+        const std::size_t maxContextBytes = 64000; // token budget safety
+        const std::size_t maxCharsPerSource = 12000;
+
+        const auto appendContextBlock = [&](const std::string& label,
+                                            std::string content) {
+          content = trimAscii(std::move(content));
+          if (content.empty() || totalContextBytes >= maxContextBytes) {
+            return false;
           }
-          attemptedProviders = decision.attemptedProviders;
+          if (content.size() > maxCharsPerSource) {
+            content.resize(maxCharsPerSource);
+            content += "\n... [truncated]";
+          }
+          if (content.size() > maxContextBytes - totalContextBytes) {
+            content.resize(maxContextBytes - totalContextBytes);
+          }
+          totalContextBytes += content.size();
+          extraContext += "\n\n=== " + label + " ===\n" + content;
+          return true;
+        };
+
+        const auto addCommandContext = [&](const std::string& cmd,
+                                           const std::string& label) {
+          if (totalContextBytes >= maxContextBytes) {
+            return false;
+          }
+          std::cerr << "[ULTRA-CORE] Running ultra " << cmd << "\n";
+          std::string out;
+          const int exitCode = ultra::adapters::runCommand(
+              stateManager_.projectRoot(),
+              "ultra " + cmd,
+              dummyOptions,
+              &out);
+          if (exitCode == 0 && appendContextBlock(label, out)) {
+            std::cerr << "[ULTRA-CORE] " << cmd << " returned "
+                      << out.size() << " bytes\n";
+            return true;
+          }
+          std::cerr << "[ULTRA-CORE] " << cmd << " failed rc=" << exitCode
+                    << " bytes=" << out.size() << "\n";
+          return false;
+        };
+
+        std::vector<std::string> candidateFiles;
+        const auto addCandidateFile = [&](const std::string& value) {
+          const std::string normalized = normalizePathToken(trimAscii(value));
+          if (!normalized.empty()) {
+            candidateFiles.push_back(normalized);
+          }
+        };
+        addCandidateFile(fileHint);
+        for (const std::string& file : selectedFiles) {
+          addCandidateFile(file);
         }
-        const std::string providerEndpoint =
-            providerEndpointForProject(stateManager_.projectRoot(),
-                                       selectedProvider);
+        for (const std::string& file : fileTargets) {
+          addCandidateFile(file);
+        }
+        if (payload.contains("inline_files") && payload.at("inline_files").is_array()) {
+          for (const auto& item : payload.at("inline_files")) {
+            if (item.is_object() && item.contains("path") && item.at("path").is_string()) {
+              addCandidateFile(item.at("path").get<std::string>());
+            }
+          }
+        }
+        sortAndDedupe(candidateFiles);
+
+        const auto readWorkspaceFile = [&](const std::string& candidate) {
+          if (candidate.empty()) {
+            return std::string{};
+          }
+          std::filesystem::path raw(candidate);
+          std::filesystem::path absolute =
+              raw.is_absolute() ? raw.lexically_normal()
+                                : (stateManager_.projectRoot() / raw).lexically_normal();
+          const std::filesystem::path relative =
+              absolute.lexically_relative(stateManager_.projectRoot());
+          const std::string relativeText = relative.generic_string();
+          if (relative.empty() ||
+              (relativeText.size() >= 2U && relativeText[0] == '.' &&
+               relativeText[1] == '.')) {
+            return std::string{};
+          }
+          return slurpTextFile(absolute);
+        };
+
+        const auto addDirectFileContext = [&](const std::string& candidate,
+                                              const std::string& labelPrefix) {
+          const std::string content = readWorkspaceFile(candidate);
+          if (content.empty()) {
+            std::cerr << "[ULTRA-CORE] direct file read failed: " << candidate
+                      << "\n";
+            return false;
+          }
+          if (appendContextBlock(labelPrefix + ": " + candidate, content)) {
+            std::cerr << "[ULTRA-CORE] direct file read returned "
+                      << content.size() << " bytes for " << candidate << "\n";
+            return true;
+          }
+          return false;
+        };
+
+        const auto addInlineFileContext = [&](const std::string& candidate) {
+          if (!payload.contains("inline_files") || !payload.at("inline_files").is_array()) {
+            return false;
+          }
+          for (const auto& item : payload.at("inline_files")) {
+            if (!item.is_object() || !item.contains("path") ||
+                !item.at("path").is_string() || !item.contains("content") ||
+                !item.at("content").is_string()) {
+              continue;
+            }
+            const std::string inlinePath =
+                normalizePathToken(item.at("path").get<std::string>());
+            if (inlinePath != candidate) {
+              continue;
+            }
+            const std::string content = item.at("content").get<std::string>();
+            if (appendContextBlock("Inline File Snapshot: " + inlinePath, content)) {
+              std::cerr << "[ULTRA-CORE] inline file snapshot returned "
+                        << content.size() << " bytes for " << inlinePath << "\n";
+              return true;
+            }
+          }
+          return false;
+        };
+
+        if (!isRetry) {
+           std::cerr << "[ULTRA-CORE] Running ultra scan (Refresh index)\n";
+           std::string dummyOut;
+           ultra::adapters::runCommand(stateManager_.projectRoot(), "ultra scan", dummyOptions, &dummyOut);
+        }
+
+        if (isArchitecture) {
+           addCommandContext("graph", "Project Architecture Graph");
+           if (!action.target.empty() && action.target != "workspace_root") {
+               addCommandContext("context --query " + quoteForShell(action.target), "Semantic Query: " + action.target);
+           }
+        }
+
+        if (isRetry) {
+           if (!candidateFiles.empty()) {
+               addCommandContext("context-diff " + quoteForShell(candidateFiles.front()), "Recent Changes in " + candidateFiles.front());
+           }
+           
+           // Heuristic to extract undefined symbols from compiler errors
+           std::string undefinedSymbol;
+           auto symPos = currentRequest.prompt.find("undefined reference to");
+           if (symPos != std::string::npos) {
+               auto startQuote = currentRequest.prompt.find('`', symPos);
+               auto endQuote = currentRequest.prompt.find('\'', startQuote != std::string::npos ? startQuote + 1 : symPos);
+               if (startQuote != std::string::npos && endQuote != std::string::npos && endQuote > startQuote) {
+                   undefinedSymbol = currentRequest.prompt.substr(startQuote + 1, endQuote - startQuote - 1);
+               }
+           } else if ((symPos = currentRequest.prompt.find("was not declared in this scope")) != std::string::npos) {
+                auto startQuote = currentRequest.prompt.rfind('\'', symPos);
+                if (startQuote != std::string::npos) {
+                    auto realStart = currentRequest.prompt.rfind('\'', startQuote - 1);
+                    if (realStart != std::string::npos) {
+                        undefinedSymbol = currentRequest.prompt.substr(realStart + 1, startQuote - realStart - 1);
+                    }
+                }
+           }
+           
+           if (!undefinedSymbol.empty()) {
+               addCommandContext("ai_query " + quoteForShell(undefinedSymbol), "Symbol Query: " + undefinedSymbol);
+            }
+        }
+
+        for (const std::string& candidate : candidateFiles) {
+           std::cerr << "[ULTRA-CORE] Trying ai_source for " << candidate << "...\n";
+           const bool aiSourceOk =
+               addCommandContext("ai_source " + quoteForShell(candidate),
+                                 "Source Code: " + candidate);
+            if (!aiSourceOk) {
+              std::cerr << "[ULTRA-CORE] ai_source failed: " << candidate << "\n";
+              std::cerr << "[ULTRA-CORE] Falling back to direct file read\n";
+              if (!addDirectFileContext(candidate, "Direct File Read")) {
+                addInlineFileContext(candidate);
+              }
+            }
+            if (!isRetry && !isArchitecture) {
+              const std::string astTarget =
+                  astContextTargetForPath(stateManager_.projectRoot(), candidate);
+              addCommandContext("context --ast " + quoteForShell(astTarget),
+                                "AST Summary: " + astTarget);
+            }
+            if (totalContextBytes >= maxContextBytes) {
+              break;
+            }
+        }
+
+        if (!selectedText.empty()) {
+          appendContextBlock("Selected Text", selectedText);
+        }
+        if (!symbolHint.empty()) {
+          addCommandContext("ai_query " + quoteForShell(symbolHint),
+                            "Symbol Query: " + symbolHint);
+        }
+        if (totalContextBytes == 0) {
+          const std::string semanticTarget = !candidateFiles.empty()
+              ? candidateFiles.front()
+              : (!symbolHint.empty() ? symbolHint : action.target);
+          if (!semanticTarget.empty() && semanticTarget != "workspace_root") {
+            addCommandContext("ai_context " + quoteForShell(semanticTarget),
+                              "Semantic Slice: " + semanticTarget);
+          } else {
+            addCommandContext("context --ast .", "Workspace Semantic Slice");
+          }
+        }
+        
+        std::cerr << "[ULTRA-CORE] Final prompt chars=" << (currentRequest.prompt.size() + extraContext.size()) << "\n";
+        std::cerr << "[ULTRA-CORE] Final context bytes=" << totalContextBytes << "\n";
+        std::cout << nlohmann::ordered_json{{"type", "status"}, {"message", "ULTRA assembled " + std::to_string(totalContextBytes) + " bytes of native context."}}.dump() << std::endl;
+
+        nlohmann::ordered_json messages = nlohmann::ordered_json::array();
+        if (!currentRequest.systemPrompt.empty()) {
+          messages.push_back({{"role", "system"}, {"content", currentRequest.systemPrompt}});
+        }
+        messages.push_back({{"role", "user"}, {"content", currentRequest.prompt + extraContext}});
+
+        nlohmann::ordered_json llmReq = nlohmann::ordered_json::object();
+        llmReq["type"] = "llm_request";
+        llmReq["purpose"] = "patch_generation";
+        llmReq["messages"] = std::move(messages);
+        nlohmann::ordered_json meta = nlohmann::ordered_json::object();
+        meta["mode"] = "patch";
+        llmReq["metadata"] = std::move(meta);
+
+        std::cerr << "[ULTRA-CORE] Need LLM for patch_generation\n";
+        ai::model::ModelResponse response;
+        std::string selectedProvider = "auto";
+        std::vector<std::string> attemptedProviders;
+        std::string providerEndpoint;
+
+        bool hasJsBridge = false;
+#ifdef _MSC_VER
+        char* buf = nullptr;
+        size_t sz = 0;
+        if (_dupenv_s(&buf, &sz, "ULTRA_JS_BRIDGE") == 0 && buf != nullptr) {
+            hasJsBridge = true;
+            free(buf);
+        }
+#else
+        hasJsBridge = (std::getenv("ULTRA_JS_BRIDGE") != nullptr);
+#endif
+
+        if (!hasJsBridge && modelOrchestrator_) {
+            response = modelOrchestrator_->generate(currentRequest, routedContext);
+            selectedProvider = action.modelProvider;
+            if (const auto* orchestrator =
+                    dynamic_cast<const ai::orchestration::MultiModelOrchestrator*>(
+                        modelOrchestrator_.get());
+                orchestrator != nullptr) {
+              const ai::orchestration::OrchestrationDecision& decision =
+                  orchestrator->lastDecision();
+              if (!decision.selectedProvider.empty()) {
+                selectedProvider = decision.selectedProvider;
+              }
+              attemptedProviders = decision.attemptedProviders;
+            }
+            providerEndpoint = providerEndpointForProject(stateManager_.projectRoot(), selectedProvider);
+        } else {
+            std::cout << llmReq.dump() << std::endl;
+
+            std::string responseLine;
+            if (!std::getline(std::cin, responseLine)) {
+              response.ok = false;
+              response.errorMessage = "Failed to read LLM response from JS bridge.";
+            } else {
+              try {
+                nlohmann::ordered_json jsResp = nlohmann::ordered_json::parse(responseLine);
+                if (jsResp.value("type", "") == "llm_error") {
+                  response.ok = false;
+                  response.errorMessage = jsResp.value("message", "Unknown LLM error from JS layer.");
+                } else {
+                  response.ok = true;
+                  response.textOutput = jsResp.value("content", "");
+                }
+              } catch (...) {
+                response.ok = false;
+                response.errorMessage = "Failed to parse LLM response JSON from JS bridge.";
+              }
+            }
+            selectedProvider = "js-bridge";
+            attemptedProviders = {selectedProvider};
+            providerEndpoint = "hybrid";
+        }
         lastSelectedProvider_ = selectedProvider;
         lastProviderEndpoint_ = providerEndpoint;
         lastModelTextOutput_ = response.textOutput;

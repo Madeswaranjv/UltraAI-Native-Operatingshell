@@ -7,6 +7,7 @@ const crypto = require("node:crypto");
 
 const { WorkspaceTaskQueue } = require("./taskQueue");
 const { AnalyticsStore } = require("./analyticsStore");
+const { safeLog } = require("./logging");
 const { RollbackStore } = require("./rollbackStore");
 const { UltraBridge } = require("./ultraBridge");
 const { ModelProviderClient } = require("./modelProvider");
@@ -19,9 +20,10 @@ const {
 const { getWebviewHtml } = require("./webviewHtml");
 
 const PENDING_PATCH_KEY = "ultra.pendingPatch";
-const PATCH_MODES = new Set(["fixBug", "refactor", "addTests", "optimize", "architecture", "heavy"]);
+const PATCH_MODES = new Set(["auto", "fixBug", "refactor", "addTests", "optimize", "architecture", "heavy"]);
 
 const MODE_LABELS = {
+  auto:         "Auto",
   fixBug:       "Fix Bug",
   explain:      "Explain Code",
   refactor:     "Refactor",
@@ -160,6 +162,10 @@ class UltraSidebarProvider {
     this._configUnwatch = null; // hot-reload watcher cleanup
   }
 
+  _log(message) {
+    safeLog(this.output, message, "[ULTRA-EXT]");
+  }
+
   _workspaceRoot() {
     return workspaceRootPath();
   }
@@ -190,7 +196,7 @@ class UltraSidebarProvider {
       stage,
       message
     });
-    this.output.appendLine(`[status] ${stage}: ${message}`);
+    safeLog(this.output, `[status] ${stage}: ${message}`, "[ULTRA-EXT]");
   }
 
   async resolveWebviewView(webviewView) {
@@ -205,7 +211,7 @@ class UltraSidebarProvider {
         return;
       }
       if (message.type === "runTask") {
-        await this.runTask(message.mode, message.prompt);
+        await this.runTask(message.mode, message.executionMode, message.prompt);
         return;
       }
       if (message.type === "applyPatch") {
@@ -263,11 +269,11 @@ class UltraSidebarProvider {
 
     this._configUnwatch = loader.watch((err, config) => {
       if (err) {
-        this.output.appendLine(`[config-watcher] Reload error: ${err.message}`);
+        safeLog(this.output, `[config-watcher] Reload error: ${err.message}`, "[ULTRA-EXT]");
         this._post({ type: "configError", message: err.message });
         return;
       }
-      this.output.appendLine(`[config-watcher] models.json changed — hot reload applied`);
+      safeLog(this.output, "[config-watcher] models.json changed - hot reload applied", "[ULTRA-EXT]");
 
       // Build a simple route summary for the UI
       const defaultKey = config && config.default_provider;
@@ -316,7 +322,7 @@ class UltraSidebarProvider {
         routes
       });
     } catch (e) {
-      this.output.appendLine(`[extension] sendModelsToWebview error: ${e.message}`);
+      safeLog(this.output, `[extension] sendModelsToWebview error: ${e.message}`, "[ULTRA-EXT]");
     }
   }
 
@@ -325,7 +331,7 @@ class UltraSidebarProvider {
       const storage = await this._workspaceStorage();
       this.modelProvider._ensureRouter(storage.workspaceRoot);
       await this.modelProvider.configLoader.updateRoute(mode, routeDest);
-      this.output.appendLine(`[extension] Updated route for ${mode} to ${routeDest}`);
+      safeLog(this.output, `[extension] Updated route for ${mode} to ${routeDest}`, "[ULTRA-EXT]");
     } catch (e) {
       this._post({ type: "taskError", message: `Failed to save route: ${e.message}` });
     }
@@ -355,8 +361,8 @@ class UltraSidebarProvider {
     });
   }
 
-  async runTask(mode, prompt) {
-    const normalizedMode = MODE_LABELS[mode] ? mode : "fixBug";
+  async runTask(mode, executionMode, prompt) {
+    const normalizedMode = MODE_LABELS[mode] ? mode : "auto";
     const trimmedPrompt = String(prompt || "").trim();
     if (!trimmedPrompt) {
       this._post({ type: "taskError", message: "Task prompt is required." });
@@ -391,24 +397,123 @@ class UltraSidebarProvider {
 
     try {
       await this.queue.run(workspaceRoot, { patchTask: PATCH_MODES.has(normalizedMode) }, async () => {
+        this._log(`[ULTRA-EXT] Starting task ${MODE_LABELS[normalizedMode]} request_id=${requestId}`);
         this._emitStatus("queueing", `Task queued: ${MODE_LABELS[normalizedMode]}`);
         await bridge.ensureDaemon(settings.autoWakeDaemon, (stage, message) => this._emitStatus(stage, message));
         await bridge.ensureContextAst((stage, message) => this._emitStatus(stage, message));
 
+        this._log(`[ULTRA-EXT] Collecting context mode=${normalizedMode}`);
         const context = await bridge.collectTaskContext(payload, settings, (stage, message) =>
           this._emitStatus(stage, message)
         );
 
-        this._emitStatus(
-          "generating",
-          normalizedMode === "explain" ? "Generating explanation..." : "Generating patch..."
-        );
-        const modelResult = await this.modelProvider.generate(
-          normalizedMode,
-          context,
-          settings,
-          (stage, message) => this._emitStatus(stage, message)
-        );
+        this._log(`[ULTRA-EXT] Context ready files=${context.files.length} logger_bound=${typeof this._log === "function"}`);
+        this._log(`[ULTRA-EXT] Task started: ${normalizedMode}`);
+        const useUltraBrain = ["auto", "fixBug", "refactor", "optimize", "architecture"].includes(normalizedMode);
+
+        let modelResult;
+        if (useUltraBrain) {
+           this._log(`[ULTRA-EXT] Routing to ULTRA C++ Brain for mode: ${normalizedMode}`);
+           this._emitStatus("generating", "Routing to ULTRA C++ Brain...");
+           this._log(`[ULTRA-EXT] Sending active file ${context.currentFile || "<none>"}`);
+           this._log(`[ULTRA-EXT] Sending selectedText bytes=${context.selection.length}`);
+           this._log(`[ULTRA-EXT] Sending files count=${context.files.length}`);
+           
+           const brainPayload = {
+              intent: {
+                 raw_prompt: trimmedPrompt,
+                 action: normalizedMode,
+                 goal_summary: trimmedPrompt,
+                 model_role: "auto",
+                 requires_planning: true,
+                 targets: context.currentFile
+                   ? [context.currentFile]
+                   : context.files.map((file) => file.path)
+              },
+              session: {
+                 project_root: context.workspaceRoot,
+                 governance: {
+                    require_plan_approval: true,
+                    require_action_approval: false,
+                    max_iterations: 4,
+                    protected_paths: [],
+                    forbidden_actions: []
+                 },
+                 policy: {
+                    risk_tolerance: executionMode === "safe" ? "low" : executionMode === "fast" ? "high" : "medium",
+                    strategy_style: executionMode === "deep" ? "exhaustive" : "balanced",
+                    auto_commit: false,
+                    run_tests_after_change: false,
+                    custom_rules: []
+                 }
+              },
+              context: {
+                 source_file: context.currentFile || "",
+                 selected_files: context.files.map((file) => file.path),
+                 selected_text: context.selection || "",
+                 symbol: context.symbol || "",
+                 files: context.files.map((file) => ({
+                   path: file.path,
+                   content: file.content
+                 }))
+              },
+              // Backward compatibility for older native payload readers.
+              policy: {
+                 risk_tolerance: "medium"
+              },
+              files: context.files.map((file) => ({ path: file.path, content: file.content }))
+           };
+           
+           try {
+              this._log(`[ULTRA-EXT] Calling bridge.executeUltraBrain mode=${normalizedMode}`);
+              const brainResult = await bridge.executeUltraBrain(brainPayload, (stage, message) => {
+                 this._log(`[ULTRA-EXT] Brain Event: [${stage}] ${message}`);
+                 this._emitStatus(stage, message);
+              }, async (llmRequest) => {
+                 const requestMode = llmRequest && llmRequest.metadata && llmRequest.metadata.mode
+                   ? llmRequest.metadata.mode
+                   : "patch";
+                 this._log(`[ULTRA-EXT] Received llm_request for mode: ${requestMode}`);
+                 this._emitStatus("generating", "Awaiting AI response via JS provider...");
+                 const mode = requestMode;
+                 const result = await this.modelProvider.generateRaw(mode, llmRequest.messages, context.workspaceRoot, (stage, msg) => {
+                     this._emitStatus(stage, msg);
+                 });
+                 this._log(`[ULTRA-EXT] Response received chars=${(result.content || "").length}`);
+                 return { content: result.content };
+              });
+              
+              modelResult = {
+                 type: "patch",
+                 summary: brainResult.summary || "ULTRA Brain Execution Complete",
+                 diff: brainResult.diff || "",
+                 filesUsed: context.files.map(f => f.path)
+              };
+           } catch (err) {
+              this._log(`[ULTRA-EXT] C++ Brain failed, falling back to JS Provider: ${err.message}`);
+              this._emitStatus("generating", "ULTRA Brain failed. Falling back to direct model...");
+              this._log(`[ULTRA-EXT] Calling JS provider fallback mode=${normalizedMode}`);
+              modelResult = await this.modelProvider.generate(
+                 normalizedMode,
+                 context,
+                 (stage, message) => this._emitStatus(stage, message)
+              );
+           }
+        } else {
+           this._emitStatus(
+             "generating",
+             normalizedMode === "explain" ? "Generating explanation..." : "Generating patch..."
+           );
+           this._log(`[ULTRA-EXT] Calling JS provider mode=${normalizedMode}`);
+           modelResult = await this.modelProvider.generate(
+             normalizedMode,
+             context,
+             (stage, message) => {
+                 this._log(`[ULTRA-EXT] JS Provider Event: [${stage}] ${message}`);
+                 this._emitStatus(stage, message);
+             }
+           );
+        }
 
         if (modelResult.type === "explain" || normalizedMode === "explain") {
           this._post({
@@ -632,7 +737,7 @@ let providerInstance;
 function activate(context) {
   console.log("[ULTRA] activate entered");
   const output = vscode.window.createOutputChannel("ULTRA");
-  output.appendLine("[lifecycle] activate entered");
+  safeLog(output, "[lifecycle] activate entered", "[ULTRA-EXT]");
 
   try {
     const queue = new WorkspaceTaskQueue();
@@ -640,12 +745,12 @@ function activate(context) {
 
     context.subscriptions.push(output);
 
-    output.appendLine("[lifecycle] registering webview provider ultra.sidebar");
+    safeLog(output, "[lifecycle] registering webview provider ultra.sidebar", "[ULTRA-EXT]");
     context.subscriptions.push(
       vscode.window.registerWebviewViewProvider("ultra.sidebar", providerInstance)
     );
 
-    output.appendLine("[lifecycle] commands registering");
+    safeLog(output, "[lifecycle] commands registering", "[ULTRA-EXT]");
     context.subscriptions.push(
       vscode.commands.registerCommand("ultra.openPanel", async () => {
         await vscode.commands.executeCommand("workbench.view.extension.ultra");
@@ -707,11 +812,11 @@ function activate(context) {
     context.subscriptions.push(
       vscode.commands.registerCommand("ultra.task.heavy", async () => providerInstance.promptAndRun("heavy"))
     );
-    output.appendLine("[lifecycle] activate completed");
+    safeLog(output, "[lifecycle] activate completed", "[ULTRA-EXT]");
     console.log("[ULTRA] activate completed");
   } catch (error) {
     const details = error && error.stack ? error.stack : String(error);
-    output.appendLine(`[lifecycle] activate failed: ${details}`);
+    safeLog(output, `[lifecycle] activate failed: ${details}`, "[ULTRA-EXT]");
     console.error("[ULTRA] activate failed", error);
     throw error;
   }

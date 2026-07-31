@@ -280,7 +280,7 @@ int CMakeAdapter::execute(const std::string& command,
   if (!ensureCMakeAvailable(options)) {
     return 1;
   }
-  return runCommand(m_rootPath, command, options);
+  return runCommand(m_rootPath, command, options, &m_lastOutput);
 }
 
 std::string CMakeAdapter::buildType(const ultra::cli::CommandOptions& options) {
